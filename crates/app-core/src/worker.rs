@@ -16,6 +16,9 @@ pub struct RealWorker {
     engine: Pocket,
     voice: String,
     brightness_db: f32,
+    /// Очистка запрошена заданием, но файла модели нет: каждый чанк получает
+    /// статус Missing (не молчаливый Off) — A4-фикс 1.3.
+    denoise_missing: bool,
 }
 
 /// Фабрика воркеров из параметров задания: каждый вызов загружает СВОЙ
@@ -48,11 +51,17 @@ pub fn real_worker_factory(
         engine.decode_steps = decode_steps;
         engine.eos_threshold = eos_threshold;
         let denoise_model = model_dir.join(denoise_mod::MODEL_FILE);
-        engine.denoise_on = resolve_denoise(denoise_requested, denoise_model.exists());
+        let model_present = denoise_model.exists();
+        engine.denoise_on = resolve_denoise(denoise_requested, model_present);
+        // A4-фикс 1.3: при отсутствии модели каждый чанк получает явный
+        // статус Missing в параллельном/последовательном путях.
+        let denoise_missing =
+            crate::pipeline::denoise_precheck(denoise_requested, model_present).is_some();
         Ok(RealWorker {
             engine,
             voice: voice.clone(),
             brightness_db,
+            denoise_missing,
         })
     }
 }
@@ -66,7 +75,9 @@ impl ChunkWorker for RealWorker {
         if self.brightness_db > 0.05 {
             high_shelf(&mut piece, self.brightness_db, 3000.0, POCKET_RATE as f32);
         }
-        let denoise = if self.engine.denoise_on {
+        let denoise = if self.denoise_missing {
+            DenoiseChunkStatus::Missing
+        } else if self.engine.denoise_on {
             match self.engine.clean(&piece) {
                 shtorm_engine::CleanOutcome::Applied(clean) => {
                     let back = resample(&clean, denoise_mod::RATE, POCKET_RATE);

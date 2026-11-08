@@ -85,10 +85,13 @@ impl Default for PoolConfig {
 /// Временная статистика одного чанка.
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // worker_id: читается отчётами A5 (лог чанков/прогресс)
+#[allow(dead_code)] // worker_id/denoise/samples: журнал A5 и будущий GUI
 pub struct ChunkTiming {
     pub index: usize,
     pub worker_id: usize,
     pub ms: u128,
+    pub denoise: DenoiseChunkStatus,
+    pub samples: usize,
 }
 
 /// Итоги задания.
@@ -101,11 +104,24 @@ pub struct JobSummary {
     /// Максимум готовых-но-не-по-порядку чанков в буфере (<= ёмкости очереди
     /// результатов): подтверждение ограниченного backpressure.
     pub max_buffered: usize,
+    /// Максимум PCM-байт (f32) в буфере переупорядочивания за задание:
+    /// диагностика «аудио не копится в памяти».
+    pub max_buffered_bytes: usize,
     /// Базовый seed задания (при Random фиксируется здесь — для повтора).
     pub base_seed: u64,
     pub denoise: DenoiseReport,
     /// Задание остановлено по отмене (без ошибок).
     pub cancelled: bool,
+}
+
+fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = p.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = p.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "неизвестная паника".into()
+    }
 }
 
 enum WorkerMsg {
@@ -168,6 +184,17 @@ where
 {
     anyhow::ensure!(cfg.workers >= 1, "workers >= 1");
     anyhow::ensure!(!tasks.is_empty(), "задание пусто");
+    // Индексы задач обязаны быть непрерывны и в порядке 0..N-1: порядок и
+    // seed+index — инварианты конвейера, «дырки» запрещены.
+    for (i, t) in tasks.iter().enumerate() {
+        anyhow::ensure!(
+            t.index == i as u64,
+            "индекс задачи {} вместо {} (индексы должны быть непрерывны 0..{})",
+            t.index,
+            i,
+            tasks.len() - 1
+        );
+    }
     let workers = cfg.workers.min(tasks.len());
     let cap = cfg.queue_cap.max(workers);
     let base_seed = seed.resolve();
@@ -222,13 +249,24 @@ where
         let stop = Arc::clone(&stop);
         let factory = Arc::clone(&factory);
         handles.push(std::thread::spawn(move || {
-            let mut worker = match factory(wid, base_seed) {
-                Ok(w) => w,
-                Err(e) => {
+            // Паника фабрики — диагностируемая ошибка задания, не обрыв потока.
+            let started =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| factory(wid, base_seed)));
+            let mut worker = match started {
+                Ok(Ok(w)) => w,
+                Ok(Err(e)) => {
                     let _ = tx.send(WorkerMsg::Failed {
                         index: None,
                         worker_id: wid,
                         error: format!("старт воркера {wid}: {e:#}"),
+                    });
+                    return;
+                }
+                Err(p) => {
+                    let _ = tx.send(WorkerMsg::Failed {
+                        index: None,
+                        worker_id: wid,
+                        error: format!("паника фабрики воркера {wid}: {}", panic_text(&p)),
                     });
                     return;
                 }
@@ -248,8 +286,12 @@ where
                     break;
                 }
                 let t0 = Instant::now();
-                match worker.process(&task) {
-                    Ok(mut audio) => {
+                // Паника process() — диагностируемая ошибка чанка.
+                let produced = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    worker.process(&task)
+                }));
+                match produced {
+                    Ok(Ok(mut audio)) => {
                         let ms = t0.elapsed().as_millis();
                         // пауза — из задачи (единственный источник, посчитан
                         // по исходному чанку в фидерной фазе)
@@ -266,11 +308,19 @@ where
                             break; // приёмник закрыт — выходим
                         }
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         let _ = tx.send(WorkerMsg::Failed {
                             index: Some(task.index),
                             worker_id: wid,
                             error: format!("{e:#}"),
+                        });
+                        break;
+                    }
+                    Err(p) => {
+                        let _ = tx.send(WorkerMsg::Failed {
+                            index: Some(task.index),
+                            worker_id: wid,
+                            error: format!("паника воркера {wid}: {}", panic_text(&p)),
                         });
                         break;
                     }
@@ -290,6 +340,8 @@ where
     let mut first_error: Option<String> = None;
     let mut sink_error: Option<anyhow::Error> = None;
     let mut max_buffered = 0usize;
+    let mut max_buffered_bytes = 0usize;
+    let mut buffered_bytes = 0usize;
     let mut external_cancel = false;
 
     while next_emit < total {
@@ -301,7 +353,17 @@ where
         let msg = match res_rx.recv_timeout(Duration::from_millis(200)) {
             Ok(m) => m,
             Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Disconnected) => {
+                // все воркеры вышли раньше времени без отмены/ошибки —
+                // это НЕ успех: канал закрылся преждевременно
+                if first_error.is_none() && sink_error.is_none() && next_emit < total {
+                    first_error = Some(format!(
+                        "канал результатов закрылся преждевременно: готово {next_emit} из {total}"
+                    ));
+                }
+                stop.store(true, Ordering::SeqCst);
+                break;
+            }
         };
         match msg {
             WorkerMsg::Done {
@@ -314,6 +376,8 @@ where
                     index: index as usize,
                     worker_id,
                     ms,
+                    denoise: audio.denoise.clone(),
+                    samples: audio.speech.len(),
                 });
                 match &audio.denoise {
                     DenoiseChunkStatus::Applied => denoise.applied += 1,
@@ -326,13 +390,17 @@ where
                         }
                     }
                 }
+                buffered_bytes += audio.speech.len() * std::mem::size_of::<f32>();
                 buffer.insert(index, (worker_id, audio, ms));
                 max_buffered = max_buffered.max(buffer.len());
+                max_buffered_bytes = max_buffered_bytes.max(buffered_bytes);
                 while let Some((_wid, audio, _ms)) = buffer.remove(&(next_emit as u64)) {
                     if let Err(e) = sink(next_emit, &audio.speech, audio.pause_s) {
                         sink_error = Some(e);
                         break;
                     }
+                    buffered_bytes = buffered_bytes
+                        .saturating_sub(audio.speech.len() * std::mem::size_of::<f32>());
                     next_emit += 1;
                     emitted.store(next_emit, Ordering::SeqCst); // двигаем окно фидера
                 }
@@ -370,9 +438,17 @@ where
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
-    let _ = feeder.join();
-    for h in handles {
-        let _ = h.join();
+    let mut thread_panics: Vec<String> = Vec::new();
+    if let Err(p) = feeder.join() {
+        thread_panics.push(format!("фидер паниковал: {}", panic_text(p.as_ref())));
+    }
+    for (wid, h) in handles.into_iter().enumerate() {
+        if let Err(p) = h.join() {
+            thread_panics.push(format!(
+                "поток воркера {wid} паниковал: {}",
+                panic_text(p.as_ref())
+            ));
+        }
     }
 
     if let Some(e) = first_error {
@@ -381,11 +457,20 @@ where
     if let Some(e) = sink_error {
         return Err(anyhow::anyhow!("задание прервано приёмником: {e:#}"));
     }
+    if let Some(e) = thread_panics.first() {
+        return Err(anyhow::anyhow!("задание прервано паникой потока: {e}"));
+    }
+    if !external_cancel && next_emit < total {
+        return Err(anyhow::anyhow!(
+            "задание завершилось неполным: готово {next_emit} из {total}"
+        ));
+    }
     Ok(JobSummary {
         workers,
         chunks_done: next_emit,
         timings,
         max_buffered,
+        max_buffered_bytes,
         base_seed,
         denoise,
         cancelled: external_cancel,
@@ -647,6 +732,120 @@ mod tests {
         assert!(s1 >= 1 && s2 >= 1);
         // коллизия наносекунд на одной машине практически исключена
         assert_ne!(s1, s2, "случайные seed различаются");
+    }
+
+    #[test]
+    fn non_contiguous_indices_rejected() {
+        let mut t = tasks(3);
+        t[1].index = 5; // дырка в индексах
+        let err = run_job(
+            &PoolConfig {
+                workers: 1,
+                queue_cap: 2,
+            },
+            t,
+            |_, _| {
+                Ok(Mock {
+                    sleep_ms: HashMap::new(),
+                    fail_on: None,
+                })
+            },
+            |_, _, _| Ok(()),
+            &no_cancel(),
+            SeedPolicy::Fixed(1),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("непрерывны"), "{err:#}");
+    }
+
+    /// Паника фабрики и process() превращается в ошибку задания.
+    /// Тело выполняется ТОЛЬКО в дочернем процессе (env-маркер): дочерний
+    /// процесс — тестовый бинарь, запущенный с фильтром по этому имени теста.
+    /// Родительский тест ограничивает время и убивает зависшего ребёнка.
+    #[test]
+    fn panic_scenarios_child_entry() {
+        if std::env::var("SHTORM_POOL_PANIC_CHILD").is_err() {
+            return; // в обычном прогоне — no-op
+        }
+        // 1) паника в фабрике
+        let e = run_job(
+            &PoolConfig {
+                workers: 2,
+                queue_cap: 2,
+            },
+            tasks(4),
+            |_, _| -> Result<PanicFactoryInner> { panic!("фабрика легла") },
+            |_, _, _| Ok(()),
+            &no_cancel(),
+            SeedPolicy::Fixed(1),
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("паника фабрики"), "{e:#}");
+        // 2) паника в process()
+        struct PanicWorker;
+        impl ChunkWorker for PanicWorker {
+            fn process(&mut self, _t: &Task) -> Result<ChunkAudio> {
+                panic!("process легла");
+            }
+        }
+        let e = run_job(
+            &PoolConfig {
+                workers: 1,
+                queue_cap: 2,
+            },
+            tasks(3),
+            |_, _| Ok(PanicWorker),
+            |_, _, _| Ok(()),
+            &no_cancel(),
+            SeedPolicy::Fixed(1),
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("паника воркера"), "{e:#}");
+        println!("CHILD_OK");
+    }
+
+    /// Тип-заглушка для компиляции паникующей фабрики (не создаётся никогда).
+    struct PanicFactoryInner;
+    impl ChunkWorker for PanicFactoryInner {
+        fn process(&mut self, _t: &Task) -> Result<ChunkAudio> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn panic_scenarios_do_not_hang_parent() {
+        if std::env::var("SHTORM_POOL_PANIC_CHILD").is_ok() {
+            return; // это дочерний процесс — родительский тест сам решает
+        }
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut child = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "pool::tests::panic_scenarios_child_entry",
+                "--test-threads=1",
+            ])
+            .env("SHTORM_POOL_PANIC_CHILD", "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn child test");
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            match child.try_wait().expect("try_wait") {
+                Some(status) => {
+                    assert!(status.success(), "дочерний тест паник упал: {status:?}");
+                    break;
+                }
+                None => {
+                    if std::time::Instant::now() > deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!("дочерний тест паник завис — убит по таймауту");
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
     }
 
     #[test]

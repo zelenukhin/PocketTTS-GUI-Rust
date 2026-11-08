@@ -78,6 +78,16 @@ pub struct DenoiseReport {
     pub first_error: Option<String>,
 }
 
+/// Денойз в параллельном пути: если очистка запрошена, но файла модели нет,
+/// каждый чанк должен получить явный статус Missing (не молчаливый Off).
+/// Чистая функция — тестируется без ONNX.
+pub fn denoise_precheck(
+    requested: bool,
+    model_present: bool,
+) -> Option<crate::pool::DenoiseChunkStatus> {
+    (requested && !model_present).then_some(crate::pool::DenoiseChunkStatus::Missing)
+}
+
 /// Решение о включении DPDFNet на экземпляре движка: только если очистка
 /// запрошена заданием И файл модели существует. Чистая функция (тестируется
 /// без модели); фактическое применение всё равно подтверждается per-chunk
@@ -418,6 +428,18 @@ mod denoise_tests {
     }
 
     #[test]
+    fn denoise_precheck_flags_missing_model() {
+        use crate::pool::DenoiseChunkStatus;
+        assert_eq!(
+            denoise_precheck(true, false),
+            Some(DenoiseChunkStatus::Missing)
+        );
+        assert_eq!(denoise_precheck(true, true), None);
+        assert_eq!(denoise_precheck(false, false), None);
+        assert_eq!(denoise_precheck(false, true), None);
+    }
+
+    #[test]
     fn report_summary_branches() {
         // успех: только применения
         let r = DenoiseReport {
@@ -450,6 +472,14 @@ use crate::pool::{run_job, PoolConfig, SeedPolicy, Task};
 use crate::worker::real_worker_factory;
 use std::sync::atomic::AtomicBool;
 
+/// Однозначный статус задания (A4-фикс): неполный результат не публикуется.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunStatus {
+    Completed,
+    Cancelled,
+    Failed,
+}
+
 /// Итог параллельного прогона: аудио-метрики конвейера + метрики пула.
 #[derive(Debug)]
 pub struct ParallelOutcome {
@@ -464,7 +494,11 @@ pub struct ParallelOutcome {
     pub workers: usize,
     /// Максимум буфера переупорядочивания (backpressure ограничен окном).
     pub max_buffered: usize,
-    pub cancelled: bool,
+    /// Максимум PCM-байт в буфере переупорядочивания (диагностика памяти).
+    pub max_buffered_bytes: usize,
+    /// Чанков фактически выдано в sink (Completed: == total).
+    pub chunks_done: usize,
+    pub status: RunStatus,
 }
 
 /// Параллельный конвейер (A4): те же этапы и семантика, что `synthesize`,
@@ -564,13 +598,32 @@ where
     let speech_samples: usize = outcomes.iter().map(|c| c.speech_samples).sum();
     let pause_samples = assembled.len().saturating_sub(speech_samples);
 
-    if let Some(path) = out {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
+    // A4-фикс: при отмене итоговый файл НЕ публикуется (неполный результат
+    // не должен выглядеть как готовая книга); явный статус и счёт чанков —
+    // в возвращаемом исходе. Failed передаётся вызывающему через Err.
+    let status = if summary.cancelled {
+        RunStatus::Cancelled
+    } else if summary.chunks_done == total {
+        RunStatus::Completed
+    } else {
+        RunStatus::Failed
+    };
+    if status == RunStatus::Failed {
+        anyhow::bail!(
+            "синтез не завершён: {}/{} чанков (без отмены) — файл не создан",
+            summary.chunks_done,
+            total
+        );
+    }
+    if status == RunStatus::Completed {
+        if let Some(path) = out {
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)?;
+                }
             }
+            audio_processing::write_wav16(path, fs, &assembled)?;
         }
-        audio_processing::write_wav16(path, fs, &assembled)?;
     }
 
     Ok(ParallelOutcome {
@@ -583,6 +636,8 @@ where
         base_seed,
         workers: summary.workers,
         max_buffered: summary.max_buffered,
-        cancelled: summary.cancelled,
+        max_buffered_bytes: summary.max_buffered_bytes,
+        chunks_done: summary.chunks_done,
+        status,
     })
 }

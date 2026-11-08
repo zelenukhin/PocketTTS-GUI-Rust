@@ -159,6 +159,22 @@ fn main() -> Result<()> {
     )?;
     let elapsed = t.elapsed().as_secs_f32();
 
+    match outcome.status {
+        app_core::pipeline::RunStatus::Cancelled => {
+            // A4-фикс: неполный результат не публикуется и не называется успехом
+            println!(
+                "ОТМЕНЕНО: обработано {}/{} чанков; итоговый файл {} НЕ создан",
+                outcome.chunks_done,
+                outcome.chunks.len(),
+                args.out.display()
+            );
+            std::process::exit(2);
+        }
+        app_core::pipeline::RunStatus::Failed => {
+            anyhow::bail!("синтез не завершён (Failed) — файл не создан");
+        }
+        app_core::pipeline::RunStatus::Completed => {}
+    }
     let total_s = outcome.total_samples as f32 / outcome.sample_rate as f32;
     let speech_s = outcome.speech_samples as f32 / outcome.sample_rate as f32;
     println!(
@@ -172,15 +188,11 @@ fn main() -> Result<()> {
         elapsed / total_s.max(1e-6)
     );
     println!(
-        "пул: воркеров {}, base_seed {}{}, буфер переупорядочивания <= {}",
+        "пул: воркеров {}, base_seed {}, буфер переупорядочивания <= {} чанков / {} КиБ PCM",
         outcome.workers,
         outcome.base_seed,
-        if outcome.cancelled {
-            ", ОТМЕНЕНО"
-        } else {
-            ""
-        },
-        outcome.max_buffered
+        outcome.max_buffered,
+        outcome.max_buffered_bytes / 1024
     );
     println!("денойз: {}", outcome.denoise_report.summary());
     let outcome = app_core::pipeline::PipelineOutcome {
