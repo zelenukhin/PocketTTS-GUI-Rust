@@ -184,29 +184,6 @@ fn main() -> Result<()> {
         }
     }
 
-    if let Some(parent) = args.out.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-    audio_processing::write_wav16(&args.out, POCKET_RATE, &all)
-        .with_context(|| format!("write {}", args.out.display()))?;
-    println!(
-        "WAV: {} ({:.2} s, {} chunks, суммарный RTF {:.3})",
-        args.out.display(),
-        all.len() as f32 / POCKET_RATE as f32,
-        args.repeats,
-        gen_secs_total / audio_secs_total.max(1e-6)
-    );
-
-    if let Ok(m) = app_core::diagnostics::process_memory() {
-        println!(
-            "process RAM: WS {:+.0} MB (peak {:.0} MB), private {:+.0} MB",
-            m.working_set_mb - mem0.as_ref().map(|x| x.working_set_mb).unwrap_or(0.0),
-            m.peak_working_set_mb,
-            m.private_mb - mem0.as_ref().map(|x| x.private_mb).unwrap_or(0.0)
-        );
-    }
     if device.is_cuda() {
         // Требование: наличие CUDAExecutionProvider не доказывает GPU-вычисления.
         // Успешный CUDA-статус возможен ТОЛЬКО с подтверждением (VRAM-дельта);
@@ -238,6 +215,29 @@ fn main() -> Result<()> {
         println!(
             "GPU total VRAM: {v0:.0} -> {v1:.0} MB (Δ {:+.0} MB)",
             v1 - v0
+        );
+    }
+    if let Some(parent) = args.out.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    audio_processing::write_wav16(&args.out, POCKET_RATE, &all)
+        .with_context(|| format!("write {}", args.out.display()))?;
+    println!(
+        "WAV: {} ({:.2} s, {} chunks, суммарный RTF {:.3})",
+        args.out.display(),
+        all.len() as f32 / POCKET_RATE as f32,
+        args.repeats,
+        gen_secs_total / audio_secs_total.max(1e-6)
+    );
+
+    if let Ok(m) = app_core::diagnostics::process_memory() {
+        println!(
+            "process RAM: WS {:+.0} MB (peak {:.0} MB), private {:+.0} MB",
+            m.working_set_mb - mem0.as_ref().map(|x| x.working_set_mb).unwrap_or(0.0),
+            m.peak_working_set_mb,
+            m.private_mb - mem0.as_ref().map(|x| x.private_mb).unwrap_or(0.0)
         );
     }
     Ok(())

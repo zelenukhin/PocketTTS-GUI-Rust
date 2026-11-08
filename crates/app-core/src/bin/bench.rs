@@ -238,7 +238,12 @@ fn main() -> Result<()> {
                     std::fs::create_dir_all(parent)?;
                 }
             }
-            let mut w = std::fs::File::create(p)?;
+            // Атомарно-эксклюзивно: существующий CSV не перезаписывается
+            // (политика SAFETY_AUDIT.md); выше уже есть ensure!(!csv.exists()).
+            let mut w = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(p)?;
             use std::io::Write;
             writeln!(w, "phase,chunk,ws_mb,private_mb,gpu_total_mb")?;
             writeln!(

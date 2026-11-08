@@ -1,12 +1,15 @@
 //! Аудио-хелперы уровня приложения (WAV 16-bit, тишина, конкатенация).
 //!
 //! write_wav16 — порт `write_wav_file()` из synthesis_worker.py
-//! (clip [-1..1] -> PCM16) на крейт hound.
+//! (clip [-1..1] -> PCM16) на крейт hound, с атомарно-эксклюзивным созданием
+//! файла (`OpenOptions::create_new` + `WavWriter::new`): существующий файл
+//! НИКОГДА не перезаписывается и не усекается (политика SAFETY_AUDIT.md).
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::Path;
 
-/// Записывает float-PCM [-1..1] в 16-битный моно WAV.
+/// Записывает float-PCM [-1..1] в 16-битный моно WAV. Файл создаётся
+/// эксклюзивно: если путь уже существует — ошибка, содержимое не трогается.
 pub fn write_wav16(path: &Path, sample_rate: u32, audio: &[f32]) -> Result<()> {
     let spec = hound::WavSpec {
         channels: 1,
@@ -14,7 +17,12 @@ pub fn write_wav16(path: &Path, sample_rate: u32, audio: &[f32]) -> Result<()> {
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-    let mut w = hound::WavWriter::create(path, spec)?;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("создать {} (файл существует?)", path.display()))?;
+    let mut w = hound::WavWriter::new(file, spec)?;
     for &s in audio {
         let v = s.clamp(-1.0, 1.0);
         w.write_sample((v * 32767.0) as i16)?;
@@ -33,11 +41,24 @@ pub fn silence(seconds: f32, sample_rate: u32) -> Vec<f32> {
 mod tests {
     use super::*;
 
+    /// Уникальная песочница без удалений: имя с pid+наносекундами, файлы
+    /// остаются в %TEMP% (политика SAFETY_AUDIT.md).
+    fn unique_wav(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "shtorm_wav_{}_{}_{}.wav",
+            std::process::id(),
+            tag,
+            nanos
+        ))
+    }
+
     #[test]
-    fn writes_readable_wav() {
-        let dir = std::env::temp_dir().join("shtorm_audio_test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("t.wav");
+    fn writes_readable_wav_unique_name() {
+        let p = unique_wav("write");
         let x = vec![0.0f32, 0.5, -0.5, 1.5, -1.5]; // выход за [-1..1] клипается
         write_wav16(&p, 24000, &x).unwrap();
         let mut r = hound::WavReader::open(&p).unwrap();
@@ -46,7 +67,35 @@ mod tests {
         let got: Vec<i16> = r.samples().map(|s| s.unwrap()).collect();
         assert_eq!(got, vec![0, 16383, -16383, 32767, -32767]);
         // временный wav остаётся в %TEMP%: тесты работают без удалений
-        // (политика SAFETY_AUDIT.md)
+    }
+
+    #[test]
+    fn refuses_existing_file_without_touching_it() {
+        let p = unique_wav("exists");
+        // сначала успешная запись, затем повтор в тот же путь — отказ
+        write_wav16(&p, 24000, &[0.25]).unwrap();
+        let err = write_wav16(&p, 24000, &[0.9]);
+        assert!(
+            err.is_err(),
+            "повторная запись в существующий файл запрещена"
+        );
+        // содержимое не изменилось (первая версия осталась)
+        let mut r = hound::WavReader::open(&p).unwrap();
+        let got: Vec<i16> = r.samples().map(|s| s.unwrap()).collect();
+        assert_eq!(
+            got,
+            vec![8191],
+            "существующий файл не перезаписан и не усечён"
+        );
+    }
+
+    #[test]
+    fn preexisting_foreign_file_is_refused() {
+        // файл, созданный НЕ через write_wav16 (например пустой), тоже неприкосновенен
+        let p = unique_wav("foreign");
+        std::fs::write(&p, b"keep me").unwrap();
+        assert!(write_wav16(&p, 24000, &[0.0]).is_err());
+        assert_eq!(std::fs::read(&p).unwrap(), b"keep me");
     }
 
     #[test]
