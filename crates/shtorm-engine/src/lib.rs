@@ -16,6 +16,7 @@ pub mod denoise;
 pub mod dsp;
 pub mod pocket;
 
+pub use pocket::CleanOutcome;
 pub use pocket::{
     high_shelf, read_voice, resample, Bpe, Device, LoadOptions, Pocket, POCKET_MAX_CHUNK_CHARS,
     POCKET_RATE,

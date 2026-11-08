@@ -475,6 +475,8 @@ pub struct Pocket {
     /// wanted; [denoiser_failed]: it would not load — not tried again.
     denoiser: Option<crate::denoise::Denoiser>,
     denoiser_failed: bool,
+    /// Очистка включена для ЭТОГО экземпляра (A4: глобаль удалена).
+    pub denoise_on: bool,
 }
 
 /// The frames a phrase may take when read normally: its letters at 11 a second (book prose is
@@ -487,6 +489,20 @@ fn speech_limit_frames(prepared: &str) -> usize {
 /// Is [dir] a Shtorm model folder? (FP32 graph only; int8 variants are ignored on purpose.)
 pub fn is_pocket_dir(dir: &str) -> bool {
     Path::new(dir).join("flow_lm_main.onnx").exists()
+}
+
+#[derive(Debug)]
+pub enum CleanOutcome {
+    /// Очищенное аудио (48 кГц).
+    Applied(Vec<f32>),
+    /// Очистка не включена для этого экземпляра.
+    Off,
+    /// Файл модели отсутствует в каталоге модели.
+    ModelMissing,
+    /// Загрузка сети не удалась (повторов нет до конца экземпляра).
+    LoadFailed(String),
+    /// Инференс упал.
+    RunFailed(String),
 }
 
 impl Pocket {
@@ -544,6 +560,7 @@ impl Pocket {
             dir: dir.to_path_buf(),
             denoiser: None,
             denoiser_failed: false,
+            denoise_on: false,
         })
     }
 
@@ -570,30 +587,44 @@ impl Pocket {
     /// Finished speech (24 kHz) cleaned by the speech-enhancement network, at its 48 kHz — if it is
     /// switched on and its file has been downloaded; otherwise None (the speech is used as it is).
     /// One thread: on more the small network only waits for them (measured: 1 is the fastest).
-    pub fn clean(&mut self, x: &[f32]) -> Option<Vec<f32>> {
-        if !crate::denoise::enabled() || self.denoiser_failed || x.is_empty() {
-            return None;
+    /// Результат очистки DPDFNet: фактическое применение подтверждается
+    /// только успехом инференса (A4, замечание A3: наличие файла ничего
+    /// не гарантирует; сбой загрузки и сбой инференса различаются).
+    /// Очистка законченной речи (24 кГц -> DPDFNet на 48 кГц).
+    /// Один поток: на большем маленькая сеть только ждёт (замер teratts).
+    pub fn clean(&mut self, x: &[f32]) -> CleanOutcome {
+        use crate::denoise::{Denoiser, ATTENUATION_LIMIT_DB, MODEL_FILE, RATE};
+        if !self.denoise_on {
+            return CleanOutcome::Off;
+        }
+        if self.denoiser_failed {
+            return CleanOutcome::LoadFailed(
+                "повтор после сбоя загрузки отключён для этого экземпляра".into(),
+            );
+        }
+        if x.is_empty() {
+            return CleanOutcome::Off;
         }
         if self.denoiser.is_none() {
-            let path = self.dir.join(crate::denoise::MODEL_FILE);
+            let path = self.dir.join(MODEL_FILE);
             if !path.exists() {
-                return None;
+                return CleanOutcome::ModelMissing;
             }
-            match crate::denoise::Denoiser::load(&path, 1) {
+            match Denoiser::load(&path, 1) {
                 Ok(d) => self.denoiser = Some(d),
                 Err(e) => {
-                    log::warn!("denoiser: {e:#}");
                     self.denoiser_failed = true;
-                    return None;
+                    return CleanOutcome::LoadFailed(format!("{e:#}"));
                 }
             }
         }
         let t = std::time::Instant::now();
-        let up = resample(x, POCKET_RATE, crate::denoise::RATE);
+        let up = resample(x, POCKET_RATE, RATE);
         match self
             .denoiser
-            .as_mut()?
-            .run(&up, crate::denoise::ATTENUATION_LIMIT_DB)
+            .as_mut()
+            .expect("denoiser загружен выше")
+            .run(&up, ATTENUATION_LIMIT_DB)
         {
             Ok(y) => {
                 log::info!(
@@ -601,12 +632,9 @@ impl Pocket {
                     x.len() as f32 / POCKET_RATE as f32,
                     t.elapsed().as_millis()
                 );
-                Some(y)
+                CleanOutcome::Applied(y)
             }
-            Err(e) => {
-                log::warn!("denoiser: {e:#}");
-                None
-            }
+            Err(e) => CleanOutcome::RunFailed(format!("{e:#}")),
         }
     }
 

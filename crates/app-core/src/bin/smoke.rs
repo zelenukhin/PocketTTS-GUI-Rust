@@ -123,7 +123,8 @@ fn main() -> Result<()> {
     engine.decode_steps = args.decode_steps as usize;
     engine.anti_repeat = !args.no_anti_repeat;
     if args.denoise {
-        shtorm_engine::denoise::set_enabled(true);
+        // A4: настройка принадлежит экземпляру движка (глобаль удалена)
+        engine.denoise_on = true;
     }
 
     // Голос: кодирование промпта (первый say включает его в замер; прогреваем заранее)
@@ -169,12 +170,13 @@ fn main() -> Result<()> {
             shtorm_engine::high_shelf(&mut piece, args.brightness_db, 3000.0, POCKET_RATE as f32);
         }
         if args.denoise {
-            if let Some(clean) = engine.clean(&piece) {
-                let back =
-                    shtorm_engine::resample(&clean, shtorm_engine::denoise::RATE, POCKET_RATE);
-                piece = back[..back.len().min(piece.len())].to_vec();
-            } else {
-                println!("denoise: недоступен (модель не найдена/ошибка) — пропуск");
+            match engine.clean(&piece) {
+                shtorm_engine::CleanOutcome::Applied(clean) => {
+                    let back =
+                        shtorm_engine::resample(&clean, shtorm_engine::denoise::RATE, POCKET_RATE);
+                    piece = back[..back.len().min(piece.len())].to_vec();
+                }
+                other => println!("denoise: {other:?} — чанк без очистки"),
             }
         }
         shtorm_engine::dsp::fade_out(&mut piece, POCKET_RATE);

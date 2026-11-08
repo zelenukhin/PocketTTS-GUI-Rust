@@ -11,7 +11,13 @@
 │  • diagnostics.rs RAM (GetProcessMemoryInfo), VRAM (nvidia-smi)│
 │  • bin/smoke.rs  смоук-CLI: загрузка→голос→чанк(и)→DSP→WAV      │
 │  • bin/bench.rs  бенчмарк: warmup→N чанков→RTF/RAM/VRAM-строка  │
-│  (след. этап: worker-пул, файловый конвейер, ffmpeg-пайп)       │
+│  • pool.rs      A4: N воркеров × свой Pocket; ограниченные      │
+│                 очереди (crossbeam), скользящее окно задач,     │
+│                 строгий порядок выдачи, отмена, join; sink —    │
+│                 интерфейс для потокового writer A5               │
+│  • worker.rs    RealWorker: Pocket + DSP-цепочка A3 в потоке    │
+│                 воркера; фабрика с base_seed задания            │
+│  (след. этап: потоковый WAV/ffmpeg writer, файловый конвейер)   │
 ├────────────────────────────────────────────────────────────────┤
 │ shtorm-engine (ядро; производное teratts-android, GPL-3.0)     │
 │  • pocket.rs  Pocket: load(Device,threads,seed) / say_chunk()   │

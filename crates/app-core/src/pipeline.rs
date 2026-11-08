@@ -63,10 +63,42 @@ pub struct PipelineOutcome {
     pub speech_samples: usize,
     pub pause_samples: usize,
     pub chunks: Vec<ChunkOutcome>,
-    /// DPDFNet реально применялся.
-    pub denoise_used: bool,
-    /// DDPFNet был включён, но модель отсутствует (сообщение уже выведено).
-    pub denoise_missing: bool,
+    /// Фактический учёт DPDFNet (см. DenoiseReport).
+    pub denoise_report: DenoiseReport,
+}
+
+/// Учёт очистки по факту применения (A4): Applied — только успешный
+/// инференс; ошибки загрузки/инференса считаются отдельно.
+#[derive(Debug, Default, Clone)]
+pub struct DenoiseReport {
+    pub applied: usize,
+    pub off: usize,
+    pub missing: usize,
+    pub failed: usize,
+    pub first_error: Option<String>,
+}
+
+/// Решение о включении DPDFNet на экземпляре движка: только если очистка
+/// запрошена заданием И файл модели существует. Чистая функция (тестируется
+/// без модели); фактическое применение всё равно подтверждается per-chunk
+/// CleanOutcome::Applied.
+pub fn resolve_denoise(requested: bool, model_file_exists: bool) -> bool {
+    requested && model_file_exists
+}
+
+impl DenoiseReport {
+    /// Человекочитаемая сводка для лога/CLI.
+    pub fn summary(&self) -> String {
+        match (&self.first_error, self.missing) {
+            (Some(e), _) => format!(
+                "применён к {} чанк(ам); сбои: {} (первая: {})",
+                self.applied, self.failed, e
+            ),
+            (None, m) if m > 0 => format!("модель отсутствует ({m} чанк(ов) без очистки)"),
+            (None, _) if self.applied > 0 => format!("применён к {} чанк(ам)", self.applied),
+            (None, _) => "выключен".into(),
+        }
+    }
 }
 
 /// Собрать итоговый трек из `(речь чанка, пауза после)`. Порядок строгий,
@@ -120,23 +152,18 @@ where
     engine.decode_steps = opts.decode_steps;
     engine.eos_threshold = opts.eos_threshold;
 
-    // 3. Denoise: включаем только при наличии файла модели (иначе явно
-    //    сообщаем — успешную очистку не имитируем).
+    // 3. Denoise (A4): включаем на ЭКЗЕМПЛЯРЕ движка только если файл модели
+    //    есть; фактическое применение подтверждается per-chunk результатом
+    //    engine.clean() (CleanOutcome) — наличие файла ничего не гарантирует.
     let denoise_model = opts.model_dir.join(denoise::MODEL_FILE);
-    let (denoise_used, denoise_missing) = if opts.denoise {
-        if denoise_model.exists() {
-            denoise::set_enabled(true);
-            (true, false)
-        } else {
-            eprintln!(
-                "ВНИМАНИЕ: денойз включён, но модель не найдена: {} — синтез без очистки звука.",
-                denoise_model.display()
-            );
-            (false, true)
-        }
-    } else {
-        (false, false)
-    };
+    engine.denoise_on = resolve_denoise(opts.denoise, denoise_model.exists());
+    if opts.denoise && !denoise_model.exists() {
+        eprintln!(
+            "ВНИМАНИЕ: денойз включён, но модель не найдена: {} — синтез без очистки звука.",
+            denoise_model.display()
+        );
+    }
+    let mut denoise_report = DenoiseReport::default();
 
     let voice = opts.voice.to_string_lossy().to_string();
     let mut parts: Vec<(Vec<f32>, Option<f32>)> = Vec::with_capacity(total);
@@ -164,11 +191,25 @@ where
         if opts.brightness_db > 0.05 {
             high_shelf(&mut piece, opts.brightness_db, 3000.0, fs as f32);
         }
-        if denoise_used {
-            if let Some(clean) = engine.clean(&piece) {
-                let back = resample(&clean, denoise::RATE, fs);
-                piece = back[..back.len().min(piece.len())].to_vec();
+        if engine.denoise_on {
+            match engine.clean(&piece) {
+                shtorm_engine::CleanOutcome::Applied(clean) => {
+                    let back = resample(&clean, denoise::RATE, fs);
+                    piece = back[..back.len().min(piece.len())].to_vec();
+                    denoise_report.applied += 1;
+                }
+                shtorm_engine::CleanOutcome::ModelMissing => denoise_report.missing += 1,
+                shtorm_engine::CleanOutcome::Off => denoise_report.off += 1,
+                shtorm_engine::CleanOutcome::LoadFailed(e)
+                | shtorm_engine::CleanOutcome::RunFailed(e) => {
+                    if denoise_report.first_error.is_none() {
+                        denoise_report.first_error = Some(e);
+                    }
+                    denoise_report.failed += 1;
+                }
             }
+        } else {
+            denoise_report.off += 1;
         }
         // тератт-режим GUI: тишина хвоста EOS срезается по звуку, фейд 10 мс
         let mut piece = trim_edges(&piece, 0.02, 0.10, fs);
@@ -206,8 +247,7 @@ where
         speech_samples,
         pause_samples,
         chunks: outcomes,
-        denoise_used,
-        denoise_missing,
+        denoise_report,
     })
 }
 
@@ -358,4 +398,191 @@ mod tests {
         );
         eprintln!("golden pauses: {checked} cases OK (divergent узлов: {divergent_checked})");
     }
+}
+
+#[cfg(test)]
+mod denoise_tests {
+    use super::*;
+
+    /// Решение о включении очистки на экземпляре (A4): чистая функция —
+    /// регрессионный тест без настоящей модели DPDFNet.
+    #[test]
+    fn resolve_denoise_decision() {
+        // не запрошено -> всегда выключено, независимо от файла
+        assert!(!resolve_denoise(false, true));
+        assert!(!resolve_denoise(false, false));
+        // запрошено и модель есть -> включаем
+        assert!(resolve_denoise(true, true));
+        // запрошено, модели нет -> НЕ включаем (прогон без очистки + сообщение)
+        assert!(!resolve_denoise(true, false));
+    }
+
+    #[test]
+    fn report_summary_branches() {
+        // успех: только применения
+        let r = DenoiseReport {
+            applied: 3,
+            ..Default::default()
+        };
+        assert_eq!(r.summary(), "применён к 3 чанк(ам)");
+        // модель отсутствует
+        let r = DenoiseReport {
+            missing: 2,
+            ..Default::default()
+        };
+        assert_eq!(r.summary(), "модель отсутствует (2 чанк(ов) без очистки)");
+        // сбой: текст первой ошибки приоритетен
+        let r = DenoiseReport {
+            applied: 1,
+            failed: 2,
+            first_error: Some("нет DLL".into()),
+            ..Default::default()
+        };
+        assert!(r.summary().contains("сбои: 2") && r.summary().contains("нет DLL"));
+        // выключен
+        assert_eq!(DenoiseReport::default().summary(), "выключен");
+    }
+}
+
+// ============================ A4: параллельный путь ============================
+
+use crate::pool::{run_job, PoolConfig, SeedPolicy, Task};
+use crate::worker::real_worker_factory;
+use std::sync::atomic::AtomicBool;
+
+/// Итог параллельного прогона: аудио-метрики конвейера + метрики пула.
+#[derive(Debug)]
+pub struct ParallelOutcome {
+    pub sample_rate: u32,
+    pub total_samples: usize,
+    pub speech_samples: usize,
+    pub pause_samples: usize,
+    pub chunks: Vec<ChunkOutcome>,
+    pub denoise_report: DenoiseReport,
+    /// Базовый seed задания (при Random зафиксирован здесь — для повтора).
+    pub base_seed: u64,
+    pub workers: usize,
+    /// Максимум буфера переупорядочивания (backpressure ограничен окном).
+    pub max_buffered: usize,
+    pub cancelled: bool,
+}
+
+/// Параллельный конвейер (A4): те же этапы и семантика, что `synthesize`,
+/// но чанки выполняют N воркеров с собственными экземплярами Pocket.
+/// Порядок выдачи — строгий исходный; seed = base + глобальный индекс чанка
+/// (не зависит от воркера). `out` пишется одним WAV (create_new).
+/// `progress(done, total)` вызывается по мере ГОТОВНОСТИ чанков.
+pub fn synthesize_parallel<F>(
+    raw_text: &str,
+    opts: &PipelineOptions,
+    workers: usize,
+    out: Option<&Path>,
+    mut progress: F,
+    cancel: &AtomicBool,
+) -> Result<ParallelOutcome>
+where
+    F: FnMut(usize, usize),
+{
+    use text_processing::{chunk_pause_s, chunk_pipeline, to_model_stress_notation};
+
+    let chunks = chunk_pipeline(raw_text, opts.max_tokens);
+    anyhow::ensure!(!chunks.is_empty(), "текст пуст — нечего синтезировать");
+    let total = chunks.len();
+    let fs = POCKET_RATE;
+
+    // Политика seed: фиксированный или случайный-раз-на-задание (фиксируем
+    // ЗДЕСЬ, чтобы вернуть в исходе и передать всем воркерам одинаково).
+    let base_seed = match opts.seed {
+        Some(s) => s,
+        None => SeedPolicy::Random.resolve(),
+    };
+
+    // Задачи: текст модели (ударения + char_rules) и пауза — считаются
+    // заранее, ДО очереди; индекс = позиция в исходном порядке.
+    let tasks: Vec<Task> = chunks
+        .iter()
+        .enumerate()
+        .map(|(i, chunk)| {
+            let mut model_text = to_model_stress_notation(&chunk.text);
+            if let Some(rules) = &opts.char_rules {
+                model_text = apply_char_rules(&model_text, rules);
+            }
+            let pause_s = chunk_pause_s(
+                chunk,
+                i + 1 == total,
+                opts.paragraph_pause_s,
+                opts.pause_scale,
+            );
+            Task {
+                index: i as u64,
+                model_text,
+                pause_s,
+            }
+        })
+        .collect();
+
+    let cfg = PoolConfig {
+        workers,
+        queue_cap: 4,
+    };
+    let factory = real_worker_factory(opts, base_seed);
+
+    let mut assembled: Vec<f32> = Vec::new();
+    let mut outcomes: Vec<ChunkOutcome> = chunks
+        .iter()
+        .map(|c| ChunkOutcome {
+            index: 0,
+            text: c.text.clone(),
+            pause_s: None,
+            speech_samples: 0,
+        })
+        .collect();
+    let mut done_ref = 0usize;
+
+    // sink собирает итог прямо в порядке выдачи; run_job дропает воркеров
+    // (join) до возврата — экземпляры Pocket освобождены к моменту записи WAV
+    let summary = run_job(
+        &cfg,
+        tasks,
+        factory,
+        |i, pcm, pause| {
+            outcomes[i].index = i;
+            outcomes[i].pause_s = pause;
+            outcomes[i].speech_samples = pcm.len();
+            assembled.extend_from_slice(pcm);
+            if let Some(p) = pause {
+                assembled.extend(audio_processing::silence(p, fs));
+            }
+            done_ref += 1;
+            progress(done_ref, total);
+            Ok(())
+        },
+        cancel,
+        SeedPolicy::Fixed(base_seed),
+    )?;
+
+    let speech_samples: usize = outcomes.iter().map(|c| c.speech_samples).sum();
+    let pause_samples = assembled.len().saturating_sub(speech_samples);
+
+    if let Some(path) = out {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        audio_processing::write_wav16(path, fs, &assembled)?;
+    }
+
+    Ok(ParallelOutcome {
+        sample_rate: fs,
+        total_samples: assembled.len(),
+        speech_samples,
+        pause_samples,
+        chunks: outcomes,
+        denoise_report: summary.denoise,
+        base_seed,
+        workers: summary.workers,
+        max_buffered: summary.max_buffered,
+        cancelled: summary.cancelled,
+    })
 }

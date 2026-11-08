@@ -10,6 +10,7 @@ shtorm-engine = { path = "../shtorm-engine" }
 text-processing = { path = "../text-processing" }
 audio-processing = { path = "../audio-processing" }
 anyhow.workspace = true
+crossbeam-channel = "0.5"
 ndarray.workspace = true
 log.workspace = true
 env_logger.workspace = true
