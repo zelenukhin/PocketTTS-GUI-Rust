@@ -1,0 +1,22 @@
+== A. TF32 probe (flow_lm_flow [Gemm-heavy] + mimi_encoder [Conv-heavy], фиксированные входы) ==
+flow_lm_flow (Gemm):
+  unset vs use_tf32=0:
+  unset_off: bitwise_equal=true max_abs_diff=0.000e0
+  unset vs use_tf32=1:
+  unset_on: bitwise_equal=true max_abs_diff=0.000e0
+  tf32=0 vs tf32=1:
+  off_on: bitwise_equal=true max_abs_diff=0.000e0
+mimi_encoder (Conv):
+  unset vs use_tf32=0:
+  enc_unset_off: bitwise_equal=false max_abs_diff=1.242e-4
+  unset vs use_tf32=1:
+  enc_unset_on: bitwise_equal=true max_abs_diff=0.000e0
+  tf32=0 vs tf32=1:
+  enc_off_on: bitwise_equal=false max_abs_diff=1.242e-4
+VERDICT A: DEFAULT==TF32_ON для conv-графа: дефолт провайдера ВКЛЮЧАЕТ TF32 — явное use_tf32=0 обязательно (сделано в session_builder)
+
+== B. Профилирование: распределение операторов (Chrome trace) ==
+Error: чистка C:\PocketTTS-GUI-Rust\ShtormTTS-Windows\out\ep_traces_sandbox
+
+Caused by:
+    отказ: посторонний файл «notatrace.txt» в каталоге трасс C:\PocketTTS-GUI-Rust\ShtormTTS-Windows\out\ep_traces_sandbox

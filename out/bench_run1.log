@@ -1,0 +1,12 @@
+=== cpu / ru-v2-slow ===
+| cpu-fp32-slow | ru-v2-slow | cpu | 1 | 4 | 1.2 | 18.7 | 3.238 | 3.625 | 515.4 | 323.8 | 0.628 | 508 | 499 | 0 |
+load 1.2s, warmup 5 in 18.7s, 100 chunks: mean 3.238s p95 3.625s, audio 515.4s in 323.8s, RTF 0.628 (1.6x), peak WS 1482 MB
+=== cuda / ru-v2-slow ===
+| cuda-fp32-slow | ru-v2-slow | cuda | 1 | 4 | 1.5 | 13.9 | 2.608 | 2.843 | 515.5 | 260.8 | 0.506 | 1008 | 3689 | 0 |
+load 1.5s, warmup 5 in 13.9s, 100 chunks: mean 2.608s p95 2.843s, audio 515.5s in 260.8s, RTF 0.506 (2.0x), peak WS 1059 MB
+=== cpu / ru-v2-fast ===
+| cpu-fp32-fast | ru-v2-fast | cpu | 1 | 4 | 1.2 | 16.5 | 2.648 | 2.927 | 501.6 | 264.8 | 0.528 | 483 | 476 | 0 |
+load 1.2s, warmup 5 in 16.5s, 100 chunks: mean 2.648s p95 2.927s, audio 501.6s in 264.8s, RTF 0.528 (1.9x), peak WS 1502 MB
+=== cuda / ru-v2-fast ===
+| cuda-fp32-fast | ru-v2-fast | cuda | 1 | 4 | 1.6 | 8.0 | 1.534 | 1.745 | 501.8 | 153.4 | 0.306 | 867 | 3659 | 0 |
+load 1.6s, warmup 5 in 8.0s, 100 chunks: mean 1.534s p95 1.745s, audio 501.8s in 153.4s, RTF 0.306 (3.3x), peak WS 1007 MB

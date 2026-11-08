@@ -1,0 +1,15 @@
+[2026-11-08T14:37:32Z INFO  smoke] ORT_DYLIB_PATH = C:\PocketTTS-GUI-Rust\ShtormTTS-Windows\deps\ort-gpu-wheel\x\onnxruntime\capi\onnxruntime.dll
+[2026-11-08T14:37:32Z INFO  smoke] model_dir = C:\Users\alexa\Downloads\pocket_tts_android\build\onnx\ru-v2-slow
+[2026-11-08T14:37:32Z INFO  smoke] onnxruntime dylib loaded OK
+[2026-11-08T14:37:33Z INFO  shtorm_engine::pocket] load mimi_encoder: 493 ms
+[2026-11-08T14:37:33Z INFO  shtorm_engine::pocket] load text_conditioner: 27 ms
+[2026-11-08T14:37:33Z INFO  shtorm_engine::pocket] load flow_lm_main: 682 ms
+[2026-11-08T14:37:34Z INFO  shtorm_engine::pocket] load flow_lm_flow: 127 ms
+[2026-11-08T14:37:34Z INFO  shtorm_engine::pocket] load mimi_decoder: 210 ms
+model load: 1.55 s
+text (model notation): Стре́лки часо́в показы́вали по́лночь.
+chunk 0: 3.04 s audio in 2.06 s (RTF 0.677, 1.5x realtime), peak 0.553, samples 72960
+WAV: out/smoke_a2_cuda.wav (3.04 s, 1 chunks, суммарный RTF 0.677)
+process RAM: WS +915 MB (peak 919 MB), private +3558 MB
+GPU total VRAM: 649 -> 2795 MB (Δ +2146 MB)
+this process VRAM (nvidia-smi compute-apps): 0 MB
