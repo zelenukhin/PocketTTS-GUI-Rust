@@ -25,10 +25,14 @@
 ## Этап A (продолжение): конвейер файлов без GUI
 
 1. ~~A1 чанкование~~ ✅. ~~A2 char_rules~~ ✅. ~~база пауз~~ ✅.
-2. **A3. Склейка с паузами**: конвейер чанк → движок (say_chunk) → brightness
-   → denoise → trim/fade → тишина `chunk_pause_s` (scale/абзац) → накопление
-   аудио файла. Критерий: длительность пауз контрольного текста совпадает с
-   расчётом (golden-лог пауз).
+2. ~~A3. Склейка с паузами~~ ✅ (2026-11-08): `pipeline.rs` (последовательный
+   конвейер chunk → char_rules → say_chunk → brightness → denoise-опция →
+   trim/fade → chunk_pause_s → assemble → WAV create_new) + CLI `synthesize`
+   (+ лог чанков, create_new). Golden: `pauses_golden.json` 20 кейсов
+   (генератор `tools/gen_pauses_golden.py`: чанки ветки + паузы main;
+   расходящиеся узлы — только исправление is_last>soft_break). Смоуки
+   CPU/CUDA на 3-абзацном тексте — один WAV, паузы 0.90/0.90/нет,
+   последний без вставки.
 3. **A4. Воркеры**: N потоков × `Pocket`; порядок сборки, отмена. Критерий:
    параллельно = побитово последовательно (per-chunk seed).
 4. **A5. Выход**: WAV-стриминг + ffmpeg-пайп (MP3/Opus, флаги GUI); `_log.txt`.
