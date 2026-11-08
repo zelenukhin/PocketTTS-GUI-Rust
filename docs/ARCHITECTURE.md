@@ -17,7 +17,12 @@
 │                 интерфейс для потокового writer A5               │
 │  • worker.rs    RealWorker: Pocket + DSP-цепочка A3 в потоке    │
 │                 воркера; фабрика с base_seed задания            │
-│  (след. этап: потоковый WAV/ffmpeg writer, файловый конвейер)   │
+│  • sink.rs      A5: AudioSink (WavSink | FfmpegSink); PCM       │
+│                 строго по порядку, паузы блоками, .partial +    │
+│                 hard_link, ffmpeg stdin/stderr/-n, resolve      │
+│  • pipeline.rs  synthesize_stream: чанки → пул → sink (без      │
+│                 накопления аудио); RunStatus Completed/         │
+│                 Cancelled/Failed; журнал-метаданные             │
 ├────────────────────────────────────────────────────────────────┤
 │ shtorm-engine (ядро; производное teratts-android, GPL-3.0)     │
 │  • pocket.rs  Pocket: load(Device,threads,seed) / say_chunk()   │

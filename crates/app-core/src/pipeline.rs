@@ -1,22 +1,18 @@
-//! A3: последовательный файловый конвейер синтеза (без GUI, без потоков —
-//! воркеры в A4).
+//! A3/A4/A5: конвейер синтеза (пул воркеров A4, потоковый вывод A5).
 //!
 //! Схема: chunk (A1, comma-semantics) → char_rules (A2) → Shtorm say_chunk
 //! (seed+index, EOS/анти-повторы движка не меняются) → brightness →
-//! denoise (опционально; при отсутствии модели — явное сообщение, без
-//! имитации) → trim/fade → пауза chunk_pause_s (приоритет конца абзаца над
-//! soft_break — задокументированное исправление) → сборка итогового аудио.
-//! Последний чанк файла — без вставки паузы.
+//! denoise (опционально; при отсутствии модели — явный статус Missing) →
+//! trim/fade → пауза chunk_pause_s (приоритет конца абзаца над soft_break) →
+//! AudioSink (WAV напрямую / ffmpeg stdin) строго по порядку.
+//! Последний чанк файла — без вставки паузы. Полное аудио в памяти НЕ
+//! накапливается: буферы ограничены окном воркеров и каналом.
 
 use anyhow::Result;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use shtorm_engine::denoise;
-use shtorm_engine::dsp::{fade_out, trim_edges};
-use shtorm_engine::{high_shelf, resample, Device, LoadOptions, Pocket, POCKET_RATE};
-use text_processing::{
-    apply_char_rules, chunk_pause_s, chunk_pipeline, to_model_stress_notation, CharRules,
-};
+use shtorm_engine::{Device, POCKET_RATE};
+use text_processing::{apply_char_rules, CharRules};
 
 /// Полные параметры прогона (зеркалируют SynthSettings + пути).
 #[derive(Debug, Clone)]
@@ -130,140 +126,10 @@ pub fn assemble(parts: &[(Vec<f32>, Option<f32>)], fs: u32) -> Vec<f32> {
     out
 }
 
-/// Полный прогон: текст → один WAV (если задан out) + метаданные.
-///
-/// `progress(index, total)` вызывается перед каждым чанком; возврат `false` —
-/// немедленная отмена с ошибкой (уже синтезированное НЕ записывается).
-pub fn synthesize<F>(
-    raw_text: &str,
-    opts: &PipelineOptions,
-    out: Option<&Path>,
-    mut progress: F,
-) -> Result<PipelineOutcome>
-where
-    F: FnMut(usize, usize) -> bool,
-{
-    // 1. Нарезка (A1) — конвейер ветки comma-semantics.
-    let chunks = chunk_pipeline(raw_text, opts.max_tokens);
-    anyhow::ensure!(!chunks.is_empty(), "текст пуст — нечего синтезировать");
-    let total = chunks.len();
-
-    // 2. Движок.
-    let mut engine = Pocket::load(
-        &opts.model_dir,
-        &LoadOptions {
-            device: opts.device.clone(),
-            threads: opts.threads,
-            seed: opts.seed,
-            profile_dir: None,
-        },
-    )?;
-    engine.temperature = opts.temperature;
-    engine.decode_steps = opts.decode_steps;
-    engine.eos_threshold = opts.eos_threshold;
-
-    // 3. Denoise (A4): включаем на ЭКЗЕМПЛЯРЕ движка только если файл модели
-    //    есть; фактическое применение подтверждается per-chunk результатом
-    //    engine.clean() (CleanOutcome) — наличие файла ничего не гарантирует.
-    let denoise_model = opts.model_dir.join(denoise::MODEL_FILE);
-    engine.denoise_on = resolve_denoise(opts.denoise, denoise_model.exists());
-    if opts.denoise && !denoise_model.exists() {
-        eprintln!(
-            "ВНИМАНИЕ: денойз включён, но модель не найдена: {} — синтез без очистки звука.",
-            denoise_model.display()
-        );
-    }
-    let mut denoise_report = DenoiseReport::default();
-
-    let voice = opts.voice.to_string_lossy().to_string();
-    let mut parts: Vec<(Vec<f32>, Option<f32>)> = Vec::with_capacity(total);
-    let mut outcomes: Vec<ChunkOutcome> = Vec::with_capacity(total);
-    let fs = POCKET_RATE;
-
-    for (i, chunk) in chunks.iter().enumerate() {
-        if !progress(i, total) {
-            anyhow::bail!("отменено пользователем на чанке {}/{}", i + 1, total);
-        }
-        // текст модели: ударения (как GUI) + правила модели
-        let mut model_text = to_model_stress_notation(&chunk.text);
-        if let Some(rules) = &opts.char_rules {
-            model_text = apply_char_rules(&model_text, rules);
-        }
-        let audio = engine.say_chunk(&model_text, &voice, i as u64)?;
-        outcomes.push(ChunkOutcome {
-            index: i,
-            text: chunk.text.clone(),
-            pause_s: None, // заполним ниже (нужно для assemble и отчёта)
-            speech_samples: 0,
-        });
-
-        let mut piece = audio;
-        if opts.brightness_db > 0.05 {
-            high_shelf(&mut piece, opts.brightness_db, 3000.0, fs as f32);
-        }
-        if engine.denoise_on {
-            match engine.clean(&piece) {
-                shtorm_engine::CleanOutcome::Applied(clean) => {
-                    let back = resample(&clean, denoise::RATE, fs);
-                    piece = back[..back.len().min(piece.len())].to_vec();
-                    denoise_report.applied += 1;
-                }
-                shtorm_engine::CleanOutcome::ModelMissing => denoise_report.missing += 1,
-                shtorm_engine::CleanOutcome::Off => denoise_report.off += 1,
-                shtorm_engine::CleanOutcome::LoadFailed(e)
-                | shtorm_engine::CleanOutcome::RunFailed(e) => {
-                    if denoise_report.first_error.is_none() {
-                        denoise_report.first_error = Some(e);
-                    }
-                    denoise_report.failed += 1;
-                }
-            }
-        } else {
-            denoise_report.off += 1;
-        }
-        // тератт-режим GUI: тишина хвоста EOS срезается по звуку, фейд 10 мс
-        let mut piece = trim_edges(&piece, 0.02, 0.10, fs);
-        fade_out(&mut piece, fs);
-
-        // пауза: по исходному чанку (не по model_text), приоритет конца абзаца
-        let pause = chunk_pause_s(
-            chunk,
-            i + 1 == total,
-            opts.paragraph_pause_s,
-            opts.pause_scale,
-        );
-        let speech_samples = piece.len();
-        outcomes[i].pause_s = pause;
-        outcomes[i].speech_samples = speech_samples;
-        parts.push((piece, pause));
-    }
-
-    let assembled = assemble(&parts, fs);
-    let speech_samples: usize = parts.iter().map(|(a, _)| a.len()).sum();
-    let pause_samples = assembled.len().saturating_sub(speech_samples);
-
-    if let Some(path) = out {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-        audio_processing::write_wav16(path, fs, &assembled)?;
-    }
-
-    Ok(PipelineOutcome {
-        sample_rate: fs,
-        total_samples: assembled.len(),
-        speech_samples,
-        pause_samples,
-        chunks: outcomes,
-        denoise_report,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use text_processing::{chunk_pause_s, chunk_pipeline};
 
     fn marker_parts() -> Vec<(Vec<f32>, Option<f32>)> {
         // чанк k — k сэмплов со значением k+1 (маркер порядка/потерь/дублей)
@@ -466,9 +332,10 @@ mod denoise_tests {
     }
 }
 
-// ============================ A4: параллельный путь ============================
+// ============================ A5: потоковый конвейер ============================
 
-use crate::pool::{run_job, PoolConfig, SeedPolicy, Task};
+use crate::pool::{run_job, ChunkTiming, DenoiseChunkStatus, PoolConfig, SeedPolicy, Task};
+use crate::sink::AudioSink;
 use crate::worker::real_worker_factory;
 use std::sync::atomic::AtomicBool;
 
@@ -480,40 +347,50 @@ pub enum RunStatus {
     Failed,
 }
 
-/// Итог параллельного прогона: аудио-метрики конвейера + метрики пула.
-#[derive(Debug)]
-pub struct ParallelOutcome {
-    pub sample_rate: u32,
-    pub total_samples: usize,
+/// Строка журнала по одному чанку (метаданные, не аудио).
+#[derive(Debug, Clone)]
+pub struct ChunkLogRow {
+    pub index: usize,
+    pub text: String,
+    pub worker_id: Option<usize>,
+    pub ms: Option<u128>,
+    pub denoise: DenoiseChunkStatus,
     pub speech_samples: usize,
-    pub pause_samples: usize,
-    pub chunks: Vec<ChunkOutcome>,
-    pub denoise_report: DenoiseReport,
-    /// Базовый seed задания (при Random зафиксирован здесь — для повтора).
-    pub base_seed: u64,
-    pub workers: usize,
-    /// Максимум буфера переупорядочивания (backpressure ограничен окном).
-    pub max_buffered: usize,
-    /// Максимум PCM-байт в буфере переупорядочивания (диагностика памяти).
-    pub max_buffered_bytes: usize,
-    /// Чанков фактически выдано в sink (Completed: == total).
-    pub chunks_done: usize,
-    pub status: RunStatus,
+    pub pause_s: Option<f32>,
 }
 
-/// Параллельный конвейер (A4): те же этапы и семантика, что `synthesize`,
-/// но чанки выполняют N воркеров с собственными экземплярами Pocket.
-/// Порядок выдачи — строгий исходный; seed = base + глобальный индекс чанка
-/// (не зависит от воркера). `out` пишется одним WAV (create_new).
-/// `progress(done, total)` вызывается по мере ГОТОВНОСТИ чанков.
-pub fn synthesize_parallel<F>(
+/// Итог потокового прогона: пути/статус/метрики, без аудио в памяти.
+#[derive(Debug)]
+pub struct StreamOutcome {
+    pub status: RunStatus,
+    /// Итоговый файл (только при Completed).
+    pub path: Option<PathBuf>,
+    /// Черновик (диагностика при отмене/ошибке; при Completed уже убран).
+    pub partial_path: PathBuf,
+    pub workers: usize,
+    pub base_seed: u64,
+    pub max_buffered: usize,
+    pub max_buffered_bytes: usize,
+    pub chunks_done: usize,
+    pub total_chunks: usize,
+    pub sample_rate: u32,
+    pub speech_samples: u64,
+    pub pause_samples: u64,
+    pub denoise_report: DenoiseReport,
+    pub chunks: Vec<ChunkLogRow>,
+}
+
+/// Потоковый конвейер A5: чанки пишутся в `sink` строго по порядку, полное
+/// аудио в памяти НЕ накапливается (буферы ограничены окном воркеров).
+/// Тот же расчёт пауз/seed, что в A3/A4; при отмене итог не публикуется.
+pub fn synthesize_stream<F>(
     raw_text: &str,
     opts: &PipelineOptions,
     workers: usize,
-    out: Option<&Path>,
+    sink: Box<dyn AudioSink>,
     mut progress: F,
     cancel: &AtomicBool,
-) -> Result<ParallelOutcome>
+) -> Result<StreamOutcome>
 where
     F: FnMut(usize, usize),
 {
@@ -523,16 +400,13 @@ where
     anyhow::ensure!(!chunks.is_empty(), "текст пуст — нечего синтезировать");
     let total = chunks.len();
     let fs = POCKET_RATE;
+    let partial_path = sink.partial_path();
 
-    // Политика seed: фиксированный или случайный-раз-на-задание (фиксируем
-    // ЗДЕСЬ, чтобы вернуть в исходе и передать всем воркерам одинаково).
     let base_seed = match opts.seed {
         Some(s) => s,
         None => SeedPolicy::Random.resolve(),
     };
 
-    // Задачи: текст модели (ударения + char_rules) и пауза — считаются
-    // заранее, ДО очереди; индекс = позиция в исходном порядке.
     let tasks: Vec<Task> = chunks
         .iter()
         .enumerate()
@@ -561,46 +435,69 @@ where
     };
     let factory = real_worker_factory(opts, base_seed);
 
-    let mut assembled: Vec<f32> = Vec::new();
-    let mut outcomes: Vec<ChunkOutcome> = chunks
-        .iter()
-        .map(|c| ChunkOutcome {
-            index: 0,
-            text: c.text.clone(),
-            pause_s: None,
-            speech_samples: 0,
-        })
-        .collect();
     let mut done_ref = 0usize;
-
-    // sink собирает итог прямо в порядке выдачи; run_job дропает воркеров
-    // (join) до возврата — экземпляры Pocket освобождены к моменту записи WAV
-    let summary = run_job(
+    let mut sink = sink;
+    let run = run_job(
         &cfg,
-        tasks,
+        tasks.clone(),
         factory,
         |i, pcm, pause| {
-            outcomes[i].index = i;
-            outcomes[i].pause_s = pause;
-            outcomes[i].speech_samples = pcm.len();
-            assembled.extend_from_slice(pcm);
-            if let Some(p) = pause {
-                assembled.extend(audio_processing::silence(p, fs));
-            }
+            sink.write_chunk(i, pcm, pause)?;
             done_ref += 1;
             progress(done_ref, total);
             Ok(())
         },
         cancel,
         SeedPolicy::Fixed(base_seed),
-    )?;
+    );
 
-    let speech_samples: usize = outcomes.iter().map(|c| c.speech_samples).sum();
-    let pause_samples = assembled.len().saturating_sub(speech_samples);
+    let summary = match run {
+        Ok(s) => s,
+        Err(e) => {
+            // черновик осознанно остаётся для диагностики (без удалений)
+            return Err(anyhow::anyhow!(
+                "{e:#}\nчерновик сохранён: {}",
+                partial_path.display()
+            ));
+        }
+    };
 
-    // A4-фикс: при отмене итоговый файл НЕ публикуется (неполный результат
-    // не должен выглядеть как готовая книга); явный статус и счёт чанков —
-    // в возвращаемом исходе. Failed передаётся вызывающему через Err.
+    // метаданные журнала: текст/пауза из задач, воркер/время/денойз из timings
+    let mut by_index: std::collections::HashMap<usize, ChunkTiming> = summary
+        .timings
+        .iter()
+        .cloned()
+        .map(|t| (t.index, t))
+        .collect();
+    let rows: Vec<ChunkLogRow> = chunks
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let t = by_index.remove(&i);
+            ChunkLogRow {
+                index: i,
+                text: c.text.clone(),
+                worker_id: t.as_ref().map(|t| t.worker_id),
+                ms: t.as_ref().map(|t| t.ms),
+                denoise: t
+                    .as_ref()
+                    .map(|t| t.denoise.clone())
+                    .unwrap_or(DenoiseChunkStatus::Off),
+                speech_samples: t.as_ref().map(|t| t.samples).unwrap_or(0),
+                pause_s: tasks[i].pause_s,
+            }
+        })
+        .collect();
+    let speech_samples: u64 = rows.iter().map(|r| r.speech_samples as u64).sum();
+    let pause_samples: u64 = rows
+        .iter()
+        .map(|r| {
+            r.pause_s
+                .map(|p| (p.max(0.0) * fs as f32) as u64)
+                .unwrap_or(0)
+        })
+        .sum();
+
     let status = if summary.cancelled {
         RunStatus::Cancelled
     } else if summary.chunks_done == total {
@@ -608,36 +505,40 @@ where
     } else {
         RunStatus::Failed
     };
-    if status == RunStatus::Failed {
-        anyhow::bail!(
-            "синтез не завершён: {}/{} чанков (без отмены) — файл не создан",
-            summary.chunks_done,
-            total
-        );
-    }
-    if status == RunStatus::Completed {
-        if let Some(path) = out {
-            if let Some(parent) = path.parent() {
-                if !parent.as_os_str().is_empty() {
-                    std::fs::create_dir_all(parent)?;
-                }
-            }
-            audio_processing::write_wav16(path, fs, &assembled)?;
-        }
-    }
 
-    Ok(ParallelOutcome {
-        sample_rate: fs,
-        total_samples: assembled.len(),
-        speech_samples,
-        pause_samples,
-        chunks: outcomes,
-        denoise_report: summary.denoise,
-        base_seed,
+    let (path, final_partial) = match status {
+        RunStatus::Completed => {
+            let published = sink.finalize()?;
+            (Some(published), partial_path)
+        }
+        RunStatus::Cancelled => {
+            // неполный результат не публикуется; черновик остаётся и сообщается
+            (None, partial_path)
+        }
+        RunStatus::Failed => {
+            anyhow::bail!(
+                "синтез не завершён: {}/{} чанков (без отмены) — файл не создан; черновик: {}",
+                summary.chunks_done,
+                total,
+                partial_path.display()
+            );
+        }
+    };
+
+    Ok(StreamOutcome {
+        status,
+        path,
+        partial_path: final_partial,
         workers: summary.workers,
+        base_seed,
         max_buffered: summary.max_buffered,
         max_buffered_bytes: summary.max_buffered_bytes,
         chunks_done: summary.chunks_done,
-        status,
+        total_chunks: total,
+        sample_rate: fs,
+        speech_samples,
+        pause_samples,
+        denoise_report: summary.denoise,
+        chunks: rows,
     })
 }

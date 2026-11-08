@@ -1,0 +1,13 @@
+поток: out/a4_text.txt | формат Wav (-V2 (Высокое)) | чанков-лимит 50 | паузы ×1.00 | абзац 0.90 с | cpu | воркеров 1
+[2026-11-08T22:10:41Z INFO  shtorm_engine::pocket] load mimi_encoder: 196 ms
+[2026-11-08T22:10:41Z INFO  shtorm_engine::pocket] load text_conditioner: 15 ms
+[2026-11-08T22:10:41Z INFO  shtorm_engine::pocket] load flow_lm_main: 617 ms
+[2026-11-08T22:10:42Z INFO  shtorm_engine::pocket] load flow_lm_flow: 109 ms
+[2026-11-08T22:10:42Z INFO  shtorm_engine::pocket] load mimi_decoder: 172 ms
+  [1/3] готов
+  [2/3] готов
+  [3/3] готов
+файл: out/a5_mem_short2.wav (18.45 с: речь 16.66 с + паузы 1.80 с; чанков 3; 16.25 с генерации, RTF 0.881)
+пул: воркеров 1, base_seed 42, буфер переупорядочивания <= 1 чанков / 726 КиБ PCM
+денойз: выключен
+SAMPLER2 wall=16.3s peakWS=1340MB peakPrivate=1591MB exit=0

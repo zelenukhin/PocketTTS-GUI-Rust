@@ -5,6 +5,8 @@
 //! файла (`OpenOptions::create_new` + `WavWriter::new`): существующий файл
 //! НИКОГДА не перезаписывается и не усекается (политика SAFETY_AUDIT.md).
 
+pub mod stream;
+
 use anyhow::{Context, Result};
 use std::path::Path;
 

@@ -1,22 +1,22 @@
-//! synthesize — A3/A4 CLI: текстовый файл → один WAV с паузами.
-//! Последовательный конвейер (A3); параллельные воркеры подключает A4.
+//! synthesize — A5 CLI: текстовый файл → WAV/MP3/Opus потоком (без накопления
+//! аудио в памяти). Пул воркеров A4, синк A5.
 //!
 //!   set ORT_DYLIB_PATH=...\onnxruntime.dll
 //!   synthesize --model-dir <onnx\ru-v2-slow> --voice <v.wav> \
-//!     --text-file book.txt --out out\book.wav --device cuda \
-//!     --char-rules <runtime.json модели>
+//!     --text-file book.txt --out out\book.mp3 --format mp3 --device cuda --workers 2
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use app_core::pipeline::{synthesize_parallel, PipelineOptions, PipelineOutcome};
+use app_core::pipeline::{synthesize_stream, PipelineOptions, RunStatus, StreamOutcome};
+use app_core::sink::{make_sink, OutputFormat};
 use shtorm_engine::Device;
 use text_processing::CharRules;
 
 #[derive(Parser, Debug)]
-#[command(about = "Shtorm A3: text file -> one WAV with teratts pauses (FP32, CPU/CUDA)")]
+#[command(about = "Shtorm A5: text file -> streamed WAV/MP3/Opus with teratts pauses")]
 struct Args {
     #[arg(long)]
     model_dir: PathBuf,
@@ -24,8 +24,18 @@ struct Args {
     voice: PathBuf,
     #[arg(long)]
     text_file: PathBuf,
+    /// Итоговый файл
     #[arg(long)]
     out: PathBuf,
+    /// wav | mp3 | opus
+    #[arg(long, default_value = "wav")]
+    format: String,
+    /// Пресет качества (метки как в Python GUI; значения с «-V..»)
+    #[arg(long, default_value = "-V2 (Высокое)", allow_hyphen_values = true)]
+    mp3_preset: String,
+    /// Явный путь к ffmpeg (иначе: рядом с exe → ../ffmpeg → PATH)
+    #[arg(long)]
+    ffmpeg: Option<PathBuf>,
     #[arg(long, default_value = "cpu")]
     device: String,
     #[arg(long, default_value_t = 0)]
@@ -53,12 +63,21 @@ struct Args {
     /// runtime.json модели (секция char_rules)
     #[arg(long)]
     char_rules: Option<PathBuf>,
-    /// Писать рядом с WAV {имя}_log.txt со списком чанков и пауз
+    /// Писать рядом {имя}_log.txt (metadata-only журнал)
     #[arg(long, default_value_t = false)]
     chunk_log: bool,
-    /// Параллельные воркеры (каждый со своим экземпляром движка); 1 — один.
+    /// Параллельные воркеры (каждый со своим экземпляром движка)
     #[arg(long, default_value_t = 1)]
     workers: usize,
+}
+
+fn parse_format(s: &str) -> Result<OutputFormat> {
+    match s.to_ascii_lowercase().as_str() {
+        "wav" => Ok(OutputFormat::Wav),
+        "mp3" => Ok(OutputFormat::Mp3),
+        "opus" => Ok(OutputFormat::Opus),
+        other => bail!("--format: wav|mp3|opus, получено {other}"),
+    }
 }
 
 fn main() -> Result<()> {
@@ -67,7 +86,8 @@ fn main() -> Result<()> {
     if std::env::var("ORT_DYLIB_PATH").is_err() {
         bail!("ORT_DYLIB_PATH не задан (см. tools/smoke-cpu.ps1 / smoke-cuda.ps1)");
     }
-    // Политика безопасности (SAFETY_AUDIT.md): существующие файлы не трогаем.
+    let format = parse_format(&args.format)?;
+    // политика безопасности: существующие файлы не трогаем (синк тоже проверит)
     anyhow::ensure!(
         !args.out.exists(),
         "выходной файл уже существует: {} — укажите другое имя",
@@ -88,7 +108,6 @@ fn main() -> Result<()> {
         other => bail!("--device cpu|cuda, получено {other}"),
     };
 
-    // char_rules из runtime.json модели (секция char_rules, если есть)
     let char_rules = match &args.char_rules {
         Some(p) => {
             let raw =
@@ -114,7 +133,6 @@ fn main() -> Result<()> {
 
     let raw_text = std::fs::read(&args.text_file)
         .with_context(|| format!("read {}", args.text_file.display()))?;
-    // как Python GUI: чтение UTF-8 с заменой некорректных байтов
     let text = String::from_utf8_lossy(&raw_text).into_owned();
 
     let opts = PipelineOptions {
@@ -139,88 +157,90 @@ fn main() -> Result<()> {
     };
 
     println!(
-        "конвейер: {} | чанков-лимит {} ток. | паузы ×{:.2} | абзац {:.2} с | устройство {} | воркеров {}",
+        "поток: {} | формат {:?} ({}) | чанков-лимит {} | паузы ×{:.2} | абзац {:.2} с | {} | воркеров {}",
         args.text_file.display(),
+        format,
+        args.mp3_preset,
         args.max_tokens,
         args.pause_scale,
         args.paragraph_pause_s,
         args.device,
         args.workers
     );
-    let t = Instant::now();
+
+    let sink = make_sink(
+        &args.out,
+        24_000,
+        format,
+        &args.mp3_preset,
+        args.ffmpeg.as_deref(),
+    )?;
     let cancel = std::sync::atomic::AtomicBool::new(false);
-    let outcome = synthesize_parallel(
+    let t = Instant::now();
+    let outcome = synthesize_stream(
         &text,
         &opts,
         args.workers,
-        Some(&args.out),
+        sink,
         |done, total| println!("  [{done}/{total}] готов"),
         &cancel,
     )?;
     let elapsed = t.elapsed().as_secs_f32();
 
     match outcome.status {
-        app_core::pipeline::RunStatus::Cancelled => {
-            // A4-фикс: неполный результат не публикуется и не называется успехом
+        RunStatus::Cancelled => {
             println!(
-                "ОТМЕНЕНО: обработано {}/{} чанков; итоговый файл {} НЕ создан",
+                "ОТМЕНЕНО: обработано {}/{} чанков; итоговый файл НЕ создан; черновик: {}",
                 outcome.chunks_done,
-                outcome.chunks.len(),
-                args.out.display()
+                outcome.total_chunks,
+                outcome.partial_path.display()
             );
             std::process::exit(2);
         }
-        app_core::pipeline::RunStatus::Failed => {
-            anyhow::bail!("синтез не завершён (Failed) — файл не создан");
-        }
-        app_core::pipeline::RunStatus::Completed => {}
+        RunStatus::Failed => bail!("синтез не завершён (Failed) — файл не создан"),
+        RunStatus::Completed => {}
     }
-    let total_s = outcome.total_samples as f32 / outcome.sample_rate as f32;
-    let speech_s = outcome.speech_samples as f32 / outcome.sample_rate as f32;
-    println!(
-        "WAV: {} ({:.2} с: речь {:.2} с + паузы {:.2} с; чанков {}; {:.2} с генерации, RTF {:.3})",
-        args.out.display(),
-        total_s,
-        speech_s,
-        total_s - speech_s,
-        outcome.chunks.len(),
-        elapsed,
-        elapsed / total_s.max(1e-6)
-    );
-    println!(
-        "пул: воркеров {}, base_seed {}, буфер переупорядочивания <= {} чанков / {} КиБ PCM",
-        outcome.workers,
-        outcome.base_seed,
-        outcome.max_buffered,
-        outcome.max_buffered_bytes / 1024
-    );
-    println!("денойз: {}", outcome.denoise_report.summary());
-    let outcome = app_core::pipeline::PipelineOutcome {
-        sample_rate: outcome.sample_rate,
-        total_samples: outcome.total_samples,
-        speech_samples: outcome.speech_samples,
-        pause_samples: outcome.pause_samples,
-        chunks: outcome.chunks.clone(),
-        denoise_report: outcome.denoise_report.clone(),
-    };
+
+    print_outcome(&args.out, &outcome, elapsed);
 
     if args.chunk_log {
-        // Независимая диагностика (A4): статус АУДИО уже успешен выше; сбой
-        // журнала не отменяет его и не маскируется — отдельное сообщение.
-        if let Err(log_err) = write_chunk_log(&chunk_log_path, &outcome) {
-            println!(
-                "⚠ АУДИО УСПЕШНО: {}\n⚠ ЖУРНАЛ ЧАНКОВ НЕ СОЗДАН: {} — {log_err}",
+        // журнал опционален: сбой не маскирует успешное аудио (независимый статус)
+        match write_chunk_log(&chunk_log_path, &outcome, &args) {
+            Ok(()) => println!("лог чанков: {}", chunk_log_path.display()),
+            Err(e) => println!(
+                "⚠ АУДИО УСПЕШНО: {}\n⚠ ЖУРНАЛ ЧАНКОВ НЕ СОЗДАН: {} — {e}",
                 args.out.display(),
                 chunk_log_path.display()
-            );
-        } else {
-            println!("лог чанков: {}", chunk_log_path.display());
+            ),
         }
     }
     Ok(())
 }
 
-/// {out-stem}_log.txt рядом с WAV.
+fn print_outcome(out: &Path, o: &StreamOutcome, elapsed: f32) {
+    let total_s = (o.speech_samples + o.pause_samples) as f64 / o.sample_rate as f64;
+    let speech_s = o.speech_samples as f64 / o.sample_rate as f64;
+    println!(
+        "файл: {} ({:.2} с: речь {:.2} с + паузы {:.2} с; чанков {}; {:.2} с генерации, RTF {:.3})",
+        out.display(),
+        total_s,
+        speech_s,
+        total_s - speech_s,
+        o.chunks.len(),
+        elapsed,
+        elapsed as f64 / total_s.max(1e-9)
+    );
+    println!(
+        "пул: воркеров {}, base_seed {}, буфер переупорядочивания <= {} чанков / {} КиБ PCM",
+        o.workers,
+        o.base_seed,
+        o.max_buffered,
+        o.max_buffered_bytes / 1024
+    );
+    println!("денойз: {}", o.denoise_report.summary());
+}
+
+/// {out-stem}_log.txt рядом с файлом.
 pub fn log_path_for(out: &Path) -> PathBuf {
     let stem = out
         .file_stem()
@@ -229,23 +249,43 @@ pub fn log_path_for(out: &Path) -> PathBuf {
     out.with_file_name(format!("{stem}_log.txt"))
 }
 
-fn write_chunk_log(path: &Path, outcome: &PipelineOutcome) -> Result<()> {
+fn write_chunk_log(path: &Path, o: &StreamOutcome, args: &Args) -> Result<()> {
     use std::io::Write;
     let mut w = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)
         .with_context(|| format!("создать {}", path.display()))?;
-    writeln!(w, "Лог чанков (A3/A4)")?;
-    writeln!(w, "Чанков: {}", outcome.chunks.len())?;
-    writeln!(w, "Денойз: {}", outcome.denoise_report.summary())?;
-    for c in &outcome.chunks {
+    writeln!(w, "Лог чанков (A5)")?;
+    writeln!(
+        w,
+        "Устройство: {}; воркеров: {}; base_seed: {}",
+        args.device, o.workers, o.base_seed
+    )?;
+    writeln!(
+        w,
+        "Формат: {:?} ({}); чанков: {}",
+        parse_format(&args.format)?,
+        args.mp3_preset,
+        o.chunks.len()
+    )?;
+    writeln!(w, "Статус: {:?}", o.status)?;
+    writeln!(w, "Денойз: {}", o.denoise_report.summary())?;
+    for c in &o.chunks {
         writeln!(w, "[{}] {}", c.index + 1, c.text)?;
-        let speech_s = c.speech_samples as f32 / outcome.sample_rate as f32;
-        match c.pause_s {
-            Some(p) => writeln!(w, "    -> пауза {p:.2} с; речь {speech_s:.2} с")?,
-            None => writeln!(w, "    -> конец файла (без паузы); речь {speech_s:.2} с")?,
-        }
+        writeln!(
+            w,
+            "    -> воркер {}; {:.2} с генерации; речь {:.2} с; пауза {}; денойз {:?}",
+            c.worker_id
+                .map(|w| (w + 1).to_string())
+                .unwrap_or_else(|| "?".into()),
+            c.ms.unwrap_or(0) as f64 / 1000.0,
+            c.speech_samples as f64 / o.sample_rate as f64,
+            c.pause_s
+                .map(|p| format!("{p:.2} с"))
+                .unwrap_or_else(|| "нет (конец файла)".into()),
+            c.denoise
+        )?;
     }
     Ok(())
 }

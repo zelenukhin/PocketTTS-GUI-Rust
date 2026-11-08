@@ -84,7 +84,6 @@ impl Default for PoolConfig {
 
 /// Временная статистика одного чанка.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // worker_id: читается отчётами A5 (лог чанков/прогресс)
 #[allow(dead_code)] // worker_id/denoise/samples: журнал A5 и будущий GUI
 pub struct ChunkTiming {
     pub index: usize,

@@ -7,6 +7,7 @@ pub mod diagnostics;
 pub mod pipeline;
 pub mod pool;
 pub mod settings;
+pub mod sink;
 pub mod trace_dir;
 pub mod worker;
 

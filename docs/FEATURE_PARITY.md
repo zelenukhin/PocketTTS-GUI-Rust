@@ -28,8 +28,8 @@
 | **«Задваивать запятые» (чекбокс test-GUI)** | 📝 | `_patch_dup_log.py` | тривиально после чанкования |
 | **Параллельные воркеры (1–N, очереди, порядок, отмена)** | ✅ (A4, 2026-11-08) | app-core `pool.rs` + `worker.rs` + `pipeline::synthesize_parallel` | N воркеров × собственный Pocket; ограниченные очереди + скользящее окно (backpressure, буфер ≤ окна); порядок строгий; seed = base+индекс (не зависит от воркера); ошибка чанка/старта/sink останавливает задание; отмена без зависаний (send_timeout + join); Pocket дропаются в потоках воркеров до возврата; **детерминизм: CPU и CUDA 1w vs 2w — побитово** (3 и 47 чанков); CLI `--workers`, `--seed -1` → base_seed в логе. Сценарные тесты пула — на моках без ONNX (8 шт.: порядок/1v2/ошибка/отмена/ранний-долгий/reuse/старт-сбой) |
 | **Перезапуск воркеров каждые N файлов** | ⬜ | GUI `pool_factory` | в Rust пересоздание `Pocket` в потоке; следить за VRAM/RAM (bench покажет, нужен ли вообще) |
-| **Потоковая запись WAV / MP3 / Opus (ffmpeg-пайп)** | ⬜ | GUI `_synthesize_file_streaming` | hound-стример/WAV напрямую; MP3/Opus — `std::process` ffmpeg с теми же флагами кодирования |
-| **Лог чанков `{имя}_log.txt`** | ⬜ | GUI `_write_chunk_log` | тривиально |
+| **Потоковая запись WAV / MP3 / Opus (ffmpeg-пайп)** | ✅ (A5, 2026-11-09) | `audio-processing::stream::StreamingWav` + `app-core::sink::FfmpegSink` | PCM сразу в файл/stdin ffmpeg, без накопления; аргументы 1:1 (libmp3lame -q/-b, libopus -b); `.partial` + hard_link-публикация; `create_new`; RIFF-лимит; ffprobe/декод проверены |
+| **Лог чанков `{имя}_log.txt`** | ✅ (A5) | CLI `--chunk-log` | текст/номер/воркер/время/речь/пауза/denoise/seed/устройство/статус; ошибка журнала не маскирует аудио |
 | **Рекурсивная обработка папки (.txt/.md/.log)** | ⬜ | GUI `_process_directory_recursively` | `walkdir` |
 | **Отмена (Stop), прогресс** | ⬜ | GUI cancel_event/progress_queue | AtomicBool + каналы |
 | **GUI (eframe/egui), свёртки, тёмная тема, settings.json** | ⬜ | — | этап после конвейера |
