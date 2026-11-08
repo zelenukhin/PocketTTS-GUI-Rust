@@ -1,0 +1,103 @@
+# GUI_PLAN — нативный GUI на eframe/egui (план, реализация не начата)
+
+Ориентир — функциональная совместимость с актуальным Python PocketTTS-GUI
+(`C:\PocketTTS-GUI\PocketTTS-GUI\pocket-tts_gui.py` + synthesis_worker.py).
+Нейросетевой движок и семантика синтеза не меняются — GUI лишь управляет уже
+готовым API (`app_core::pipeline::synthesize_stream`, `pool`, `sink`).
+
+## Архитектура
+
+- Новый крейт `crates/gui` (bin `shtorm-gui`), зависимости: `eframe/egui`,
+  `rfd` (диалоги файлов/каталогов), `walkdir` (batch), `serde_json`
+  (настройки), `ctrlc` (отмена), `app-core`/`text-processing`.
+- Потоковая модель: UI-поток рисует состояние; «Работа» — отдельный поток,
+  внутри — `synthesize_stream` с пулом A4. Общение: `std::sync::mpsc`
+  канал событий `UIEvent { Progress(done,total), ChunkLog(row), Finished(RunStatus, StreamOutcome), Failed(StreamError), Log(line) }`;
+  UI вызывает `ctx.request_repaint()` по приходу события.
+- Отмена = `Arc<AtomicBool>` задания (кнопка Stop и Ctrl+C); статусы —
+  единые `RunStatus::{Completed, Cancelled, Failed}`; при отмене итоговый
+  файл не публикуется, показываются `.partial` и путь диагностического
+  журнала.
+
+## Экраны (Layout как в Python GUI, свёртки сохранить)
+
+1. **Режим**: Одиночный файл / Папка (рекурсивно); «Перезапуск воркеров
+   каждые N файлов» (в Rust = пересоздание пула Pocket).
+2. **Источник и голос**: поле пути + «Обзор…»; голос — комбо пресетов
+   (`male_deep`, `female_silky`, `male_authoritative` — пути к `.safetensors`
+   либо WAV), поле WAV-промпта с «Обзор…» (WAV/Safetensors).
+3. **Параметры генерации**: Модель (встроенная + `custom_models/*`), Температура
+   0.10–1.50, Масштаб пауз 0–2, Пауза абзаца 0–3 с, Макс. токенов 10–300,
+   Устройство Auto/CPU/CUDA, Шаги декодирования 1–32, Seed (int, −1 =
+   случайный), Порог EOS (Авто/список), Кадров после EOS (Авто/None/0–3),
+   EOS teratts (чекбокс; порог −4 + хвост 4/6), Защита от повторов,
+   Очистка звука (DPDFNet), Яркость 0–12 дБ.
+   «Авто»-значения EOS/char_rules — из `runtime.json` модели (логика разрешения
+   переносится из GUI `_resolve_auto_runtime`; backend уже принимает
+   `--char-rules`; добавить чтение `eos_threshold`/`frames_after_eos`).
+4. **Вывод**: «Процессы синтеза» (1–12 → `--workers`), формат: wav или
+   mp3/opus + пресет качества (метки как в GUI: `-V0..-V4`, `192k/128k`,
+   `opus 96k/64k/32k`), «Лог чанков» (файл `{имя}_log.txt`), папка результата.
+5. **Кнопки**: Сохранить настройки, Начать синтез, Стоп; прогресс-бар;
+   лог (цветной, stderr-строки красным, автопрокрутка, копирование).
+
+## Настройки (settings_pocket_tts.json)
+
+- Читать/писать ТОТ ЖЕ файл формата Python GUI: маппинг полей уже начат в
+  `app-core::settings::SynthSettings` (temperature, sampler_decode_steps,
+  eos_threshold, seed, brightness_db, denoise, anti_repeat, pause_scale,
+  paragraph_pause_s, device, num_model_instances) + добавить остальные ключи
+  (voice_source, model_config, mp3_preset, use_wav, chunk_log, source_path_*,
+  output_dir_path, restart_workers*, expanded-флаги блоков, eos_threshold/
+  frames_after_eos метки).
+- Неизвестные ключи сохранять (serde_json::Value passthrough), чтобы не
+  разрушать настройки при переключении между Python-GUI и Rust-GUI.
+- Миграция устаревших значений (LEGACY_DEFAULT_VOICE) — перенести.
+
+## Пакетная обработка
+
+- Обход каталога `walkdir` по `.txt/.md/.log` (как GUI), сохранение
+  относительной структуры в папке результата; общий прогресс по файлам и
+  построчный по чанкам.
+- «Перезапуск воркеров каждые N файлов»: по каунтеру пересоздавать пул
+  (новые Pocket; старые дропаются в потоках — память освобождается).
+- Ошибка одного файла не валит задание: файл помечается Failed, диагностический
+  журнал; итоговый отчёт «успешно K из N».
+
+## Portable FFmpeg и модели
+
+- ffmpeg: `sink::resolve_ffmpeg` (явный путь из настроек → рядом с exe →
+  `../ffmpeg/ffmpeg.exe` → PATH); в UI показывать найденный путь/статус и
+  позволять выбрать вручную. Портативная сборка кладёт `ffmpeg.exe` рядом.
+- Модели: сканировать `custom_models/*` (папка с `*.yaml`) + список встроенных;
+  отображать выбранный config и наличие `dpdfnet2_48khz_hr.onnx`
+  (для денойза — статус «модель найдена/отсутствует»).
+- DLL onnxruntime: CPU/GPU выбор через `ORT_DYLIB_PATH` (лаунчер) — показать
+  в UI текущий путь/провайдер и предупреждать при CUDA-fallback (уже есть
+  VRAM-проверка в smoke; в GUI — предупреждение по факту job-телеметрии).
+
+## Этапы реализации
+
+1. **G1**: каркас `crates/gui` (eframe), чтение/запись settings JSON,
+   статическая форма, валидация/clamps.
+2. **G2**: одиночный файл: сборка `PipelineOptions`, запуск в фоновом потоке,
+   прогресс/лог/Стоп, статусы Completed/Cancelled/Failed, журнал чанков.
+3. **G3**: пакетный режим, перезапуск воркеров, миграция настроек, отчёт.
+4. **G4**: портативная сборка (exe + deps/portable + ffmpeg + лаунчер),
+   иконка, ассоциации не настраивать.
+5. **G5**: полировка (свёртки блоков, тема, копирование лога, ошибки CUDA).
+
+## Критерии готовности GUI
+
+- Совпадение поведения с Python GUI на одинаковых входах: чанки/паузы
+  (golden A1/A3/A5 уже в проекте), журнал чанков, статусы отмены.
+- WAV при одинаковых параметрах/seed побитово совпадает с CLI-путём
+  (GUI — тонкая обёртка над тем же `synthesize_stream`).
+- Никаких блокировок UI; Stop останавливает выдачу и не публикует неполный
+  файл; все файлы создаются эксклюзивно (SAFETY_AUDIT-политика).
+
+## Что нужно доделать в backend до/во время G2
+
+- Чтение `runtime.json` (EOS/frames auto + char_rules) в CLI/GUI-слое.
+- Сборка каталога: `batch` helper в app-core (walkdir) с отчётом по файлам.
+- Денойз с реальным файлом модели (сквозной прогон) — пункт «Осталось до GUI».

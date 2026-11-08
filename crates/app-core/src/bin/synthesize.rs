@@ -1,16 +1,18 @@
 //! synthesize — A5 CLI: текстовый файл → WAV/MP3/Opus потоком (без накопления
-//! аудио в памяти). Пул воркеров A4, синк A5.
-//!
-//!   set ORT_DYLIB_PATH=...\onnxruntime.dll
-//!   synthesize --model-dir <onnx\ru-v2-slow> --voice <v.wav> \
-//!     --text-file book.txt --out out\book.mp3 --format mp3 --device cuda --workers 2
+//! аудио в памяти). Пул воркеров A4, синк A5, отмена Ctrl+C с диагностическим
+//! журналом и корректным кодом выхода (без process::exit в середине работы).
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
-use app_core::pipeline::{synthesize_stream, PipelineOptions, RunStatus, StreamOutcome};
+use app_core::pipeline::{
+    synthesize_stream, PipelineOptions, RunStatus, StreamError, StreamOutcome,
+};
 use app_core::sink::{make_sink, OutputFormat};
 use shtorm_engine::Device;
 use text_processing::CharRules;
@@ -30,7 +32,7 @@ struct Args {
     /// wav | mp3 | opus
     #[arg(long, default_value = "wav")]
     format: String,
-    /// Пресет качества (метки как в Python GUI; значения с «-V..»)
+    /// Пресет качества (метки как в Python GUI)
     #[arg(long, default_value = "-V2 (Высокое)", allow_hyphen_values = true)]
     mp3_preset: String,
     /// Явный путь к ffmpeg (иначе: рядом с exe → ../ffmpeg → PATH)
@@ -80,7 +82,17 @@ fn parse_format(s: &str) -> Result<OutputFormat> {
     }
 }
 
-fn main() -> Result<()> {
+fn main() -> ExitCode {
+    match run() {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("ОШИБКА: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<ExitCode> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
     if std::env::var("ORT_DYLIB_PATH").is_err() {
@@ -168,6 +180,16 @@ fn main() -> Result<()> {
         args.workers
     );
 
+    // Отмена: Ctrl+C ставит флаг; воркеры дорабатывают текущий чанк, sink
+    // останавливается, итоговый файл не публикуется (RunStatus::Cancelled).
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let c = Arc::clone(&cancel);
+        let _ = ctrlc::set_handler(move || {
+            c.store(true, Ordering::SeqCst);
+        });
+    }
+
     let sink = make_sink(
         &args.out,
         24_000,
@@ -175,30 +197,66 @@ fn main() -> Result<()> {
         &args.mp3_preset,
         args.ffmpeg.as_deref(),
     )?;
-    let cancel = std::sync::atomic::AtomicBool::new(false);
     let t = Instant::now();
-    let outcome = synthesize_stream(
+    let result = synthesize_stream(
         &text,
         &opts,
         args.workers,
         sink,
         |done, total| println!("  [{done}/{total}] готов"),
         &cancel,
-    )?;
+    );
     let elapsed = t.elapsed().as_secs_f32();
 
-    match outcome.status {
-        RunStatus::Cancelled => {
-            println!(
-                "ОТМЕНЕНО: обработано {}/{} чанков; итоговый файл НЕ создан; черновик: {}",
-                outcome.chunks_done,
-                outcome.total_chunks,
-                outcome.partial_path.display()
-            );
-            std::process::exit(2);
+    let outcome = match result {
+        Ok(o) => o,
+        Err(e) => {
+            // типизированный контекст: диагностический журнал рядом с файлом
+            if let Some(se) = e.downcast_ref::<StreamError>() {
+                let diag = write_diag_log(
+                    &args.out,
+                    "Failed",
+                    &format!("{}\nпричина: ошибка выполнения задания", se.message),
+                    Some(se),
+                );
+                eprintln!("ДИАГНОСТИКА: {se}");
+                if let Some(p) = &diag {
+                    eprintln!("диагностический журнал: {}", p.display());
+                }
+            }
+            return Err(e);
         }
-        RunStatus::Failed => bail!("синтез не завершён (Failed) — файл не создан"),
-        RunStatus::Completed => {}
+    };
+
+    if outcome.status == RunStatus::Cancelled {
+        let reason = if cancel.load(Ordering::SeqCst) {
+            "прервано пользователем (Ctrl+C/SIGINT)"
+        } else {
+            "отменено"
+        };
+        let diag = write_diag_log(
+            &args.out,
+            "Cancelled",
+            &format!(
+                "{reason}; черновик сохранён: {}",
+                outcome.partial_path.display()
+            ),
+            None,
+        );
+        println!(
+            "ОТМЕНЕНО: обработано {}/{} чанков; итоговый файл {} НЕ создан; черновик: {}",
+            outcome.chunks_done,
+            outcome.total_chunks,
+            args.out.display(),
+            outcome.partial_path.display()
+        );
+        if let Some(p) = &diag {
+            println!("диагностический журнал: {}", p.display());
+        }
+        return Ok(ExitCode::from(2));
+    }
+    if outcome.status == RunStatus::Failed {
+        bail!("синтез не завершён (Failed) — файл не создан");
     }
 
     print_outcome(&args.out, &outcome, elapsed);
@@ -214,7 +272,7 @@ fn main() -> Result<()> {
             ),
         }
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 fn print_outcome(out: &Path, o: &StreamOutcome, elapsed: f32) {
@@ -247,6 +305,59 @@ pub fn log_path_for(out: &Path) -> PathBuf {
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
     out.with_file_name(format!("{stem}_log.txt"))
+}
+
+/// Уникальный диагностический журнал отмены/ошибки (эксклюзивное имя, без
+/// удалений). Возвращает путь или None с предупреждением — журнал не должен
+/// маскировать основной статус.
+fn write_diag_log(
+    out: &Path,
+    status: &str,
+    details: &str,
+    err: Option<&StreamError>,
+) -> Option<PathBuf> {
+    use std::io::Write;
+    let stem = out
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = out.with_file_name(format!(
+        "{stem}.{nanos}.{}.diagnostic_log.txt",
+        std::process::id()
+    ));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut w) => {
+            let _ = writeln!(w, "Диагностический журнал задания (A5.1)");
+            let _ = writeln!(w, "Статус: {status}");
+            let _ = writeln!(w, "Детали: {details}");
+            if let Some(e) = err {
+                let _ = writeln!(
+                    w,
+                    "Прогресс: {}/{} чанков; base_seed {}; черновик: {}",
+                    e.chunks_done,
+                    e.total,
+                    e.base_seed,
+                    e.partial.display()
+                );
+            }
+            Some(path)
+        }
+        Err(e) => {
+            eprintln!(
+                "примечание: не удалось создать диагностический журнал {}: {e}",
+                path.display()
+            );
+            None
+        }
+    }
 }
 
 fn write_chunk_log(path: &Path, o: &StreamOutcome, args: &Args) -> Result<()> {

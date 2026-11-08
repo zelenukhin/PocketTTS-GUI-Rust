@@ -347,6 +347,32 @@ pub enum RunStatus {
     Failed,
 }
 
+/// Ошибка потокового задания с контекстом для диагностики/журнала:
+/// сохраняется исходный текст, путь черновика и точный прогресс.
+#[derive(Debug)]
+pub struct StreamError {
+    pub message: String,
+    pub partial: PathBuf,
+    pub chunks_done: usize,
+    pub total: usize,
+    pub base_seed: u64,
+}
+
+impl std::fmt::Display for StreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} (обработано {}/{}, base_seed {}, черновик: {})",
+            self.message,
+            self.chunks_done,
+            self.total,
+            self.base_seed,
+            self.partial.display()
+        )
+    }
+}
+impl std::error::Error for StreamError {}
+
 /// Строка журнала по одному чанку (метаданные, не аудио).
 #[derive(Debug, Clone)]
 pub struct ChunkLogRow {
@@ -508,7 +534,15 @@ where
 
     let (path, final_partial) = match status {
         RunStatus::Completed => {
-            let published = sink.finalize()?;
+            let published = sink.finalize().map_err(|e| {
+                anyhow::Error::new(StreamError {
+                    message: format!("не удалось завершить/опубликовать файл: {e:#}"),
+                    partial: partial_path.clone(),
+                    chunks_done: summary.chunks_done,
+                    total,
+                    base_seed,
+                })
+            })?;
             (Some(published), partial_path)
         }
         RunStatus::Cancelled => {
@@ -516,12 +550,13 @@ where
             (None, partial_path)
         }
         RunStatus::Failed => {
-            anyhow::bail!(
-                "синтез не завершён: {}/{} чанков (без отмены) — файл не создан; черновик: {}",
-                summary.chunks_done,
+            return Err(anyhow::Error::new(StreamError {
+                message: "синтез не завершён (без отмены) — файл не создан".into(),
+                partial: partial_path.clone(),
+                chunks_done: summary.chunks_done,
                 total,
-                partial_path.display()
-            );
+                base_seed,
+            }));
         }
     };
 

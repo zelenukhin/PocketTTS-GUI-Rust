@@ -1,0 +1,12 @@
+поток: out/a4_text.txt | формат Wav (-V2 (Высокое)) | чанков-лимит 50 | паузы ×1.00 | абзац 0.90 с | cuda | воркеров 1
+[2026-11-08T23:51:14Z INFO  shtorm_engine::pocket] load mimi_encoder: 1079 ms
+[2026-11-08T23:51:14Z INFO  shtorm_engine::pocket] load text_conditioner: 27 ms
+[2026-11-08T23:51:15Z INFO  shtorm_engine::pocket] load flow_lm_main: 669 ms
+[2026-11-08T23:51:15Z INFO  shtorm_engine::pocket] load flow_lm_flow: 129 ms
+[2026-11-08T23:51:15Z INFO  shtorm_engine::pocket] load mimi_decoder: 206 ms
+  [1/3] готов
+  [2/3] готов
+  [3/3] готов
+файл: out/a51_cuda.wav (18.45 с: речь 16.66 с + паузы 1.80 с; чанков 3; 11.19 с генерации, RTF 0.606)
+пул: воркеров 1, base_seed 42, буфер переупорядочивания <= 1 чанков / 726 КиБ PCM
+денойз: выключен

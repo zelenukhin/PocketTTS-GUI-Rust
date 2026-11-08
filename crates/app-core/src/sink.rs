@@ -15,7 +15,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 
-use audio_processing::stream::{partial_path_for, StreamingWav};
+use audio_processing::stream::{publish_no_replace, unique_partial_path, StreamingWav};
 
 /// Потоковый приёмник готовых чанков (строго по порядку).
 pub trait AudioSink {
@@ -163,10 +163,15 @@ pub struct FfmpegSink {
     final_path: PathBuf,
     buf: Vec<u8>,
     bytes_fed: u64,
+    /// Процесс уже дожат/собран (finalize или abort) — Drop не повторяет.
+    finished: bool,
+    /// Хвост stderr (диагностика; заполняется при abort/finalize).
+    pub stderr_text: Option<String>,
 }
 
-/// Сколько байт stderr держим для диагностики.
-const STDERR_CAP: u64 = 8192;
+/// Сколько байт ХВОСТА stderr держим для диагностики (читаем всегда до EOF —
+/// ограничение касается только памяти, не дренирования pipe).
+const STDERR_TAIL: usize = 8192;
 
 impl FfmpegSink {
     pub fn create(
@@ -182,12 +187,8 @@ impl FfmpegSink {
             final_path.display()
         );
         let ext = format.extension();
-        let partial = partial_path_for(final_path, ext);
-        anyhow::ensure!(
-            !partial.exists(),
-            "черновик уже существует: {} — удалите/переименуйте вручную",
-            partial.display()
-        );
+        // уникальное имя за запуск: старые черновики не мешают (не удаляются)
+        let partial = unique_partial_path(final_path, ext);
         let args = Self::base_args(sample_rate, format, preset, &partial);
         Self::spawn(ffmpeg, &args, partial, final_path.to_path_buf())
     }
@@ -226,7 +227,21 @@ impl FfmpegSink {
         partial: PathBuf,
         final_path: PathBuf,
     ) -> Result<Self> {
+        Self::spawn_with_env(program, args, &[], partial, final_path)
+    }
+
+    /// Как [spawn], с дополнительными переменными окружения (тесты).
+    pub fn spawn_with_env(
+        program: &Path,
+        args: &[String],
+        envs: &[(&str, &str)],
+        partial: PathBuf,
+        final_path: PathBuf,
+    ) -> Result<Self> {
         let mut cmd = Command::new(program);
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
         cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -238,9 +253,31 @@ impl FfmpegSink {
         let stderr = child.stderr.take().expect("stderr piped");
         let stderr_thread = std::thread::spawn(move || {
             use std::io::Read;
-            let mut buf = Vec::new();
-            let _ = stderr.take(STDERR_CAP).read_to_end(&mut buf);
-            String::from_utf8_lossy(&buf).into_owned()
+            // Читаем ДО EOF (иначе pipe переполняется и ffmpeg блокируется),
+            // храним только ограниченный хвост.
+            let mut tail: Vec<u8> = Vec::new();
+            let mut buf = [0u8; 8192];
+            let mut total: u64 = 0;
+            let mut stderr = stderr;
+            loop {
+                match stderr.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        total += n as u64;
+                        tail.extend_from_slice(&buf[..n]);
+                        if tail.len() > STDERR_TAIL {
+                            let cut = tail.len() - STDERR_TAIL;
+                            tail.drain(..cut);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let mut text = String::from_utf8_lossy(&tail).into_owned();
+            if total > STDERR_TAIL as u64 {
+                text = format!("[{total} байт stderr; хвост {STDERR_TAIL}] {text}");
+            }
+            text
         });
         Ok(Self {
             child,
@@ -250,6 +287,8 @@ impl FfmpegSink {
             final_path,
             buf: Vec::new(),
             bytes_fed: 0,
+            finished: false,
+            stderr_text: None,
         })
     }
 
@@ -292,6 +331,53 @@ impl FfmpegSink {
     }
 }
 
+impl FfmpegSink {
+    /// Прервать кодирование: закрыть stdin, дать ffmpeg штатно завершиться
+    /// (ограничение ~5 с), при необходимости убить ТОЛЬКО свой дочерний
+    /// процесс; всегда wait() и join stderr-потока. Черновик остаётся.
+    pub fn abort(&mut self) -> Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        drop(self.stdin.take());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    if std::time::Instant::now() > deadline {
+                        let _ = self.child.kill();
+                        let _ = self.child.wait();
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(_) => {
+                    let _ = self.child.wait();
+                    break;
+                }
+            }
+        }
+        // собрать поток stderr (после закрытия pipe он завершится)
+        if let Some(t) = self.stderr_thread.take() {
+            self.stderr_text = t.join().ok();
+        }
+        self.finished = true;
+        Ok(())
+    }
+}
+
+impl Drop for FfmpegSink {
+    /// Защита на случай выхода без finalize/abort (отмена, ранний return):
+    /// процесс дожидается/убивается, потоки присоединяются; `.partial`
+    /// НЕ удаляется.
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.abort();
+        }
+    }
+}
+
 impl AudioSink for FfmpegSink {
     fn write_chunk(&mut self, _index: usize, pcm: &[f32], pause_s: Option<f32>) -> Result<()> {
         self.feed(pcm)?;
@@ -326,6 +412,8 @@ impl AudioSink for FfmpegSink {
             .take()
             .and_then(|t| t.join().ok())
             .unwrap_or_default();
+        self.stderr_text = Some(stderr.clone());
+        self.finished = true;
         if !status.success() {
             bail!(
                 "ffmpeg завершился с ошибкой (код {:?}): {} — черновик сохранён: {}",
@@ -334,20 +422,9 @@ impl AudioSink for FfmpegSink {
                 self.partial.display()
             );
         }
-        // публикация только после успешного кодирования
-        std::fs::hard_link(&self.partial, &self.final_path).with_context(|| {
-            format!(
-                "опубликовать {} -> {} (итог мог появиться извне; черновик сохранён)",
-                self.partial.display(),
-                self.final_path.display()
-            )
-        })?;
-        if let Err(e) = std::fs::remove_file(&self.partial) {
-            eprintln!(
-                "примечание: не удалось убрать черновик {} ({e}); итог опубликован",
-                self.partial.display()
-            );
-        }
+        // публикация только после успешного кодирования: MoveFileW без
+        // замены; при занятом имени — отказ, черновик остаётся
+        publish_no_replace(&self.partial, &self.final_path)?;
         Ok(self.final_path.clone())
     }
 
@@ -420,15 +497,121 @@ mod tests {
     }
 
     #[test]
-    fn partial_naming_is_explicit() {
-        assert_eq!(
-            partial_path_for(Path::new("/out/book.mp3"), "mp3"),
-            PathBuf::from("/out/book.partial.mp3")
+    fn partial_naming_is_unique_and_explicit() {
+        let a = unique_partial_path(Path::new("/out/book.mp3"), "mp3");
+        let b = unique_partial_path(Path::new("/out/book.mp3"), "mp3");
+        assert_ne!(a, b, "каждый запуск — свой черновик");
+        for p in [&a, &b] {
+            let name = p.file_name().unwrap().to_string_lossy().to_string();
+            assert!(name.starts_with("book."), "{name}");
+            assert!(name.contains(".partial.mp3"), "{name}");
+            assert_eq!(p.parent(), Some(Path::new("/out")));
+        }
+        let o = unique_partial_path(Path::new(r"C:\outook.opus"), "opus");
+        assert!(o.to_string_lossy().contains(".partial.opus"));
+    }
+
+    /// Из двух процессов: производитель флуда stderr (запускается харнессом
+    /// дочернего процесса с env SHTORM_SINK_FLOOD_PRODUCER=1).
+    #[test]
+    fn stderr_flood_producer() {
+        use std::io::Write;
+        if std::env::var("SHTORM_SINK_FLOOD_PRODUCER").is_err() {
+            return;
+        }
+        let mut err = std::io::stderr();
+        let block = vec![b'A'; 8192];
+        for _ in 0..16 {
+            // 128 КиБ — заметно больше буфера pipe
+            let _ = err.write_all(&block);
+        }
+        let _ = err.write_all(
+            b"FLOOD_END
+",
         );
-        assert_eq!(
-            partial_path_for(Path::new(r"C:\out\book.opus"), "opus"),
-            PathBuf::from(r"C:\out\book.partial.opus")
+        let _ = err.flush();
+    }
+
+    /// Сценарий флуда: FfmpegSink читает stderr ДО EOF — продюсер не должен
+    /// заблокироваться; хвост ограничен. Выполняется ТОЛЬКО в дочернем
+    /// процессе (env-маркер): зависание здесь не блокирует основной прогон.
+    #[test]
+    fn stderr_flood_child_entry() {
+        if std::env::var("SHTORM_SINK_STDERR_CHILD").is_err() {
+            return;
+        }
+        let exe = std::env::current_exe().expect("current_exe");
+        let d = unique_dir("flood");
+        let final_p = d.join("out.mp3");
+        let partial = unique_partial_path(&final_p, "mp3");
+        let args: Vec<String> = vec![
+            "--exact".into(),
+            "sink::tests::stderr_flood_producer".into(),
+            "--test-threads=1".into(),
+        ];
+        let mut sink = FfmpegSink::spawn_with_env(
+            &exe,
+            &args,
+            &[("SHTORM_SINK_FLOOD_PRODUCER", "1")],
+            partial.clone(),
+            final_p.clone(),
+        )
+        .expect("spawn producer");
+        // пишем немного PCM (продюсер stdin не читает — укладывается в буфер)
+        let _ = sink.write_chunk(0, &[0.01f32; 4800], None);
+        // abort: закрыть stdin, дожать, собрать stderr-хвост
+        sink.abort().expect("abort");
+        let tail = sink.stderr_text.clone().unwrap_or_default();
+        assert!(
+            tail.contains("FLOOD_END"),
+            "хвост должен содержать конец флуда (дренаж до EOF): {tail:.80}"
         );
+        let total_shown = tail.len();
+        assert!(
+            total_shown <= STDERR_TAIL + 64,
+            "в памяти только ограниченный хвост ({total_shown} > {} + префикс)",
+            STDERR_TAIL
+        );
+        println!("CHILD_OK stderr_tail={total_shown}");
+    }
+
+    /// Внешний таймаут вокруг сценария флуда: если дренаж stderr сломан,
+    /// продюсер блокируется на заполненном pipe — дочерний процесс убивается,
+    /// тест падает с явной диагностикой (основной прогон не зависает).
+    #[test]
+    fn stderr_flood_no_deadlock_with_timeout() {
+        if std::env::var("SHTORM_SINK_STDERR_CHILD").is_ok() {
+            return;
+        }
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut child = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "sink::tests::stderr_flood_child_entry",
+                "--test-threads=1",
+            ])
+            .env("SHTORM_SINK_STDERR_CHILD", "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn child");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            match child.try_wait().expect("try_wait") {
+                Some(status) => {
+                    assert!(status.success(), "дочерний сценарий флуда упал: {status:?}");
+                    break;
+                }
+                None => {
+                    if std::time::Instant::now() > deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!("дочерний сценарий флуда завис — убит по таймауту 60с");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+        }
     }
 
     /// ffmpeg для тестов: env SHTORM_FFMPEG или распространённые места; если
@@ -464,7 +647,7 @@ mod tests {
         };
         let d = unique_dir("bad_args");
         let final_p = d.join("out.mp3");
-        let partial = partial_path_for(&final_p, "mp3");
+        let partial = unique_partial_path(&final_p, "mp3");
         // заведомо некорректный флаг энкодера
         let mut args = FfmpegSink::base_args(24000, OutputFormat::Mp3, "-V2", &partial);
         args.insert(args.len() - 1, "-bogus_flag".into());
@@ -475,6 +658,48 @@ mod tests {
         let err = sink.finalize().unwrap_err();
         assert!(format!("{err:#}").contains("ffmpeg"), "{err:#}");
         assert!(!final_p.exists(), "итог не публикуется при ошибке ffmpeg");
+    }
+
+    #[test]
+    fn drop_without_finalize_reaps_process_and_keeps_partial() {
+        let Some(ff) = test_ffmpeg() else {
+            eprintln!("SKIP drop_without_finalize: ffmpeg недоступен");
+            return;
+        };
+        let d = unique_dir("drop");
+        let final_p = d.join("out.mp3");
+        let t0 = std::time::Instant::now();
+        {
+            let mut sink =
+                FfmpegSink::create(&final_p, 24000, OutputFormat::Mp3, "-V2", &ff).unwrap();
+            sink.write_chunk(0, &[0.05f32; 9600], None).unwrap();
+            // Drop без finalize: abort внутри — процесс дожат/убит по таймауту
+        }
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(15),
+            "Drop не должен зависать"
+        );
+        assert!(!final_p.exists(), "итог при Drop не публикуется");
+    }
+
+    #[test]
+    fn abort_keeps_partial_and_reports_no_final() {
+        let Some(ff) = test_ffmpeg() else {
+            eprintln!("SKIP abort_keeps_partial: ffmpeg недоступен");
+            return;
+        };
+        let d = unique_dir("abort");
+        let final_p = d.join("out.mp3");
+        let mut sink = FfmpegSink::create(&final_p, 24000, OutputFormat::Mp3, "-V2", &ff).unwrap();
+        sink.write_chunk(0, &[0.05f32; 9600], None).unwrap();
+        let partial = sink.partial_path();
+        sink.abort().expect("abort без ошибок");
+        assert!(!final_p.exists(), "итог при отмене не публикуется");
+        // ffmpeg обычно успевает финализировать контейнер — partial сохраняется
+        assert!(
+            partial.exists(),
+            "черновик остаётся для диагностики: {partial:?}"
+        );
     }
 
     #[test]
@@ -493,7 +718,7 @@ mod tests {
         assert_eq!(path, final_p);
         let size = std::fs::metadata(&final_p).unwrap().len();
         assert!(size > 500, "mp3 содержателен: {size} байт");
-        assert!(!partial_path_for(&final_p, "mp3").exists());
+        assert!(!unique_partial_path(&final_p, "mp3").exists());
     }
 
     #[test]

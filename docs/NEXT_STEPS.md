@@ -31,7 +31,13 @@
   MP3/Opus: ffprobe 18.455/18.4615 с, полное декодирование без ошибок;
   память: 14x более длинного текста не увеличивает пик (Private 1591->1095 МБ),
   буфер переупорядочивания <= 856 КиБ.
-- Надёжность: SAFETY_AUDIT-политика (create_new, partial+hard_link, без
+- **A5.1 стабилизация** — MoveFileW-публикация без замены (NTFS проверено,
+  exFAT — на уровне API, носителя нет), уникальные partial-имена за запуск,
+  stderr-дренаж до EOF (хвост 8 КиБ, child-тест 128 КиБ с таймаутом),
+  abort/Drop lifecycle, Ctrl+C (exit 2 + диагностический журнал), StreamError
+  с прогрессом/seed/черновиком. WAV-паритет с A5 сохранён; CPU/CUDA ×
+  wav/mp3/opus — ffprobe/декод OK. План GUI — `docs/GUI_PLAN.md`.
+- Надёжность: SAFETY_AUDIT-политика (create_new, partial+hard_link→MoveFileW, без
   рекурсивных удалений), TF32 изолирован фичей `diag-tf32`, smoke exit!=0 при
   CUDA-fallback, bench-гварды, trace_dir (уникальный каталог за запуск).
 

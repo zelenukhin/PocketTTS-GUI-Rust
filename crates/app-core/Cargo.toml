@@ -17,6 +17,7 @@ env_logger.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true
+ctrlc = "3"
 # бинарям (smoke/bench) нужен ort напрямую: init + версия dylib.
 ort = { version = "=2.0.0-rc.11", default-features = false, features = ["load-dynamic"] }
 

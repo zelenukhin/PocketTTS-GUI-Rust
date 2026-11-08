@@ -2,12 +2,15 @@
 //!
 //! Каждый чанк пишется сразу (hound WavWriter), паузы — блоками нулей
 //! (без создания больших временных векторов). Итоговый файл публикуется
-//! только после успешной финализации: черновик лежит в `{stem}.partial.wav`
-//! рядом с итогом (явно отличимое имя), публикация — `hard_link` (атомарно
-//! отказывает, если итоговый путь уже существует), затем best-effort
-//! удаление собственного `.partial`. При отмене/ошибке `.partial` остаётся
-//! на месте, путь сообщается вызывающему; пользовательские файлы
-//! неприкосновенны (create_new, никаких рекурсивных удалений).
+//! только после успешной финализации: черновик лежит в
+//! `{stem}.{время}.{pid}.partial.{ext}` рядом с итогом (уникальное имя за
+//! запуск, никогда не перезаписывается), публикация — Win32 `MoveFileW`
+//! БЕЗ MOVEFILE_REPLACE_EXISTING: при занятом имени назначения вызов
+//! атомарно отказывает (файл-приёмник не изменяется), черновик остаётся.
+//! После успешного переноса `.partial` больше нет (перемещён, не удалён).
+//! При отмене/ошибке `.partial` остаётся и путь сообщается вызывающему;
+//! пользовательские файлы неприкосновенны (create_new, без рекурсивных
+//! удалений, без автоматической чистки старых черновиков).
 
 use anyhow::{bail, Context, Result};
 use std::fs::File;
@@ -47,12 +50,9 @@ impl StreamingWav {
             "итоговый WAV уже существует: {} — не перезаписываем",
             final_path.display()
         );
-        let partial_path = partial_path_for(final_path, "wav");
-        anyhow::ensure!(
-            !partial_path.exists(),
-            "черновик уже существует: {} — удалите/переименуйте вручную",
-            partial_path.display()
-        );
+        // уникальное имя за запуск: старые черновики не мешают повторному
+        // запуску (и не удаляются автоматически)
+        let partial_path = unique_partial_path(final_path, "wav");
         let file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -111,26 +111,13 @@ impl StreamingWav {
         Ok(())
     }
 
-    /// Финализация: заголовок, закрытие, атомарная публикация итога.
+    /// Финализация: заголовок, закрытие, публикация итога без замены
+    /// (Win32 MoveFileW; при занятом имени — отказ, черновик остаётся).
     pub fn finalize(mut self) -> Result<PathBuf> {
         let mut w = self.writer.take().expect("writer ещё открыт");
         w.flush()?;
         w.finalize()?;
-        // публикация: hard_link отказывает, если итог уже создан (атомарно)
-        std::fs::hard_link(&self.partial_path, &self.final_path).with_context(|| {
-            format!(
-                "опубликовать {} -> {} (итог мог появиться извне; черновик сохранён)",
-                self.partial_path.display(),
-                self.final_path.display()
-            )
-        })?;
-        // наш собственный черновик после успешной публикации — best-effort
-        if let Err(e) = std::fs::remove_file(&self.partial_path) {
-            eprintln!(
-                "примечание: не удалось убрать черновик {} ({e}); итог уже опубликован",
-                self.partial_path.display()
-            );
-        }
+        publish_no_replace(&self.partial_path, &self.final_path)?;
         Ok(self.final_path)
     }
 
@@ -145,13 +132,68 @@ impl StreamingWav {
     }
 }
 
-/// Путь черновика: `{stem}.partial.{ext}` рядом с итогом.
-pub fn partial_path_for(final_path: &Path, ext: &str) -> PathBuf {
+/// Уникальный путь черновика за запуск:
+/// `{stem}.{нс}.{pid}.{счётчик}.partial.{ext}` — наносекунды + атомарный
+/// счётчик гарантируют различие последовательных запусков в одном процессе.
+/// Создание всё равно эксклюзивное (create_new / ffmpeg -n): теоретическая
+/// коллизия даст явную ошибку, но не перезапись.
+pub fn unique_partial_path(final_path: &Path, ext: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let stem = final_path
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "output".into());
-    final_path.with_file_name(format!("{stem}.partial.{ext}"))
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    final_path.with_file_name(format!(
+        "{stem}.{nanos}.{}.{seq}.partial.{ext}",
+        std::process::id()
+    ))
+}
+
+/// Публикация черновика под итоговым именем БЕЗ замены существующего файла.
+/// Windows: `MoveFileW` без MOVEFILE_REPLACE_EXISTING — атомарный отказ при
+/// занятом имени (NTFS; семантика Win32 одинакова для exFAT, отдельно не
+/// проверялась). Не-Windows: `hard_link` (fail-if-exists) + удаление
+/// собственного черновика — authорitative замены не происходит.
+#[cfg(windows)]
+pub fn publish_no_replace(from: &Path, to: &Path) -> anyhow::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::MoveFileW;
+    let wide = |p: &Path| -> Vec<u16> {
+        p.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    };
+    let (w_from, w_to) = (wide(from), wide(to));
+    let ok = unsafe { MoveFileW(w_from.as_ptr(), w_to.as_ptr()) };
+    if ok == 0 {
+        let e = std::io::Error::last_os_error();
+        anyhow::bail!(
+            "MoveFileW({} -> {}) отказал: {e}; черновик сохранён",
+            from.display(),
+            to.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn publish_no_replace(from: &Path, to: &Path) -> anyhow::Result<()> {
+    std::fs::hard_link(from, to).with_context(|| {
+        format!(
+            "опубликовать {} -> {} (итог мог появиться извне; черновик сохранён)",
+            from.display(),
+            to.display()
+        )
+    })?;
+    let _ = std::fs::remove_file(from);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -204,7 +246,7 @@ mod tests {
         assert_eq!(&pcm[25..27], &[m(2.0), m(2.0)]);
         assert_eq!(&pcm[27..30], &[m(3.0), m(3.0), m(3.0)]);
         // черновик убран после публикации
-        assert!(!partial_path_for(&final_p, "wav").exists());
+        assert!(!unique_partial_path(&final_p, "wav").exists());
     }
 
     #[test]
@@ -241,18 +283,54 @@ mod tests {
         assert!(err.is_err());
         assert_eq!(std::fs::read(&final_p).unwrap(), b"user data");
         assert!(
-            !partial_path_for(&final_p, "wav").exists(),
+            !unique_partial_path(&final_p, "wav").exists(),
             "черновик не создан"
         );
     }
 
     #[test]
-    fn refuses_existing_partial() {
-        let d = unique_dir("partial");
+    fn unique_partials_and_rerun_after_abort() {
+        let d = unique_dir("rerun");
         let final_p = d.join("book.wav");
-        std::fs::write(partial_path_for(&final_p, "wav"), b"old partial").unwrap();
-        let err = StreamingWav::create(&final_p, 24000);
-        assert!(err.is_err(), "существующий .partial не перезаписывается");
+        // запуск 1: пишем и «абортим»
+        let mut w1 = StreamingWav::create(&final_p, 24000).unwrap();
+        w1.write_chunk(&[0.1f32; 50], None).unwrap();
+        let partial1 = w1.partial_path().to_path_buf();
+        drop(w1);
+        assert!(partial1.exists(), "черновик 1 сохранён");
+        assert!(!final_p.exists());
+        // запуск 2 с тем же итоговым именем: старый partial не мешает,
+        // имена различаются, ничего не удаляется
+        let w2 = StreamingWav::create(&final_p, 24000).unwrap();
+        let partial2 = w2.partial_path().to_path_buf();
+        assert_ne!(partial1, partial2, "уникальное имя за запуск");
+        assert!(partial1.exists(), "старый черновик не тронут");
+        drop(w2);
+    }
+
+    #[test]
+    fn publish_no_replace_refuses_existing_and_keeps_both() {
+        let d = unique_dir("publish");
+        let src = d.join("draft.bin");
+        let dst = d.join("final.bin");
+        std::fs::write(&src, b"draft").unwrap();
+        std::fs::write(&dst, b"user data").unwrap();
+        let err = publish_no_replace(&src, &dst);
+        assert!(
+            err.is_err(),
+            "публикация при занятом имени обязана отказать"
+        );
+        assert_eq!(
+            std::fs::read(&dst).unwrap(),
+            b"user data",
+            "назначение не тронуто"
+        );
+        assert_eq!(std::fs::read(&src).unwrap(), b"draft", "черновик сохранён");
+        // свободное имя: публикация переносит файл (черновика больше нет)
+        let dst2 = d.join("final2.bin");
+        publish_no_replace(&src, &dst2).unwrap();
+        assert_eq!(std::fs::read(&dst2).unwrap(), b"draft");
+        assert!(!src.exists(), "MoveFileW переносит (не копирует)");
     }
 
     #[test]
