@@ -167,11 +167,11 @@ fn main() -> Result<()> {
 
     // ---------- B. Provider distribution ----------
     println!("\n== B. Профилирование: распределение операторов (Chrome trace) ==");
-    // Очистка только собственного каталога трасс: гвард в app_core::trace_clean
-    // (канонизация обеих сторон, защищённые пути, белый список содержимого).
-    // Урок инцидента 2026-11-08: remove_dir_all по пользовательскому пути без
-    // гварда удалил скрытые каталоги профиля — больше здесь нет прямых удалений.
-    app_core::trace_clean::clean_trace_dir(&args.trace_dir)?;
+    // Никакой очистки (урок инцидента 2026-11-08, docs/SAFETY_AUDIT.md):
+    // каждый запуск создаёт СВОЙ новый уникальный каталог трасс; существующие
+    // каталоги и файлы не удаляются и не перезаписываются никогда.
+    let trace_dir = app_core::trace_dir::new_trace_dir(&args.trace_dir)?;
+    println!("trace dir: {}", trace_dir.display());
     use shtorm_engine::{LoadOptions, Pocket};
     let mut engine = Pocket::load(
         &args.model_dir,
@@ -179,7 +179,7 @@ fn main() -> Result<()> {
             device: shtorm_engine::Device::cuda(args.device_id),
             threads: 4,
             seed: Some(42),
-            profile_dir: Some(args.trace_dir.clone()),
+            profile_dir: Some(trace_dir.clone()),
         },
     )?;
     let text = text_processing::to_model_stress_notation(&args.text);

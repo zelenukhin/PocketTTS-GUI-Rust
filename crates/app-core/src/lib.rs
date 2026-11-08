@@ -5,6 +5,6 @@
 
 pub mod diagnostics;
 pub mod settings;
-pub mod trace_clean;
+pub mod trace_dir;
 
 pub use settings::SynthSettings;

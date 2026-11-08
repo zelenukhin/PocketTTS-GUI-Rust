@@ -70,6 +70,13 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args = Args::parse();
+    // Политика безопасности: диагностические инструменты не перезаписывают
+    // существующие файлы — только новые (docs/SAFETY_AUDIT.md).
+    anyhow::ensure!(
+        !args.out.exists(),
+        "выходной файл уже существует: {} — удалите/переименуйте вручную или укажите другое имя (--out)",
+        args.out.display()
+    );
     let dylib = std::env::var("ORT_DYLIB_PATH").map_err(|_| {
         anyhow::anyhow!("ORT_DYLIB_PATH не задан: укажите путь к onnxruntime.dll (см. tools/*.ps1)")
     })?;

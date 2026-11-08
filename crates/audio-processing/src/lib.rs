@@ -45,7 +45,8 @@ mod tests {
         assert_eq!(r.spec().channels, 1);
         let got: Vec<i16> = r.samples().map(|s| s.unwrap()).collect();
         assert_eq!(got, vec![0, 16383, -16383, 32767, -32767]);
-        let _ = std::fs::remove_file(&p);
+        // временный wav остаётся в %TEMP%: тесты работают без удалений
+        // (политика SAFETY_AUDIT.md)
     }
 
     #[test]

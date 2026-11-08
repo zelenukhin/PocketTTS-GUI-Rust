@@ -178,6 +178,14 @@ fn main() -> Result<()> {
         args.chunks
     );
     let sample_every = args.sample_every.max(1);
+    if let Some(csv) = &args.csv {
+        // Политика безопасности: не перезаписывать существующие файлы.
+        anyhow::ensure!(
+            !csv.exists(),
+            "CSV уже существует: {} — удалите/переименуйте вручную или укажите другое имя",
+            csv.display()
+        );
+    }
     let device = match args.device.as_str() {
         "cpu" => Device::Cpu,
         "cuda" => Device::cuda(args.device_id),
