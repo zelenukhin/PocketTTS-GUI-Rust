@@ -55,9 +55,13 @@
 
 6. ~~G1 каркас~~ ✅ (2026-11-09, см. GUI_PLAN.md): форма/валидация/настройки/
    импорт RO/кириллица; anti_repeat реально в Pocket (A5.2+G1).
-7. **G2**: запуск synthesize_stream в фоновом потоке из GUI (кнопка
-   «Запустить»), прогресс done/total, Стоп (общий AtomicBool), статусы
-   Completed/Cancelled/Failed, диагностические журналы, пути .partial в UI.
+7. ~~G2~~ ✅ (2026-11-09): запуск `synthesize_stream` в фоновом потоке из GUI
+   (напрямую app-core, без subprocess), прогресс done/total полосой, Стоп
+   (Arc<AtomicBool>), статусы Completed/Cancelled/Failed с путями
+   .partial/диагностических журналов, лог чанков, запрет двух заданий,
+   закрытие окна с отменой живого задания; CPU/CUDA × WAV/MP3/Opus, отмена,
+   повтор, побитовый GUI==CLI паритет подтверждены (real_matrix-тест,
+   `cargo test -p shtorm-gui --release --lib real_matrix -- --ignored`).
 8. **G3**: пакетный режим (walkdir), перезапуск воркеров каждые N файлов,
    авто-EOS/runtime.json-резолвер (или явное «не поддержано»), отчёт K из N.
 9. Портативная сборка (exe + deps/portable + ffmpeg).

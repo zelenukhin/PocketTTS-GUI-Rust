@@ -18,8 +18,16 @@ pub struct GuiSettings {
     // Модель и устройство
     pub model: ModelChoice,
     pub model_dir: String,
+    /// Базовый каталог ONNX-моделей (fast = {base}/ru-v2-fast, slow = …slow).
+    pub onnx_base: String,
     pub device: DeviceChoice,
     pub device_id: i32,
+    /// Явный путь onnxruntime.dll CPU (пусто — авто-поиск в deps проекта).
+    pub ort_cpu_dll: String,
+    /// Явный путь onnxruntime.dll CUDA (пусто — авто: deps/portable).
+    pub ort_gpu_dll: String,
+    /// Intra-op потоки ORT (паритет с CLI --threads, дефолт 4).
+    pub threads: u32,
     // Параметры генерации
     pub temperature: f32,
     pub decode_steps: u32,
@@ -80,6 +88,14 @@ impl OutputFormatChoice {
             Self::Opus => "Opus",
         }
     }
+    /// Расширение итогового файла (как sink::OutputFormat::extension).
+    pub fn extension_str(&self) -> &'static str {
+        match self {
+            Self::Wav => "wav",
+            Self::Mp3 => "mp3",
+            Self::Opus => "opus",
+        }
+    }
     pub fn mp3_preset_needed(&self) -> bool {
         !matches!(self, Self::Wav)
     }
@@ -92,8 +108,12 @@ impl Default for GuiSettings {
             voice_wav: String::new(),
             model: ModelChoice::Slow,
             model_dir: String::new(),
+            onnx_base: r"C:\Users\alexa\Downloads\pocket_tts_android\build\onnx".into(),
             device: DeviceChoice::Cpu,
             device_id: 0,
+            ort_cpu_dll: String::new(),
+            ort_gpu_dll: String::new(),
+            threads: 4,
             temperature: 0.3,
             decode_steps: 1,
             eos_threshold: -4.0,
@@ -138,6 +158,7 @@ impl GuiSettings {
         self.pause_scale = self.pause_scale.clamp(0.0, 2.0);
         self.paragraph_pause_s = self.paragraph_pause_s.clamp(0.0, 3.0);
         self.max_tokens = self.max_tokens.clamp(10, 300);
+        self.threads = self.threads.clamp(1, 16);
         if let Some(w) = self.workers {
             self.workers = Some(w.clamp(1, 12));
         }

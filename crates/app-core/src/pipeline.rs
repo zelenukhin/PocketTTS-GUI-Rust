@@ -485,6 +485,73 @@ pub struct ChunkLogRow {
     pub pause_s: Option<f32>,
 }
 
+/// `{out-stem}_log.txt` рядом с файлом (как Python GUI `{имя}_log.txt`).
+pub fn log_path_for(out: &std::path::Path) -> PathBuf {
+    let stem = out
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    out.with_file_name(format!("{stem}_log.txt"))
+}
+
+/// Метаданные прогона для заголовка журнала чанков (CLI и GUI пишут
+/// одно и то же).
+#[derive(Debug, Clone)]
+pub struct ChunkLogMeta {
+    /// Устройство как в CLI ("cpu" / "cuda" / "cuda 1").
+    pub device: String,
+    pub format: String,
+    pub preset: String,
+}
+
+/// Файл журнала чанков (create_new — не перезаписываем чужие файлы);
+/// сбой журнала НЕ маскирует успешное аудио (ошибка возвращается вызывающему,
+/// который решает, как её показать).
+pub fn write_chunk_log(
+    path: &std::path::Path,
+    o: &StreamOutcome,
+    meta: &ChunkLogMeta,
+) -> Result<()> {
+    use std::io::Write;
+    let mut w = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("создать {}: {e}", path.display()))?;
+    writeln!(w, "Лог чанков")?;
+    writeln!(
+        w,
+        "Устройство: {}; воркеров: {}; base_seed: {}",
+        meta.device, o.workers, o.base_seed
+    )?;
+    writeln!(
+        w,
+        "Формат: {} ({}); чанков: {}",
+        meta.format,
+        meta.preset,
+        o.chunks.len()
+    )?;
+    writeln!(w, "Статус: {:?}", o.status)?;
+    writeln!(w, "Денойз: {}", o.denoise_report.summary())?;
+    for c in &o.chunks {
+        writeln!(w, "[{}] {}", c.index + 1, c.text)?;
+        writeln!(
+            w,
+            "    -> воркер {}; {:.2} с генерации; речь {:.2} с; пауза {}; денойз {:?}",
+            c.worker_id
+                .map(|w| (w + 1).to_string())
+                .unwrap_or_else(|| "?".into()),
+            c.ms.unwrap_or(0) as f64 / 1000.0,
+            c.speech_samples as f64 / o.sample_rate as f64,
+            c.pause_s
+                .map(|p| format!("{p:.2} с"))
+                .unwrap_or_else(|| "нет (конец файла)".into()),
+            c.denoise
+        )?;
+    }
+    Ok(())
+}
+
 /// Итог потокового прогона: пути/статус/метрики, без аудио в памяти.
 #[derive(Debug)]
 pub struct StreamOutcome {

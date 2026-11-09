@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use app_core::pipeline::{
-    synthesize_stream, write_diag_log, DiagMeta, PipelineOptions, RunStatus, StreamError,
-    StreamOutcome,
+    log_path_for, synthesize_stream, write_chunk_log, write_diag_log, ChunkLogMeta, DiagMeta,
+    PipelineOptions, RunStatus, StreamError, StreamOutcome,
 };
 use app_core::sink::{make_sink, OutputFormat};
 use shtorm_engine::Device;
@@ -282,7 +282,12 @@ fn run() -> Result<ExitCode> {
 
     if args.chunk_log {
         // журнал опционален: сбой не маскирует успешное аудио (независимый статус)
-        match write_chunk_log(&chunk_log_path, &outcome, &args) {
+        let meta = ChunkLogMeta {
+            device: args.device.clone(),
+            format: args.format.clone(),
+            preset: args.mp3_preset.clone(),
+        };
+        match write_chunk_log(&chunk_log_path, &outcome, &meta) {
             Ok(()) => println!("лог чанков: {}", chunk_log_path.display()),
             Err(e) => println!(
                 "⚠ АУДИО УСПЕШНО: {}\n⚠ ЖУРНАЛ ЧАНКОВ НЕ СОЗДАН: {} — {e}",
@@ -315,54 +320,4 @@ fn print_outcome(out: &Path, o: &StreamOutcome, elapsed: f32) {
         o.max_buffered_bytes / 1024
     );
     println!("денойз: {}", o.denoise_report.summary());
-}
-
-/// {out-stem}_log.txt рядом с файлом.
-pub fn log_path_for(out: &Path) -> PathBuf {
-    let stem = out
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_default();
-    out.with_file_name(format!("{stem}_log.txt"))
-}
-
-fn write_chunk_log(path: &Path, o: &StreamOutcome, args: &Args) -> Result<()> {
-    use std::io::Write;
-    let mut w = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .with_context(|| format!("создать {}", path.display()))?;
-    writeln!(w, "Лог чанков (A5)")?;
-    writeln!(
-        w,
-        "Устройство: {}; воркеров: {}; base_seed: {}",
-        args.device, o.workers, o.base_seed
-    )?;
-    writeln!(
-        w,
-        "Формат: {:?} ({}); чанков: {}",
-        parse_format(&args.format)?,
-        args.mp3_preset,
-        o.chunks.len()
-    )?;
-    writeln!(w, "Статус: {:?}", o.status)?;
-    writeln!(w, "Денойз: {}", o.denoise_report.summary())?;
-    for c in &o.chunks {
-        writeln!(w, "[{}] {}", c.index + 1, c.text)?;
-        writeln!(
-            w,
-            "    -> воркер {}; {:.2} с генерации; речь {:.2} с; пауза {}; денойз {:?}",
-            c.worker_id
-                .map(|w| (w + 1).to_string())
-                .unwrap_or_else(|| "?".into()),
-            c.ms.unwrap_or(0) as f64 / 1000.0,
-            c.speech_samples as f64 / o.sample_rate as f64,
-            c.pause_s
-                .map(|p| format!("{p:.2} с"))
-                .unwrap_or_else(|| "нет (конец файла)".into()),
-            c.denoise
-        )?;
-    }
-    Ok(())
 }

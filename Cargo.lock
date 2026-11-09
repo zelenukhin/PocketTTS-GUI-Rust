@@ -3240,9 +3240,11 @@ dependencies = [
  "egui",
  "env_logger",
  "log",
+ "ort",
  "rfd",
  "serde",
  "serde_json",
+ "shtorm-engine",
  "text-processing",
  "windows-sys 0.59.0",
 ]

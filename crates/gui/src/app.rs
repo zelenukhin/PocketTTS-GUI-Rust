@@ -3,7 +3,10 @@
 
 use eframe::egui;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
+use crate::job::JobEvent;
 use crate::settings::{
     load_settings, save_settings, settings_path, DeviceChoice, GuiSettings, ModelChoice,
     OutputFormatChoice,
@@ -25,6 +28,39 @@ pub struct ShtormApp {
     log: String,
     status: String,
     last_saved: Option<PathBuf>,
+    /// Активное фоновое задание (None — можно запустить новое; два задания
+    /// одновременно запрещены).
+    job: Option<JobHandle>,
+    /// Прогресс (чанков готово / всего) последнего активного задания.
+    progress: (usize, usize),
+    /// Пользователь закрыл окно при живом задании: отменяем и закрываем сами,
+    /// когда поток завершится (без сиротских ffmpeg).
+    close_pending: bool,
+}
+
+/// Живое задание: флаг отмены, канал событий из потока, поток.
+struct JobHandle {
+    cancel: Arc<AtomicBool>,
+    rx: std::sync::mpsc::Receiver<JobEvent>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for JobHandle {
+    /// Выход из приложения с живым заданием: отмена + ожидание потока —
+    /// синк дропается в потоке задания (ffmpeg дожимается/убивается своим
+    /// abort-ом), сиротских процессов не остаётся.
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::SeqCst);
+        if let Some(h) = self.thread.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Default for ShtormApp {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ShtormApp {
@@ -44,6 +80,113 @@ impl ShtormApp {
             log: String::new(),
             status: note,
             last_saved: None,
+            job: None,
+            progress: (0, 0),
+            close_pending: false,
+        }
+    }
+
+    /// Запуск фонового задания (кнопка «Запустить синтез»): текст читается в
+    /// рабочем потоке, UI не блокируется. Повторный запуск при живом задании
+    /// исключён (кнопка отключена + проверка здесь).
+    fn start_job(&mut self, ctx: &egui::Context) {
+        if self.job.is_some() {
+            self.status = "задание уже выполняется".into();
+            return;
+        }
+        let mut s = self.settings.clone();
+        s.clamped();
+        let out_path = crate::job::derive_out_path(&s);
+        let (tx, rx) = std::sync::mpsc::channel::<JobEvent>();
+        let ctx2 = ctx.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel2 = Arc::clone(&cancel);
+        let text_file = s.text_file.trim().to_string();
+        let thread = std::thread::Builder::new()
+            .name("shtorm-synth".into())
+            .spawn(move || {
+                let cfg = crate::job::JobConfig {
+                    settings: s,
+                    text: match std::fs::read_to_string(&text_file) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            let r = crate::job::JobResult::failed(format!(
+                                "прочитать текстовый файл {text_file}: {e}"
+                            ));
+                            let _ = tx.send(JobEvent::Log(r.summary.clone()));
+                            let _ = tx.send(JobEvent::Finished(Box::new(r)));
+                            ctx2.request_repaint();
+                            return;
+                        }
+                    },
+                    out_path,
+                };
+                let result = crate::job::execute_job(&cfg, &cancel2, &|ev| {
+                    let _ = tx.send(ev);
+                    ctx2.request_repaint();
+                });
+                let _ = tx.send(JobEvent::Finished(Box::new(result)));
+                ctx2.request_repaint();
+            })
+            .expect("spawn synth thread");
+        self.job = Some(JobHandle {
+            cancel,
+            rx,
+            thread: Some(thread),
+        });
+        self.progress = (0, 0);
+        self.status = "задание запущено…".into();
+    }
+
+    /// Применение одного события задания к состоянию UI (выделено для
+    /// мок-тестов состояний без запуска синтеза).
+    fn apply_event(&mut self, ev: JobEvent) {
+        match ev {
+            JobEvent::Progress { done, total } => {
+                self.progress = (done, total);
+                self.status = format!("синтез: {done}/{total} чанков");
+            }
+            JobEvent::Log(line) => self.push_log(&line),
+            JobEvent::Finished(res) => {
+                self.status = format!("{} — {}", res.status.label(), res.summary);
+                self.push_log(&res.summary);
+            }
+        }
+    }
+
+    /// Дренаж событий задания + завершение потока (вызывается каждый кадр).
+    fn poll_job(&mut self) {
+        let Some(job) = &mut self.job else { return };
+        let mut events = Vec::new();
+        while let Ok(ev) = job.rx.try_recv() {
+            events.push(ev);
+        }
+        let thread_done = job.thread.as_ref().is_some_and(|h| h.is_finished());
+        for ev in events {
+            self.apply_event(ev);
+        }
+        // поток закончил работу (Finished получен/канал пуст) — прибираем
+        if thread_done {
+            let mut job = self.job.take().expect("job есть");
+            if let Some(h) = job.thread.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    /// Строка в журнал (ограничение размера: последние ~400 строк).
+    fn push_log(&mut self, line: &str) {
+        self.log.push_str(line);
+        self.log.push('\n');
+        if self.log.lines().count() > 400 {
+            if let Some(pos) = self
+                .log
+                .match_indices('\n')
+                .nth(self.log.lines().count() - 400)
+                .map(|(i, _)| i)
+            {
+                self.log.drain(..pos + 1);
+            }
         }
     }
 
@@ -63,26 +206,17 @@ impl ShtormApp {
         } else if !Path::new(&s.voice_wav).is_file() {
             errs.push(format!("WAV-голос не найден: {}", s.voice_wav));
         }
-        match s.model {
-            ModelChoice::Custom => {
-                if !Path::new(&s.model_dir).join("flow_lm_main.onnx").is_file() {
-                    errs.push(format!(
-                        "в каталоге модели нет flow_lm_main.onnx: {}",
-                        s.model_dir
-                    ));
-                }
-            }
-            _ => {
-                if !Path::new(&s.model_dir).join("flow_lm_main.onnx").is_file() {
-                    errs.push(format!(
-                        "укажите каталог модели Shtorm-v2 (flow_lm_main.onnx не найден): {}",
-                        s.model_dir
-                    ));
-                }
-            }
+        // модель — единым резолвером запуска (fast/slow через onnx_base)
+        if let Err(e) = crate::job::resolve_model_dir(s) {
+            errs.push(e.to_string());
         }
         if s.out_dir.trim().is_empty() {
             errs.push("не указана папка результата".into());
+        } else if crate::job::derive_out_path(s).exists() {
+            errs.push(format!(
+                "итоговый файл уже существует: {} — не перезаписываем",
+                crate::job::derive_out_path(s).display()
+            ));
         }
         if s.format != OutputFormatChoice::Wav {
             let ff = s.ffmpeg_path.trim();
@@ -98,10 +232,36 @@ impl ShtormApp {
 
 impl eframe::App for ShtormApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // события фонового задания (прогресс/логи/итог) — каждый кадр
+        self.poll_job();
+
+        // Закрытие окна при живом задании: отменяем и удерживаем окно, пока
+        // поток не завершится (CancelClose), затем закрываем сами — синк
+        // дропается в потоке задания, сиротских ffmpeg не остаётся.
+        let close_requested = ctx.input(|i| i.viewport().close_requested());
+        if close_requested {
+            if let Some(job) = &self.job {
+                job.cancel.store(true, Ordering::SeqCst);
+                if !self.close_pending {
+                    self.close_pending = true;
+                    self.push_log("закрытие: ожидаю отмену задания…");
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            }
+        }
+        if self.close_pending && self.job.is_none() {
+            self.close_pending = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        // пока задание живо — регулярные перерисовки для дренажа событий
+        if self.job.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.heading("ShtormTTS (нативный GUI, G1)");
+                ui.heading("ShtormTTS (нативный GUI)");
                 ui.separator();
                 ui.label(egui::RichText::new(&self.status).weak());
             });
@@ -109,14 +269,24 @@ impl eframe::App for ShtormApp {
         egui::TopBottomPanel::bottom("bottom").show(ctx, |ui| {
             ui.add_space(4.0);
             let errors = self.validate();
+            let job_running = self.job.is_some();
             ui.horizontal(|ui| {
-                let run = ui.add_enabled(errors.is_empty(), egui::Button::new("Запустить синтез"));
+                let run = ui.add_enabled(
+                    errors.is_empty() && !job_running,
+                    egui::Button::new("Запустить синтез"),
+                );
                 if run.clicked() {
-                    // G2: подключение synthesize_stream в фоновом потоке.
-                    // Фиктивного успеха не показываем — только статус.
-                    self.status = "Синтез будет подключён на этапе G2".into();
+                    self.start_job(ctx);
                 }
-                if errors.is_empty() {
+                if job_running {
+                    let stop = ui.add_enabled(true, egui::Button::new("Стоп"));
+                    if stop.clicked() {
+                        if let Some(job) = &self.job {
+                            job.cancel.store(true, Ordering::SeqCst);
+                            self.status = "отмена…".into();
+                        }
+                    }
+                } else if errors.is_empty() {
                     ui.label(
                         egui::RichText::new("✓ параметры валидны")
                             .color(egui::Color32::from_rgb(90, 200, 90)),
@@ -127,7 +297,6 @@ impl eframe::App for ShtormApp {
                             .color(egui::Color32::from_rgb(230, 120, 60)),
                     );
                 }
-                let _ = ui.add_enabled(false, egui::Button::new("Стоп (G2)"));
                 if ui.button("Сохранить настройки").clicked() {
                     self.settings.clamped();
                     match save_settings(&self.settings, &settings_path()) {
@@ -161,6 +330,21 @@ impl eframe::App for ShtormApp {
                             .color(egui::Color32::from_rgb(230, 120, 60)),
                     );
                 }
+            }
+            // прогресс активного задания: X/N чанков (+ RTF после завершения
+            // отображается в статусе/журнале)
+            if self.job.is_some() || self.progress.1 > 0 {
+                let (done, total) = self.progress;
+                let frac = if total > 0 {
+                    done as f32 / total as f32
+                } else {
+                    0.0
+                };
+                ui.add(
+                    egui::ProgressBar::new(frac)
+                        .text(format!("{done}/{total} чанков"))
+                        .show_percentage(),
+                );
             }
         });
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -230,18 +414,39 @@ impl eframe::App for ShtormApp {
                                 );
                             });
                     });
-                    ui.horizontal(|ui| {
-                        ui.label("Каталог модели:");
-                        ui.text_edit_singleline(&mut s.model_dir);
-                        if ui.button("Обзор…").clicked() {
-                            if let Some(p) = rfd::FileDialog::new()
-                                .set_title("Каталог модели (flow_lm_main.onnx и др.)")
-                                .pick_folder()
-                            {
-                                s.model_dir = p.display().to_string();
+                    if s.model == ModelChoice::Custom {
+                        ui.horizontal(|ui| {
+                            ui.label("Каталог модели:");
+                            ui.text_edit_singleline(&mut s.model_dir);
+                            if ui.button("Обзор…").clicked() {
+                                if let Some(p) = rfd::FileDialog::new()
+                                    .set_title("Каталог модели (flow_lm_main.onnx и др.)")
+                                    .pick_folder()
+                                {
+                                    s.model_dir = p.display().to_string();
+                                }
                             }
-                        }
-                    });
+                        });
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.label("Каталог ONNX (база):");
+                            ui.text_edit_singleline(&mut s.onnx_base);
+                            if ui.button("Обзор…").clicked() {
+                                if let Some(p) = rfd::FileDialog::new()
+                                    .set_title("Каталог с ru-v2-fast / ru-v2-slow")
+                                    .pick_folder()
+                                {
+                                    s.onnx_base = p.display().to_string();
+                                }
+                            }
+                        });
+                        ui.weak(format!(
+                            "модель: {}",
+                            crate::job::resolve_model_dir(s)
+                                .map(|d| d.display().to_string())
+                                .unwrap_or_else(|e| e.to_string())
+                        ));
+                    }
                     ui.horizontal(|ui| {
                         ui.label("Устройство:");
                         egui::ComboBox::from_id_salt("device")
@@ -260,6 +465,16 @@ impl eframe::App for ShtormApp {
                                     .prefix("GPU "),
                             );
                         }
+                    });
+                    ui.horizontal(|ui| {
+                        let dll = if s.device == DeviceChoice::Cuda {
+                            &mut s.ort_gpu_dll
+                        } else {
+                            &mut s.ort_cpu_dll
+                        };
+                        ui.label("onnxruntime.dll:");
+                        ui.text_edit_singleline(dll);
+                        ui.weak("(пусто = авто из deps проекта)");
                     });
                     ui.weak(format!(
                         "Воркеров: {} (авто: CPU 2 / CUDA 1)",
@@ -338,6 +553,11 @@ impl eframe::App for ShtormApp {
                     if let Some(w) = &mut s.workers {
                         ui.add(egui::Slider::new(w, 1..=12));
                     }
+                    ui.horizontal(|ui| {
+                        ui.label("Потоков ORT (intra-op):");
+                        ui.add(egui::DragValue::new(&mut s.threads).range(1..=16));
+                        ui.weak("(паритет с CLI --threads, по умолчанию 4)");
+                    });
                 });
             header_clicked(&resp, &mut s.pauses_open);
             ui.add_space(4.0);
@@ -487,5 +707,62 @@ mod tests {
                 _ => assert!(!open, "состояние сохраняется между кадрами"),
             }
         }
+    }
+
+    /// Мок-состояния UI задания: прогресс обновляется, Completed/Cancelled/
+    /// Failed попадают в статус и журнал (без запуска синтеза).
+    #[test]
+    fn job_events_update_ui_state() {
+        let mut app = ShtormApp::new();
+        app.apply_event(crate::job::JobEvent::Progress { done: 3, total: 7 });
+        assert_eq!(app.progress, (3, 7));
+        assert!(app.status.contains("3/7"), "{}", app.status);
+
+        app.apply_event(crate::job::JobEvent::Finished(Box::new(
+            crate::job::JobResult {
+                status: crate::job::JobStatus::Cancelled,
+                summary: "ОТМЕНЕНО на 3/7 чанках; итоговый файл не создан; черновик: C:/tmp/x.partial.wav".into(),
+                final_path: None,
+                partial_path: Some(PathBuf::from("C:/tmp/x.partial.wav")),
+                diag_path: Some(PathBuf::from("C:/tmp/x.log.txt")),
+                chunk_log_path: None,
+                rtf: Some(0.5),
+                progress: (3, 7),
+            },
+        )));
+        assert!(app.status.starts_with("Отменено"), "{}", app.status);
+        assert!(app.log.contains("ОТМЕНЕНО") && app.log.contains("x.partial.wav"));
+
+        app.apply_event(crate::job::JobEvent::Finished(Box::new(
+            crate::job::JobResult::failed("нет модели".into()),
+        )));
+        assert!(app.status.starts_with("Ошибка"), "{}", app.status);
+        assert!(app.log.contains("нет модели"));
+
+        // Completed: итоговый путь и RTF видны в журнале
+        app.apply_event(crate::job::JobEvent::Finished(Box::new(
+            crate::job::JobResult {
+                status: crate::job::JobStatus::Completed,
+                summary: "ГОТОВО: C:/out/book.wav (RTF 0.123)".into(),
+                final_path: Some(PathBuf::from("C:/out/book.wav")),
+                partial_path: None,
+                diag_path: None,
+                chunk_log_path: None,
+                rtf: Some(0.123),
+                progress: (7, 7),
+            },
+        )));
+        assert!(app.status.starts_with("Завершено"), "{}", app.status);
+        assert!(app.log.contains("book.wav"));
+
+        // журнал ограничен (нет неограниченного роста)
+        for i in 0..1000 {
+            app.push_log(&format!("строка {i}"));
+        }
+        assert!(
+            app.log.lines().count() <= 401,
+            "{} строк",
+            app.log.lines().count()
+        );
     }
 }

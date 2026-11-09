@@ -37,7 +37,8 @@ GUI для Pocket-TTS на Rust. Оперативное состояние — *
   `stream.rs` (`StreamingWav`: потоковый WAV, уникальный `.partial`,
   `publish_no_replace` = MoveFileW без замены, RIFF-лимит).
 - `crates/app-core` — оркестрация: `pipeline.rs` (`synthesize_stream`,
-  RunStatus/StreamError/DiagMeta/write_diag_log), `pool.rs` (N воркеров,
+  RunStatus/StreamError/DiagMeta/write_diag_log, `write_chunk_log`/
+  `log_path_for` — общий журнал чанков CLI и GUI), `pool.rs` (N воркеров,
   скользящее окно backpressure, catch_unwind, строгий порядок, отмена),
   `worker.rs` (RealWorker: Pocket+DSP на воркер, base_seed),
   `sink.rs` (AudioSink: WavSink/FfmpegSink — writer-поток stdin,
@@ -47,9 +48,13 @@ GUI для Pocket-TTS на Rust. Оперативное состояние — *
   ep_probe,synthesize}.rs` (CLI — тестовый инструмент; GUI не должен их
   запускать, а звать app-core напрямую).
 - `crates/gui` — eframe/egui 0.31: `settings.rs` (GuiSettings, round-trip
-  unknown keys, атомарная запись, импорт Python read-only), `app.rs`
-  (форма G1 + валидация), `main.rs` (шрифты/кириллица). G2 подключит
-  `synthesize_stream` в фоновом потоке — **напрямую к app-core**.
+  unknown keys, атомарная запись tmp create_new + MoveFileExW, импорт
+  Python read-only), `app.rs` (форма, валидация, прогресс/Стоп/статусы,
+  управляемые свёртки `.open(Some(field))`, закрытие окна с отменой
+  задания), `job.rs` (G2: резолв модели fast/slow, ORT env + init один
+  раз на процесс, конвертация GuiSettings→PipelineOptions с паритетом
+  CLI, execute_job в фоновом потоке — напрямую app-core, НЕ subprocess),
+  `main.rs` (шрифты/кириллица).
 - `docs/` — SAFETY_AUDIT, GUI_PLAN, FEATURE_PARITY, NEXT_STEPS,
   BENCHMARKS, ARCHITECTURE, CUDA_FEASIBILITY, PREPARATION_REPORT.
 - `tests/golden/` — chunking (96), char_rules (314), pauses (20).

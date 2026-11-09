@@ -1,8 +1,6 @@
-//! ShtormTTS GUI (G1). Кириллица: подключаем системный шрифт Segoe UI
+//! ShtormTTS GUI. Кириллица: подключаем системный шрифт Segoe UI
 //! (есть на любой Windows) с приоритетом — гарант корректного отображения.
-
-mod app;
-mod settings;
+//! Логика (форма/настройки/задание синтеза) — в библиотеке shtorm_gui.
 
 fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -10,7 +8,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([980.0, 860.0])
             .with_min_inner_size([760.0, 560.0])
-            .with_title("ShtormTTS — нативный GUI (G1)"),
+            .with_title("ShtormTTS — нативный GUI"),
         ..Default::default()
     };
     eframe::run_native(
@@ -18,7 +16,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             install_cyrillic_fonts(&cc.egui_ctx);
-            Ok(Box::new(app::ShtormApp::new()))
+            Ok(Box::new(shtorm_gui::app::ShtormApp::new()))
         }),
     )
 }
