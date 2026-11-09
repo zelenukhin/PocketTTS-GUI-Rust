@@ -2,7 +2,7 @@
 //! (G2 — фоновый поток поверх app_core::pipeline::synthesize_stream).
 
 use eframe::egui;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -120,12 +120,13 @@ impl ShtormApp {
         let ctx2 = ctx.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel2 = Arc::clone(&cancel);
-        let text_file = s.text_file.trim().to_string();
+        // относительный путь источника — от каталога exe, не от CWD
+        let text_file = crate::resources::resolve_user_path(&s.text_file);
         let thread = std::thread::Builder::new()
             .name("shtorm-synth".into())
             .spawn(move || {
                 let result = if batch {
-                    let source = PathBuf::from(&text_file);
+                    let source = text_file.clone();
                     crate::job::execute_batch(&s, &source, &cancel2, &|ev| {
                         let _ = tx.send(ev);
                         ctx2.request_repaint();
@@ -135,7 +136,8 @@ impl ShtormApp {
                         Ok(t) => t,
                         Err(e) => {
                             let r = crate::job::JobResult::failed(format!(
-                                "прочитать текстовый файл {text_file}: {e}"
+                                "прочитать текстовый файл {}: {e}",
+                                text_file.display()
                             ));
                             let _ = tx.send(JobEvent::Log(r.summary.clone()));
                             let _ = tx.send(JobEvent::Finished(Box::new(r)));
@@ -263,9 +265,10 @@ impl ShtormApp {
                 let explicit = if key.is_empty() {
                     None
                 } else {
-                    Some(Path::new(&key))
+                    // относительный путь ffmpeg — от каталога exe
+                    Some(crate::resources::resolve_user_path(&key))
                 };
-                self.ffmpeg_check_err = app_core::sink::resolve_ffmpeg(explicit)
+                self.ffmpeg_check_err = app_core::sink::resolve_ffmpeg(explicit.as_deref())
                     .err()
                     .map(|e| format!("{e:#}"));
                 self.ffmpeg_check_key = Some(key);
@@ -276,6 +279,8 @@ impl ShtormApp {
 
         let mut errs = Vec::new();
         let s = &self.settings;
+        let text_path = crate::resources::resolve_user_path(&s.text_file);
+        let voice_path = crate::resources::resolve_user_path(&s.voice_wav);
         if s.text_file.trim().is_empty() {
             errs.push(if s.batch {
                 "не выбран исходный каталог".into()
@@ -283,18 +288,21 @@ impl ShtormApp {
                 "не выбран текстовый файл".into()
             });
         } else if s.batch {
-            if !Path::new(&s.text_file).is_dir() {
-                errs.push(format!("исходный каталог не найден: {}", s.text_file));
+            if !text_path.is_dir() {
+                errs.push(format!(
+                    "исходный каталог не найден: {}",
+                    text_path.display()
+                ));
             }
-        } else if !Path::new(&s.text_file).is_file() {
-            errs.push(format!("текстовый файл не найден: {}", s.text_file));
+        } else if !text_path.is_file() {
+            errs.push(format!("текстовый файл не найден: {}", text_path.display()));
         }
         if s.voice_wav.trim().is_empty() {
             errs.push("не выбран WAV-голос".into());
         } else if !s.voice_wav.to_lowercase().ends_with(".wav") {
             errs.push("голосовой референс: поддерживается только WAV".into());
-        } else if !Path::new(&s.voice_wav).is_file() {
-            errs.push(format!("WAV-голос не найден: {}", s.voice_wav));
+        } else if !voice_path.is_file() {
+            errs.push(format!("WAV-голос не найден: {}", voice_path.display()));
         }
         // модель — единым резолвером запуска (fast/slow через onnx_base)
         if let Err(e) = crate::job::resolve_model_dir(s) {

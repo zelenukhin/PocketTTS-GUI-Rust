@@ -5,7 +5,7 @@
 //! к CLI, события прогресса для UI и итоговый `JobResult` со всеми путями
 //! (итог/черновик/диагностический журнал/лог чанков).
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -22,7 +22,11 @@ use text_processing::CharRules;
 use crate::batch::{
     plan_batch, run_batch, BatchEvent, BatchReport, BatchStatus, FileReport, FileStatus,
 };
+use crate::resources;
 use crate::settings::{DeviceChoice, GuiSettings, ModelChoice, OutputFormatChoice};
+
+// G4: единый резолвер ресурсов; реэкспорт сохраняет существующий API/тесты.
+pub use crate::resources::{find_project_root, resolve_ort_dylib, resolve_ort_dylib_in};
 
 /// Полный вход задания: снимок настроек (уже clamped), текст и итоговый путь.
 #[derive(Debug, Clone)]
@@ -116,9 +120,16 @@ impl JobStatus {
 /// движка — как валидация G1, но тем же кодом для реального запуска.
 pub fn resolve_model_dir(s: &GuiSettings) -> Result<PathBuf> {
     let dir = match s.model {
-        ModelChoice::Fast => Path::new(&s.onnx_base).join("ru-v2-fast"),
-        ModelChoice::Slow => Path::new(&s.onnx_base).join("ru-v2-slow"),
-        ModelChoice::Custom => PathBuf::from(s.model_dir.trim()),
+        ModelChoice::Fast => resources::resolve_model_base(s)?.join("ru-v2-fast"),
+        ModelChoice::Slow => resources::resolve_model_base(s)?.join("ru-v2-slow"),
+        ModelChoice::Custom => {
+            let p = resources::resolve_user_path(&s.model_dir);
+            anyhow::ensure!(
+                !p.as_os_str().is_empty(),
+                "для модели Custom не задан каталог model_dir"
+            );
+            p
+        }
     };
     anyhow::ensure!(
         dir.join("flow_lm_main.onnx").is_file(),
@@ -184,7 +195,8 @@ pub fn pipeline_options(
 ) -> PipelineOptions {
     PipelineOptions {
         model_dir,
-        voice: PathBuf::from(s.voice_wav.trim()),
+        // относительный голос — от каталога exe (портативный запуск)
+        voice: resources::resolve_user_path(&s.voice_wav),
         device: match s.device {
             DeviceChoice::Cpu => Device::Cpu,
             DeviceChoice::Cuda => Device::cuda(s.device_id),
@@ -223,99 +235,7 @@ pub fn derive_out_path(s: &GuiSettings) -> PathBuf {
         .file_stem()
         .map(|st| st.to_string_lossy().to_string())
         .unwrap_or_else(|| "output".into());
-    Path::new(&s.out_dir).join(format!("{stem}.{}", s.format.extension_str()))
-}
-
-/// Найти корень проекта (каталог с Cargo.toml и deps/) — от exe и от cwd.
-pub fn find_project_root() -> Option<PathBuf> {
-    let is_root = |d: &Path| d.join("Cargo.toml").is_file() && d.join("deps").is_dir();
-    if let Ok(exe) = std::env::current_exe() {
-        for a in exe.ancestors() {
-            if is_root(a) {
-                return Some(a.to_path_buf());
-            }
-        }
-    }
-    std::env::current_dir().ok().and_then(|cwd| {
-        cwd.ancestors()
-            .find(|a| is_root(a))
-            .map(|a| a.to_path_buf())
-    })
-}
-
-/// Каталоги torch-venv с CUDA/cuDNN DLL (резерв, если deps/portable пуст).
-const TORCH_LIB_FALLBACK: &str = r"C:\PocketTTS-GUI\venv\Lib\site-packages\torch\lib";
-
-/// Разрешение onnxruntime.dll для устройства: явный путь из настроек →
-/// deps проекта (CPU: ort-cpu; CUDA: deps/portable — полный комплект
-/// providers+CUDA+cuDNN, иначе ort-gpu-wheel + torch-venv lib).
-/// Возвращает (dll, каталоги для prepended PATH — только процесс GUI).
-pub fn resolve_ort_dylib_in(root: &Path, s: &GuiSettings) -> Result<(PathBuf, Vec<PathBuf>)> {
-    let cuda = s.device == DeviceChoice::Cuda;
-    let explicit = if cuda {
-        s.ort_gpu_dll.trim()
-    } else {
-        s.ort_cpu_dll.trim()
-    };
-    if !explicit.is_empty() {
-        let p = PathBuf::from(explicit);
-        anyhow::ensure!(
-            p.is_file(),
-            "onnxruntime.dll ({}) не найден: {}",
-            if cuda { "CUDA" } else { "CPU" },
-            p.display()
-        );
-        let prepend = if cuda {
-            vec![p.parent().unwrap_or(Path::new(".")).to_path_buf()]
-        } else {
-            vec![]
-        };
-        return Ok((p, prepend));
-    }
-    if cuda {
-        let portable = root.join("deps").join("portable");
-        let dll = portable.join("onnxruntime.dll");
-        if dll.is_file() {
-            return Ok((dll, vec![portable]));
-        }
-        let capi = root
-            .join("deps")
-            .join("ort-gpu-wheel")
-            .join("x")
-            .join("onnxruntime")
-            .join("capi");
-        let dll = capi.join("onnxruntime.dll");
-        if dll.is_file() {
-            let mut prepend = vec![capi.clone()];
-            let torch = PathBuf::from(TORCH_LIB_FALLBACK);
-            if torch.is_dir() {
-                prepend.push(torch);
-            }
-            return Ok((dll, prepend));
-        }
-        bail!(
-            "CUDA onnxruntime.dll не найден: {} или {} (иначе укажите путь в настройках)",
-            portable.display(),
-            capi.display()
-        );
-    }
-    let dll = root
-        .join("deps")
-        .join("ort-cpu")
-        .join("onnxruntime-win-x64-1.23.2")
-        .join("lib")
-        .join("onnxruntime.dll");
-    anyhow::ensure!(
-        dll.is_file(),
-        "CPU onnxruntime.dll не найден: {} (укажите путь в настройках)",
-        dll.display()
-    );
-    Ok((dll, vec![]))
-}
-
-pub fn resolve_ort_dylib(s: &GuiSettings) -> Result<(PathBuf, Vec<PathBuf>)> {
-    let root = find_project_root().context("не найден корень проекта (Cargo.toml + deps/)")?;
-    resolve_ort_dylib_in(&root, s)
+    resources::resolve_user_path(&s.out_dir).join(format!("{stem}.{}", s.format.extension_str()))
 }
 
 /// Уже инициализированная DLL (ORT грузится в процесс один раз — смена
@@ -433,6 +353,7 @@ pub fn execute_job(cfg: &JobConfig, cancel: &AtomicBool, emit: &dyn Fn(JobEvent)
         Ok(d) => d,
         Err(e) => return fail(format!("{e:#}")),
     };
+    emit(JobEvent::Log(format!("модель: {}", model_dir.display())));
     let mut char_warning = None;
     let char_rules = match load_char_rules(&model_dir) {
         CharRulesLoad::Absent => None,
@@ -471,10 +392,11 @@ pub fn execute_job(cfg: &JobConfig, cancel: &AtomicBool, emit: &dyn Fn(JobEvent)
             &char_warning,
         );
     }
-    let ffmpeg = if s.ffmpeg_path.trim().is_empty() {
+    let ffmpeg_path = if s.ffmpeg_path.trim().is_empty() {
         None
     } else {
-        Some(Path::new(s.ffmpeg_path.trim()))
+        // относительный путь из настроек — от каталога exe
+        Some(resources::resolve_user_path(&s.ffmpeg_path))
     };
     let preset = s.preset_for_format();
     let sink = match make_sink(
@@ -482,7 +404,7 @@ pub fn execute_job(cfg: &JobConfig, cancel: &AtomicBool, emit: &dyn Fn(JobEvent)
         24_000,
         output_format(s.format),
         preset,
-        ffmpeg,
+        ffmpeg_path.as_deref(),
     ) {
         Ok(sink) => sink,
         Err(e) => return attach_warning(fail(format!("{e:#}")), &char_warning),
@@ -531,7 +453,8 @@ pub fn execute_batch(
     emit: &dyn Fn(JobEvent),
 ) -> JobResult {
     let t0 = Instant::now();
-    let out_root = PathBuf::from(settings.out_dir.trim());
+    // относительная папка результата — от каталога exe (портативный режим)
+    let out_root = resources::resolve_user_path(&settings.out_dir);
     let plan = match plan_batch(source, &out_root) {
         Ok(p) => p,
         Err(e) => return JobResult::failed(format!("пакетный режим: {e:#}")),
@@ -1097,7 +1020,11 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let res = execute_job(&cfg, &cancel, &|_| {});
         assert_eq!(res.status, JobStatus::Failed);
-        assert!(res.summary.contains("flow_lm_main.onnx"), "{}", res.summary);
+        assert!(
+            res.summary.contains("flow_lm_main.onnx") || res.summary.contains("onnx_base"),
+            "{}",
+            res.summary
+        );
         assert!(res.partial_path.is_none());
         assert!(res.diag_path.is_none());
         assert!(!cfg.out_path.exists());

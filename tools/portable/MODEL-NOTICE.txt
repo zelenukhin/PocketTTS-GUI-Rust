@@ -1,0 +1,14 @@
+Shtorm-PocketTTS-RU v2 model weights notice
+===========================================
+
+Directories: models/ru-v2-fast, models/ru-v2-slow.
+
+No explicit license or redistribution permission file was found in the source
+model directory. The weights are included in this local portable package for
+the owner's personal use only. They are NOT licensed for public
+redistribution by this build script.
+
+If you intend to share this package, remove the models/ directory or obtain
+explicit written permission from the model author. The application can use
+models placed in models/ with the same layout (FP32 files only; the loader
+always uses flow_lm_main.onnx).

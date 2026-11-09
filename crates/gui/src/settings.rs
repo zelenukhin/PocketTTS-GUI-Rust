@@ -126,7 +126,9 @@ impl Default for GuiSettings {
             voice_wav: String::new(),
             model: ModelChoice::Slow,
             model_dir: String::new(),
-            onnx_base: r"C:\Users\alexa\Downloads\pocket_tts_android\build\onnx".into(),
+            // G4: пусто = автопоиск <exe>/models (портативно) или dev-fallback;
+            // абсолютные пути профиля разработчика в дефолт не зашиваются.
+            onnx_base: String::new(),
             device: DeviceChoice::Cpu,
             device_id: 0,
             ort_cpu_dll: String::new(),

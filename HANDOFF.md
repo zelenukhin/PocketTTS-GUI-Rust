@@ -1,8 +1,8 @@
 # HANDOFF.md — оперативный снимок проекта (читать первым вместе с AGENTS.md)
 
-- **Дата обновления**: 2026-11-09 (G3.1: физическая безопасность путей,
-  отмена пакета, конфликты имён; далее G4).
-- **Последний функциональный коммит**: G3.1 — фактический хэш брать из Git
+- **Дата обновления**: 2026-11-09 (G3.1 + G4: портативная Windows-сборка;
+  следующий — G5).
+- **Последний функциональный коммит**: G4 — фактический хэш брать из Git
   (`git log -1 --oneline`); в документе не хардкодится.
 - **HEAD**: только из Git (`git log -1 --oneline`), не из этого файла.
 - **Бэкап на NAS (подтверждён)**: полный архив HEAD `c3958d7` —
@@ -146,9 +146,36 @@ Python `pocket-tts_gui.py`. Постоянные правила и архите�
   пакет с ошибками и успехами — «Частично / ЧАСТИЧНЫЙ УСПЕХ».
 - Новые тесты: 17 (13 batch + 3 job + 1 UI), моки без ONNX.
 
+## G4 — что сделано (портативная Windows-сборка)
+
+- `crates/gui/src/resources.rs` — единый резолвер: явный путь → подкаталоги
+  портативного комплекта (`models/`, `onnxruntime/cpu|cuda/`, `ffmpeg/`) →
+  каталоги проекта (dev) → документированный fallback. Относительные пути
+  настроек разрешаются от каталога exe, не от CWD. `Cargo.toml`/рабочий
+  каталог исходников для портативного режима не нужны.
+- CPU и CUDA ORT разрешаются независимо; CUDA-каталог добавляется только в
+  PATH процесса; один ORT runtime на процесс (смена CPU↔CUDA — перезапуск).
+- Настройки по умолчанию без абсолютных dev-путей: `onnx_base` пуст,
+  портативный пример использует `models`, `onnxruntime/...`,
+  `ffmpeg/ffmpeg.exe`, `output`.
+- `tools/build-portable.ps1` + `tools/portable/*`: новый каталог вне
+  репозитория, отказ при существующем, без удалений; проверка обязательных
+  файлов, отсутствие INT8, размер `flow_lm_main.onnx`, запуск ffmpeg,
+  JSON настроек, размер+SHA256 каждого файла, manifest. Добавлены
+  `-VcRuntimeDir`, `-HardLinkPayload` (проверенные жёсткие ссылки для
+  крупных файлов на том же томе).
+- В комплект входят: exe, MSVC++ runtime (4 DLL), CPU ORT (2 DLL),
+  CUDA ORT + providers + CUDA/cuDNN (15 DLL), `ffmpeg.exe`, FP32 fast/slow
+  (6 файлов каждый, без INT8), пример настроек с относительными путями,
+  README, notices, GPL/ORT/FFmpeg/NVIDIA/model/MSVC лицензии, Cargo.lock.
+- Диагностические режимы exe: `--portable-check`, `--portable-selftest`,
+  `--portable-selftest-batch` (тот же execute_job/execute_batch, без кликов).
+- Документация: `docs/PORTABLE_BUILD.md`, обновлены `GUI_PLAN.md`,
+  `NEXT_STEPS.md`.
+
 ## Подтверждённые результаты
 
-- `cargo test` **133 passed / 0 failed** (5 ignored: 3 ONNX + real_matrix +
+- `cargo test` **137 passed / 0 failed** (5 ignored: 3 ONNX + real_matrix +
   real_batch_cpu); `cargo clippy --all-targets` **0**; release-сборка OK
   (shtorm-gui.exe запускается, окно живо).
 - **Реальные проверки G2** (`cargo test -p shtorm-gui --release --lib
@@ -171,6 +198,26 @@ Python `pocket-tts_gui.py`. Постоянные правила и архите�
   `готово 3 | ошибок 1 | пропущено 1`, статус **«Частично / ЧАСТИЧНЫЙ
   УСПЕХ»**, 9.3 с; относительные пути сохранены, существующий файл не
   перезаписан, прогресс K/N и чанков шёл событиями.
+- **G4 портативный комплект**:
+  `C:\PocketTTS-GUI-Rust\dist\ShtormTTS-Portable-2026-11-09-g4c` — 54 файла,
+  логический размер 3403.1 MiB, manifest со SHA256; exe SHA256
+  `54268A82…DF6C44E`. Крупные файлы собраны `-HardLinkPayload`
+  (фактический расход диска на том же томе мал; при копировании папки
+  материализуются).
+  - `--portable-check` из `C:\` без Cargo.toml: модель/ORT/ffmpeg из
+    относительных путей — OK.
+  - CPU FP32 WAV: Completed, 6.80 с, RTF 0.932, 326444 байта.
+  - CUDA FP32 WAV (RTX 3060): Completed, 6.80 с, RTF 0.783, 326444 байта.
+  - MP3/Opus: Completed через комплектный ffmpeg (ID3/OggS).
+  - Batch: 2/2 Completed, 12.6 с, подкаталоги сохранены.
+  - **WAV-паритет GUI==CLI**: CPU 326444 байта, одинаковый SHA256
+    `80CB7288…`; CUDA 326444 байта, одинаковый SHA256 `85A26977…`.
+  - CPU-процесс загрузил только `onnxruntime\cpu\onnxruntime.dll`;
+    CUDA-процесс — `onnxruntime\cuda\onnxruntime.dll`, providers, CUDA/cuDNN
+    из комплекта. MSVC++ runtime загружен из корня комплекта, не из System32.
+    `cudnn_adv64_9.dll`/`cudnn_cnn64_9.dll` присутствуют, но в тесте не
+    загружались (оставлены как стандартный набор cuDNN).
+  - Чистая Windows VM без Python/Torch/ORT/FFmpeg **не проверялась**.
 - Реальный аварийный путь (CLI, битый путь модели): типизированный
   StreamError «обработано 0/1, base_seed, черновик», диагностический
   журнал создан, итогового файла нет.
@@ -181,15 +228,26 @@ Python `pocket-tts_gui.py`. Постоянные правила и архите�
   выключен принудительно; VRAM-дельта — обязательная проверка GPU).
   Денойз DPDFNet: код готов; без файла модели — явный статус Missing.
 - **WAV/MP3/Opus streaming** — готов (CLI и GUI).
-- **GUI G2/G3** — одиночный файл и безопасный пакетный режим: полный цикл
-  запуск/прогресс (K/N + чанки)/Стоп/статусы/журналы/отчёт/закрытие.
+- **GUI G2/G3/G3.1/G4** — одиночный файл, безопасный пакетный режим и
+  портативная сборка: полный цикл запуск/прогресс (K/N + чанки)/Стоп/
+  статусы/журналы/отчёт/закрытие; exe-relative модели/ORT/ffmpeg,
+  CPU/CUDA раздельно, комплектный ffmpeg и VC++ runtime.
 
 ## Актуальные ограничения / нерешённое
 
 - ORT грузится в процесс GUI один раз: смена CPU↔CUDA внутри одной сессии
   GUI требует перезапуска приложения (сообщение в UI).
-- Auto-EOS (`runtime.json`-резолвер), `frames_after_eos`, CUDA I/O Binding,
-  портативная сборка — **не начаты** (не имитировать наличие).
+- Auto-EOS (`runtime.json`-резолвер), `frames_after_eos`, CUDA I/O Binding —
+  **не начаты** (не имитировать наличие). Портативная сборка G4 завершена.
+- Портативный пакет проверен на машине разработки; чистая Windows VM без
+  Python/Torch/ORT/FFmpeg **не проверялась**. Модели и голосовой пример не
+  имеют подтверждённой лицензии на публичную редистрибуцию (личное
+  использование; notice в комплекте). `cudnn_adv64_9.dll`/
+  `cudnn_cnn64_9.dll` входят в набор, но в тестовом прогоне не загружались.
+  Локальная сборка g4c использует `-HardLinkPayload` для крупных файлов;
+  при копировании папки на другой диск они материализуются.
+- MSVC++ runtime (4 DLL) входит в комплект; без него чистая Windows без
+  VC++ Redistributable не запустит exe/ORT.
 - Переиспользование пула воркеров между файлами не реализовано (сейчас пул
   создаётся/освобождается на файл); оценка изменений/рисков —
   `docs/G3_BATCH.md`. Фиктивного переключателя нет.
@@ -213,13 +271,18 @@ crates/app-core/src/pipeline.rs        # synthesize_stream, StreamError,
 crates/app-core/src/pool.rs            # run_job (воркеры, окно, отмена)
 crates/app-core/src/sink.rs            # WavSink/FfmpegSink, bytes_fed
 crates/gui/src/job.rs                  # G2: execute_job/execute_batch, ORT env
+crates/gui/src/resources.rs            # G4: exe-relative модели/ORT/ffmpeg
 crates/gui/src/batch.rs                 # G3: план/обход/пути/отчёт (моки)
 crates/gui/src/app.rs                  # форма + задание/прогресс K/N/Стоп
 crates/gui/src/settings.rs             # GuiSettings (+batch/dll/threads/пресеты)
+crates/gui/src/main.rs                 # eframe + --portable-check/selftest
+tools/build-portable.ps1               # G4: сборка комплекта (без удалений)
+tools/portable/*                       # пример настроек, notices, тексты
 tools/*.ps1, tools/gen_*_golden.py     # smoke и генераторы golden
 tests/golden/*.json                    # 96 + 314 + 20 кейсов
 docs/SAFETY_AUDIT.md, docs/GUI_PLAN.md, docs/NEXT_STEPS.md,
-docs/G3_BATCH.md, docs/FEATURE_PARITY.md, docs/BENCHMARKS.md
+docs/G3_BATCH.md, docs/PORTABLE_BUILD.md,
+docs/FEATURE_PARITY.md, docs/BENCHMARKS.md
 ```
 
 ## Сборка / запуск / проверки (Windows, Git Bash)
@@ -229,21 +292,30 @@ export PATH="$HOME/.cargo/bin:$PATH"
 cargo build --release                       # всё (вкл. shtorm-gui.exe)
 cargo test && cargo clippy --all-targets    # норма: 0 failed / 0 warning
 # реальные проверки GUI-задания (по одному устройству на процесс):
-cargo test -p shtorm-gui --release --lib real_matrix -- --ignored --nocapture
+cargo test -p shtorm-gui --release --lib real_matrix_device -- --ignored --nocapture
 SHTORM_GUI_TEST_DEVICE=cuda cargo test -p shtorm-gui --release --lib \
-  real_matrix -- --ignored --nocapture
+  real_matrix_device -- --ignored --nocapture
 # реальный пакетный CPU-тест G3 (5 файлов, вкл. битый и существующий):
 cargo test -p shtorm-gui --release --lib real_batch_cpu -- --ignored --nocapture
 # GUI: ./target/release/shtorm-gui.exe
+# G4 portable (новый каталог вне репозитория; см. docs/PORTABLE_BUILD.md):
+powershell -ExecutionPolicy Bypass -File tools/build-portable.ps1 `
+  -Destination C:\PocketTTS-GUI-Rust\dist\ShtormTTS-Portable-<date> `
+  -ModelsDir <onnx> -Ffmpeg <ffmpeg.exe> -VoiceFile <voice.wav>
 ```
 Настройки real_matrix-теста: ru-v2-slow, voice
 `C:\PocketTTS-GUI\examples\Microsoft Brian Speed 1.wav`, ffmpeg
 `C:\PocketTTS-GUI\ffmpeg\ffmpeg.exe`, seed 42, threads 4 (CPU 2w / CUDA 1w).
 
-## NEXT TASK — G4 (НЕ НАЧИНАТЬ без явного задания)
+## NEXT TASK — G5 (НЕ НАЧИНАТЬ без явного задания)
 
-1. Портативная сборка: exe + `deps/portable` + `ffmpeg.exe` + лаунчер,
-   иконка; ассоциации не настраивать.
+G4 завершён: портативный комплект
+`C:\PocketTTS-GUI-Rust\dist\ShtormTTS-Portable-2026-11-09-g4c` (см.
+`docs/PORTABLE_BUILD.md`). Следующий отдельный этап — G5.
+
+1. G5-полировка: интерактивный клик-проход окна (кнопки/Стоп/прогресс/
+   журнал), тема/копирование лога, RTF без времени загрузки моделей,
+   уточнение ошибок CUDA/VRAM.
 2. Решить: авто-EOS/`runtime.json`-резолвер (в моделях ru-v2 файла нет —
    согласовать, нужно ли «Авто» вообще); `frames_after_eos` — после
    согласования, не имитировать.
@@ -251,11 +323,13 @@ cargo test -p shtorm-gui --release --lib real_batch_cpu -- --ignored --nocapture
    времени старта/памяти и отдельного разрешения (`docs/G3_BATCH.md`).
 4. Денойз DPDFNet с реальной моделью; CUDA I/O Binding — по цифрам
    `docs/CUDA_FEASIBILITY.md`.
-5. Полировка G5: интерактивный клик-проход, тема/копирование лога, RTF без
-   времени загрузки моделей.
+5. Чистая Windows VM без Python/Torch/ORT/FFmpeg — отдельная проверка
+   портативного пакета; на машине разработки не выполнялась.
 
-## Критерии готовности G4
+## Критерии готовности G5
 
-- Портативная сборка запускается на чистой машине без Python и системного
-  ORT/ffmpeg; модели/лицензии/размер описаны; safety-политика (create_new,
-  без рекурсивных удалений) сохранена; `cargo test`/clippy зелёные.
+- Интерактивный проход GUI выполнен и описан; регрессии не выявлены.
+- `cargo test`/clippy зелёные; safety-политика (create_new, без рекурсивных
+  удалений, без перезаписи чужих файлов) сохранена.
+- Портативный комплект не изменяется без отдельного задания; модели и
+  лицензии остаются задокументированными.

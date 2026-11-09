@@ -54,9 +54,15 @@ GUI для Pocket-TTS на Rust. Оперативное состояние — *
   задания), `job.rs` (G2: резолв модели fast/slow, ORT env + init один
   раз на процесс, конвертация GuiSettings→PipelineOptions с паритетом
   CLI, execute_job в фоновом потоке — напрямую app-core, НЕ subprocess),
-  `main.rs` (шрифты/кириллица).
+  `resources.rs` (G4: единый exe-relative резолвер моделей/ORT CPU/CUDA/
+  ffmpeg; портативный комплект не требует Cargo.toml/CWD),
+  `main.rs` (шрифты/кириллица + диагностические `--portable-*` режимы).
+- `tools/build-portable.ps1` + `tools/portable/` — G4-сборка комплекта:
+  новый каталог вне репозитория, без удалений, проверка размеров/SHA256,
+  manifest; лицензии/notices, VC++ runtime, FFmpeg, FP32-модели.
 - `docs/` — SAFETY_AUDIT, GUI_PLAN, FEATURE_PARITY, NEXT_STEPS,
-  BENCHMARKS, ARCHITECTURE, CUDA_FEASIBILITY, PREPARATION_REPORT.
+  BENCHMARKS, ARCHITECTURE, CUDA_FEASIBILITY, PREPARATION_REPORT,
+  G3_BATCH, PORTABLE_BUILD.
 - `tests/golden/` — chunking (96), char_rules (314), pauses (20).
   Генераторы: `tools/gen_*_golden.py` (venv-питон `C:\PocketTTS-GUI\venv`).
 

@@ -4,4 +4,5 @@
 pub mod app;
 pub mod batch;
 pub mod job;
+pub mod resources;
 pub mod settings;

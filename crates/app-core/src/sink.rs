@@ -127,8 +127,9 @@ pub fn encoder_args(format: OutputFormat, preset: &str) -> Result<Vec<String>> {
     }
 }
 
-/// Найти ffmpeg: явный путь → рядом с exe → ../ffmpeg (портативная сборка) →
-/// PATH. Ошибочный путь — понятная ошибка (без тихого фолбэка).
+/// Найти ffmpeg: явный путь → рядом с exe → `<exe>/ffmpeg/ffmpeg.exe`
+/// (портативная сборка) → `../ffmpeg` → PATH. Ошибочный путь — понятная
+/// ошибка (без тихого фолбэка).
 pub fn resolve_ffmpeg(explicit: Option<&Path>) -> Result<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(p) = explicit {
@@ -137,6 +138,7 @@ pub fn resolve_ffmpeg(explicit: Option<&Path>) -> Result<PathBuf> {
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
                 candidates.push(dir.join("ffmpeg.exe"));
+                candidates.push(dir.join("ffmpeg").join("ffmpeg.exe"));
                 if let Some(parent) = dir.parent() {
                     candidates.push(parent.join("ffmpeg").join("ffmpeg.exe"));
                 }
