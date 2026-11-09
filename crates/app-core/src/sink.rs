@@ -504,7 +504,6 @@ impl AudioSink for FfmpegSink {
             self.finished = true;
             bail!("{err} — черновик сохранён: {}", self.partial.display());
         }
-        let status = wait_with_timeout(&mut self.child, self.wait_timeout);
         let stderr = self
             .stderr_thread
             .take()
