@@ -41,9 +41,11 @@ pub struct GuiSettings {
     pub out_dir: String,
     pub chunk_log: bool,
     pub ffmpeg_path: String,
-    // UI
+    // UI (фактические состояния свёрток; синхронизируются с egui-памятью)
     pub source_open: bool,
+    pub model_open: bool,
     pub gen_open: bool,
+    pub pauses_open: bool,
     pub out_open: bool,
     /// Неизвестные ключи (сохраняются при save/load без потерь).
     #[serde(flatten, skip_serializing_if = "BTreeMap::is_empty")]
@@ -109,7 +111,9 @@ impl Default for GuiSettings {
             chunk_log: false,
             ffmpeg_path: String::new(),
             source_open: true,
+            model_open: true,
             gen_open: true,
+            pauses_open: true,
             out_open: true,
             extra: BTreeMap::new(),
         }
@@ -156,9 +160,26 @@ pub fn load_settings(path: &Path) -> Result<GuiSettings> {
     Ok(s)
 }
 
-/// Безопасная запись: сериализация в уникальный tmp рядом с конфигом, затем
-/// атомарная замена (MoveFileExW REPLACE|WRITE_THROUGH на Windows). При сбое
+/// Эксклюзивная запись НОВОГО файла (`create_new`): занятое имя — отказ,
+/// существующее содержимое никогда не затирается (как write_wav16 в
+/// audio-processing; политика SAFETY_AUDIT).
+pub fn write_exclusive(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("создать {} (create_new)", path.display()))?;
+    f.write_all(bytes)
+        .with_context(|| format!("записать {}", path.display()))?;
+    Ok(())
+}
+
+/// Безопасная запись: сериализация в уникальный tmp (создание ТОЛЬКО
+/// эксклюзивно, `create_new` — без TOCTOU-гонки check+write), затем атомарная
+/// замена (MoveFileExW REPLACE|WRITE_THROUGH на Windows). При сбое
 /// сериализации/записи прежний валидный файл остаётся нетронутым.
+/// Замена разрешена ТОЛЬКО для собственного конфига GUI — см. AGENTS.md.
 pub fn save_settings(settings: &GuiSettings, path: &Path) -> Result<()> {
     let json = serde_json::to_string_pretty(settings).context("сериализация настроек")?;
     let nanos = std::time::SystemTime::now()
@@ -166,8 +187,7 @@ pub fn save_settings(settings: &GuiSettings, path: &Path) -> Result<()> {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let tmp = path.with_extension(format!("tmp.{nanos}.{}", std::process::id()));
-    anyhow::ensure!(!tmp.exists(), "временный файл занят: {}", tmp.display());
-    std::fs::write(&tmp, json.as_bytes()).with_context(|| format!("записать {}", tmp.display()))?;
+    write_exclusive(&tmp, json.as_bytes())?;
     let res = atomic_replace(&tmp, path);
     if res.is_err() {
         // прежний конфиг цел; tmp остаётся для диагностики (не удаляем)
@@ -304,6 +324,21 @@ mod tests {
     }
 
     #[test]
+    fn write_exclusive_refuses_occupied_name() {
+        let d = tmpdir("excl");
+        let p = d.join("occupied.json");
+        std::fs::write(&p, b"original").unwrap();
+        // create_new: занятое имя — отказ, существующее содержимое не трогаем
+        let err = write_exclusive(&p, b"new content").unwrap_err();
+        assert!(format!("{err:#}").contains("create_new"), "{err:#}");
+        assert_eq!(std::fs::read(&p).unwrap(), b"original");
+        // новое имя — успешно
+        let fresh = d.join("fresh.json");
+        write_exclusive(&fresh, b"created").unwrap();
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"created");
+    }
+
+    #[test]
     fn round_trip_preserves_unknown_keys() {
         let d = tmpdir("rt");
         let p = d.join("s.json");
@@ -332,6 +367,22 @@ mod tests {
         assert_eq!(s2.temperature, 0.7);
         assert_eq!(s2.model, ModelChoice::Fast);
         assert_eq!(s2.workers, Some(3));
+        // состояния свёрток переживают save/load (регрессия G1-фикса №3)
+        let s = GuiSettings {
+            source_open: false,
+            model_open: false,
+            gen_open: true,
+            pauses_open: false,
+            out_open: true,
+            ..s2.clone()
+        };
+        save_settings(&s, &p).unwrap();
+        let s3 = load_settings(&p).unwrap();
+        assert!(!s3.source_open);
+        assert!(!s3.model_open);
+        assert!(s3.gen_open);
+        assert!(!s3.pauses_open);
+        assert!(s3.out_open);
         assert_eq!(
             s2.extra.get("future_key"),
             s.extra.get("future_key"),

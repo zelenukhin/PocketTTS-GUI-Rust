@@ -1,6 +1,5 @@
-//! G1: статическая форма GUI (eframe/egui) с рабочей валидацией.
-//! Синтез через кнопки подключается на G2 — сейчас «Запустить» показывает
-//! состояние валидации и явно помечен как G2 (фиктивного успеха нет).
+//! G1/G2: форма GUI (eframe/egui) с рабочей валидацией и запуском синтеза
+//! (G2 — фоновый поток поверх app_core::pipeline::synthesize_stream).
 
 use eframe::egui;
 use std::path::{Path, PathBuf};
@@ -9,6 +8,17 @@ use crate::settings::{
     load_settings, save_settings, settings_path, DeviceChoice, GuiSettings, ModelChoice,
     OutputFormatChoice,
 };
+
+/// Клик по заголовку свёртки переворачивает ПОЛЕ настроек: состояние хранится
+/// в настройках (единственный источник истины, заголовок открывается через
+/// `.open(Some(field))`). Иначе фактическое состояние живёт только в
+/// egui-памяти — и в конфиг сохранялись бы стартовые значения (дефект
+/// G1-фикс №3).
+pub(crate) fn header_clicked<R>(resp: &egui::CollapsingResponse<R>, open: &mut bool) {
+    if resp.header_response.clicked() {
+        *open = !*open;
+    }
+}
 
 pub struct ShtormApp {
     pub settings: GuiSettings,
@@ -155,8 +165,8 @@ impl eframe::App for ShtormApp {
         });
         egui::CentralPanel::default().show(ctx, |ui| {
             let s = &mut self.settings;
-            egui::CollapsingHeader::new("Источник и голос")
-                .default_open(s.source_open)
+            let resp = egui::CollapsingHeader::new("Источник и голос")
+                .open(Some(s.source_open))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label("Текстовый файл:");
@@ -188,10 +198,11 @@ impl eframe::App for ShtormApp {
                         "Голосовой референс: поддерживается WAV (.safetensors — в будущих этапах).",
                     );
                 });
+            header_clicked(&resp, &mut s.source_open);
             ui.add_space(4.0);
 
-            egui::CollapsingHeader::new("Модель и устройство")
-                .default_open(true)
+            let resp = egui::CollapsingHeader::new("Модель и устройство")
+                .open(Some(s.model_open))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label("Модель:");
@@ -255,10 +266,11 @@ impl eframe::App for ShtormApp {
                         s.effective_workers()
                     ));
                 });
+            header_clicked(&resp, &mut s.model_open);
             ui.add_space(4.0);
 
-            egui::CollapsingHeader::new("Параметры генерации")
-                .default_open(s.gen_open)
+            let resp = egui::CollapsingHeader::new("Параметры генерации")
+                .open(Some(s.gen_open))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label("Температура:");
@@ -295,10 +307,11 @@ impl eframe::App for ShtormApp {
                         ui.add(egui::Slider::new(&mut s.brightness_db, 0.0..=12.0));
                     });
                 });
+            header_clicked(&resp, &mut s.gen_open);
             ui.add_space(4.0);
 
-            egui::CollapsingHeader::new("Паузы и воркеры")
-                .default_open(true)
+            let resp = egui::CollapsingHeader::new("Паузы и воркеры")
+                .open(Some(s.pauses_open))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label("Масштаб пауз:");
@@ -326,10 +339,11 @@ impl eframe::App for ShtormApp {
                         ui.add(egui::Slider::new(w, 1..=12));
                     }
                 });
+            header_clicked(&resp, &mut s.pauses_open);
             ui.add_space(4.0);
 
-            egui::CollapsingHeader::new("Вывод")
-                .default_open(s.out_open)
+            let resp = egui::CollapsingHeader::new("Вывод")
+                .open(Some(s.out_open))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label("Формат:");
@@ -392,6 +406,7 @@ impl eframe::App for ShtormApp {
                         }
                     });
                 });
+            header_clicked(&resp, &mut s.out_open);
             ui.add_space(6.0);
             ui.separator();
             ui.label("Журнал:");
@@ -414,5 +429,63 @@ impl eframe::App for ShtormApp {
                 }
             });
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Управляемая свёртка: поле настроек — единственный источник истины.
+    /// 1) открытое поле → тело показано; закрытое поле → тело скрыто.
+    /// 2) клик по заголовку (симуляция PointerButton по rect) переворачивает
+    ///    поле — состояние переживает кадры и попадает в конфиг.
+    #[test]
+    fn header_state_is_driven_by_settings_field() {
+        let ctx = egui::Context::default();
+        // без анимации: openness мгновенно 0/1 — тело строго соответствует
+        // принудительному .open() даже в разреженных headless-пассах
+        ctx.style_mut(|s| s.animation_time = 0.0);
+        let mut open = true;
+        let mut header_rect: Option<egui::Rect> = None;
+        for frame in 0..3 {
+            let mut raw = egui::RawInput::default();
+            if frame == 1 {
+                // «пользователь» кликает центр заголовка первого кадра
+                let pos = header_rect.expect("rect заголовка").center();
+                raw.events.push(egui::Event::PointerMoved(pos));
+                raw.events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                raw.events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            let _ = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let was_open = open;
+                    let resp = egui::CollapsingHeader::new("Тест-секция")
+                        .open(Some(open))
+                        .show(ui, |ui| {
+                            ui.label("тело секции");
+                        });
+                    header_rect = Some(resp.header_response.rect);
+                    header_clicked(&resp, &mut open);
+                    // в этом кадре тело показано <=> поле было открыто
+                    assert_eq!(resp.body_returned.is_some(), was_open);
+                });
+            });
+            match frame {
+                0 => assert!(open, "стартовое состояние — открыто"),
+                1 => assert!(!open, "клик по заголовку закрыл секцию"),
+                _ => assert!(!open, "состояние сохраняется между кадрами"),
+            }
+        }
     }
 }

@@ -514,10 +514,33 @@ pub fn synthesize_stream<F>(
     opts: &PipelineOptions,
     workers: usize,
     sink: Box<dyn AudioSink>,
-    mut progress: F,
+    progress: F,
     cancel: &AtomicBool,
 ) -> Result<StreamOutcome>
 where
+    F: FnMut(usize, usize),
+{
+    synthesize_stream_impl(raw_text, opts, workers, sink, progress, cancel, |seed| {
+        real_worker_factory(opts, seed)
+    })
+}
+
+/// Реализация с инъекцией фабрики воркеров: публичная обёртка всегда берёт
+/// `real_worker_factory`; тесты подставляют мок и проверяют аварийный путь
+/// целиком (run_job → StreamError с реальным прогрессом/seed/черновиком).
+fn synthesize_stream_impl<W, Fac, FacW, F>(
+    raw_text: &str,
+    opts: &PipelineOptions,
+    workers: usize,
+    sink: Box<dyn AudioSink>,
+    mut progress: F,
+    cancel: &AtomicBool,
+    factory_of: Fac,
+) -> Result<StreamOutcome>
+where
+    W: crate::pool::ChunkWorker + 'static,
+    Fac: FnOnce(u64) -> FacW,
+    FacW: Fn(usize, u64) -> anyhow::Result<W> + Send + Sync + 'static,
     F: FnMut(usize, usize),
 {
     use text_processing::{chunk_pause_s, chunk_pipeline, to_model_stress_notation};
@@ -559,7 +582,7 @@ where
         workers,
         queue_cap: 4,
     };
-    let factory = real_worker_factory(opts, base_seed);
+    let factory = factory_of(base_seed);
 
     let mut done_ref = 0usize;
     let mut sink = sink;
@@ -580,11 +603,11 @@ where
     let summary = match run {
         Ok(s) => s,
         Err(e) => {
-            // черновик осознанно остаётся для диагностики (без удалений)
-            return Err(anyhow::anyhow!(
-                "{e:#}\nчерновик сохранён: {}",
-                partial_path.display()
-            ));
+            // черновик осознанно остаётся для диагностики (без удалений);
+            // ошибка возвращается ТИПИЗИРОВАННОЙ: прогресс — это выданные в
+            // sink чанки (done_ref), не 0 и не оценки
+            let se = stream_error_from_run(e, done_ref, total, base_seed, partial_path.clone());
+            return Err(anyhow::Error::new(se));
         }
     };
 
@@ -682,6 +705,7 @@ where
 mod stream_error_tests {
     use super::*;
     use crate::pool::{run_job, ChunkWorker, PoolConfig, SeedPolicy, Task};
+    use crate::sink::WavSink;
     use std::sync::atomic::AtomicBool;
 
     struct FailingOnThird;
@@ -697,6 +721,79 @@ mod stream_error_tests {
                 denoise: crate::pool::DenoiseChunkStatus::Off,
             })
         }
+    }
+
+    /// Аварийный путь сквозного конвейера (мок-воркер, настоящий WavSink):
+    /// ошибка run_job возвращается как ТИПИЗИРОВАННЫЙ StreamError с реальным
+    /// прогрессом (2 выданных чанка, не 0), seed и путём черновика; итоговый
+    /// файл не создаётся (регрессия «anyhow без типа и прогресса»).
+    #[test]
+    fn synthesize_stream_failure_returns_typed_stream_error() {
+        let d = std::env::temp_dir().join(format!(
+            "shtorm_se2_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|t| t.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        let final_p = d.join("book.wav");
+        let opts = PipelineOptions {
+            model_dir: d.clone(),
+            voice: d.join("voice.wav"),
+            device: Device::Cpu,
+            threads: 1,
+            seed: Some(42),
+            temperature: 0.3,
+            decode_steps: 1,
+            eos_threshold: -4.0,
+            brightness_db: 0.0,
+            denoise: false,
+            pause_scale: 1.0,
+            paragraph_pause_s: 0.0,
+            max_tokens: 10, // короткие чанки — падение на 3-м гарантировано до конца
+            char_rules: None,
+            anti_repeat: true,
+        };
+        let text = "П+ервый предл+ог. Вт+орой предл+ог. Тр+етий предл+ог.";
+        let sink = Box::new(WavSink::create(&final_p, 24_000).unwrap());
+        let partial = sink.partial_path();
+        let mut progress_calls = 0usize;
+        let cancel = AtomicBool::new(false);
+        let err = synthesize_stream_impl(
+            text,
+            &opts,
+            1, // один воркер: выданы чанки 0,1, сбой на 2 — детерминированно
+            sink,
+            |done, total| {
+                assert!(total >= 3);
+                assert!(done >= 1 && done <= total);
+                progress_calls += 1;
+            },
+            &cancel,
+            |_seed| |_wid, _s| Ok(FailingOnThird),
+        )
+        .unwrap_err();
+
+        let se = err
+            .downcast_ref::<StreamError>()
+            .expect("ошибка конвейера обязана быть типизированным StreamError");
+        assert!(se.message.contains("синтетический сбой"), "{}", se.message);
+        assert_eq!(
+            se.chunks_done, 2,
+            "реальный прогресс: 2 чанка выдано в sink"
+        );
+        assert!(se.total >= 3, "минимум 3 чанка в тестовом тексте");
+        assert_eq!(se.base_seed, 42);
+        assert_eq!(se.partial, partial, "путь черновика из синка");
+        assert!(se.partial.exists(), "черновик WAV реально создан");
+        assert!(!final_p.exists(), "итоговый файл не публикуется");
+        assert!(
+            format!("{se}").contains("2/"),
+            "Display несёт прогресс: {se}"
+        );
+        assert!(progress_calls >= 2, "прогресс приходил до сбоя");
     }
 
     /// Мок-воркер падает на 3-м чанке: StreamError несёт реальный прогресс,

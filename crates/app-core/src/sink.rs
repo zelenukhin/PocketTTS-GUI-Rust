@@ -289,6 +289,8 @@ impl FfmpegSink {
         // писатель: владеет stdin; ошибки сохраняет и закрывает stdin
         let (tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(4);
         let fed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // доля структуры в ОБЩЕМ счётчике писателя (клон до move в поток)
+        let fed_shared = Arc::clone(&fed);
         let write_error = Arc::new(std::sync::Mutex::new(None::<String>));
         let werr = Arc::clone(&write_error);
         let writer_handle = std::thread::spawn(move || {
@@ -345,7 +347,9 @@ impl FfmpegSink {
             partial,
             final_path,
             buf: Vec::new(),
-            bytes_fed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            // ОДИН общий счётчик с писателем: поле и поток инкрементируют
+            // один и тот же Arc (иначе сообщения об ошибках читали бы 0).
+            bytes_fed: fed_shared,
             finished: false,
             stderr_text: None,
             wait_timeout: std::time::Duration::from_secs(30),
@@ -416,6 +420,12 @@ impl FfmpegSink {
     /// Тестовый доступ: уменьшить лимит ожидания завершения.
     pub fn set_wait_timeout(&mut self, t: std::time::Duration) {
         self.wait_timeout = t;
+    }
+
+    /// Байт PCM, реально попавших в писателя (общий счётчик с потоком stdin).
+    /// После finalize/abort (join писателя) значение детерминировано.
+    pub fn bytes_fed(&self) -> u64 {
+        self.bytes_fed.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Прервать кодирование: закрыть stdin, дать ffmpeg штатно завершиться
@@ -966,6 +976,24 @@ mod tests {
             partial.exists(),
             "черновик остаётся для диагностики: {partial:?}"
         );
+    }
+
+    /// bytes_fed — ОДИН общий счётчик писателя и структуры: после abort
+    /// (join писателя) он равен реально поданным байтам PCM, а не 0
+    /// (регрессия раздельных Arc-ов, дефект A5.2/G1-фикс №1).
+    #[test]
+    fn bytes_fed_counts_real_pcm_bytes_after_abort() {
+        let Some(ff) = test_ffmpeg() else {
+            eprintln!("SKIP bytes_fed: ffmpeg недоступен");
+            return;
+        };
+        let d = unique_dir("fed");
+        let final_p = d.join("out.mp3");
+        let mut sink = FfmpegSink::create(&final_p, 24000, OutputFormat::Mp3, "-V2", &ff).unwrap();
+        // 9600 сэмплов f32 -> s16le = 19200 байт; пауз нет — точное ожидание
+        sink.write_chunk(0, &[0.05f32; 9600], None).unwrap();
+        sink.abort().expect("abort");
+        assert_eq!(sink.bytes_fed(), 19200, "счётчик структуры == писателю");
     }
 
     #[test]
