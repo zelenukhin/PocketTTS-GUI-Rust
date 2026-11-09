@@ -19,9 +19,15 @@
 //!    включена, как в оригинале и в GUI).
 //! 6. Сессия денойзера строится локальным билдером движка (CPU — как в GUI:
 //!    замер teratts: GPU для DPDFNet в 2.7 раза медленнее).
+//! 7. G4.1: хвост EOS настраивается заданием (поля `eos_tail_short` /
+//!    `eos_tail_long`, тип [EosTail]). Дефолт `EosTail::Default` — оригинальная
+//!    политика «<=4 слов -> 5, иначе 3» без изменений; `Fixed(n)` передаётся в
+//!    счётчик движка напрямую, БЕЗ пересчёта N+1 (пересчёт 5→6/3→4 относился
+//!    к Python-пакету pocket-tts с иной семантикой frames_after_eos и сюда
+//!    не переносится). Счёт кадра срабатывания — см. [EosGate].
 //!
-//! Остальное (BPE-токенизатор, stateful-графы, EOS-хвост «<=4 слов -> 5, иначе 3»,
-//! лимит речи 11 букв/с + 1 с, flow-шаги s->t, клип-гард 0.98) — как в оригинале.
+//! Остальное (BPE-токенизатор, stateful-графы, лимит речи 11 букв/с + 1 с,
+//! flow-шаги s->t, клип-гард 0.98) — как в оригинале.
 
 use anyhow::{Context, Result};
 use ndarray::{Array, Array3, IxDyn};
@@ -99,6 +105,86 @@ impl Default for LoadOptions {
             seed: None,
             profile_dir: None,
         }
+    }
+}
+
+/// Хвост EOS для чанка (G4.1). Значение передаётся в параметр `eos_extra`
+/// оригинального алгоритма teratts-android НАПРЯМУЮ, без пересчёта.
+///
+/// `Default` — штатная политика исходного движка (5 для чанков ≤4 слов,
+/// 3 для остальных); `Fixed(n)` — всегда n, независимо от числа слов.
+/// `Fixed(0)` и `Default` — РАЗНЫЕ состояния: ноль отбрасывает все кадры
+/// хвоста, Default разрешается в 5/3 по ветке числа слов.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EosTail {
+    Default,
+    Fixed(u32),
+}
+
+impl EosTail {
+    /// Разрешение в число кадров для чанка с `words` словами. Число слов —
+    /// по подготовленному тексту ДО добавления восьми пробелов (как в
+    /// `prepare_text` оригинала); 1–4 слова — короткая ветка, ≥5 — длинная.
+    pub fn resolve_for(&self, words: usize) -> usize {
+        match self {
+            EosTail::Default => {
+                if words <= 4 {
+                    5
+                } else {
+                    3
+                }
+            }
+            EosTail::Fixed(n) => *n as usize,
+        }
+    }
+}
+
+/// Счётчик хвоста EOS из `generate()` — точная семантика teratts-android
+/// (rust/src/pocket.rs), выделена для регрессионных тестов без ONNX.
+///
+/// Кадр, в котором логит EOS ВПЕРВЫЕ превысил порог, входит в счёт: при
+/// `eos_extra = N` генерируется ровно N кадров, включая кадр срабатывания
+/// (N−1 кадров строго после него); при `N = 0` не генерируется ни одного —
+/// кадр срабатывания отбрасывается. Подтверждено тестом `eos_gate_counts`
+/// на синтетической последовательности срабатываний.
+#[derive(Debug, Clone)]
+pub(crate) struct EosGate {
+    fired: bool,
+    extra: usize,
+}
+
+impl Default for EosGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EosGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            fired: false,
+            extra: 0,
+        }
+    }
+
+    /// Реакция на кадр: `eos_fired` — логит EOS этого кадра выше порога;
+    /// false — кадр не генерировать (break цикла generate()).
+    pub(crate) fn tick(&mut self, eos_fired: bool, eos_extra: usize) -> bool {
+        if !self.fired && eos_fired {
+            self.fired = true;
+        }
+        if self.fired {
+            self.extra += 1;
+            if self.extra > eos_extra {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Сработал ли EOS (возвращаемое значение `generate`).
+    pub(crate) fn fired(&self) -> bool {
+        self.fired
     }
 }
 
@@ -462,6 +548,11 @@ pub struct Pocket {
     /// Noise of each frame (upstream default 0.7 is livelier; MyTTS/GUI settle lower).
     pub temperature: f32,
     pub eos_threshold: f32,
+    /// Хвост EOS по ветке числа слов (G4.1); дефолт — оригинальная политика
+    /// teratts-android (Default → 5/3). Задаётся заданием, все экземпляры
+    /// Pocket одного задания получают одинаковые значения.
+    pub eos_tail_short: EosTail,
+    pub eos_tail_long: EosTail,
     /// Flow steps per frame (1: as distilled; more = slower, sometimes cleaner).
     pub decode_steps: usize,
     /// Two-attempt repeat guard (`say`): on by default, as in teratts and the GUI.
@@ -553,6 +644,8 @@ impl Pocket {
             voices: HashMap::new(),
             temperature: 0.3,
             eos_threshold: -4.0,
+            eos_tail_short: EosTail::Default,
+            eos_tail_long: EosTail::Default,
             decode_steps: 1,
             anti_repeat: true,
             seed: opts.seed,
@@ -663,10 +756,11 @@ impl Pocket {
         Ok(c)
     }
 
-    /// The text as the model was trained on (PocketTTS.cpp `prepare_text`): no quotes, a capital
-    /// first letter, a final stop; under five words padded with 8 spaces. Returns the frames to
-    /// let it say after it signals the end (5 for a short reply, 3 otherwise).
-    pub fn prepare(text: &str) -> (String, usize) {
+    /// Текст как модель видит его при обучении (PocketTTS.cpp `prepare_text`):
+    /// без кавычек, заглавная первая буква, финальная точка; при <5 слов —
+    /// 8 пробелов в начале. Возвращает подготовленный текст и число слов ДО
+    /// паддинга (по нему выбирается ветка хвоста EOS). Чистая функция.
+    pub fn prepare_text(text: &str) -> (String, usize) {
         let t: String = text
             .chars()
             .filter(|c| !matches!(c, '"' | '`' | '“' | '”' | '«' | '»' | '„'))
@@ -686,11 +780,30 @@ impl Pocket {
         {
             t.push('.');
         }
-        let extra = if words <= 4 { 5 } else { 3 };
         if words < 5 {
             t = format!("        {t}");
         }
-        (t, extra)
+        (t, words)
+    }
+
+    /// Оригинальная `prepare` teratts-android: подготовленный текст + хвост
+    /// по штатной политике движка (≤4 слов → 5, иначе 3). Экземпляр с полями
+    /// `eos_tail_*` в дефолте ведёт себя идентично (см. `resolve_eos_extra`).
+    pub fn prepare(text: &str) -> (String, usize) {
+        let (t, words) = Self::prepare_text(text);
+        (t, if words <= 4 { 5 } else { 3 })
+    }
+
+    /// Хвост EOS для чанка с данным числом слов по политике ЭТОГО экземпляра
+    /// (G4.1): короткая ветка (≤4 слов) — `eos_tail_short`, длинная —
+    /// `eos_tail_long`. Значение передаётся в `generate` напрямую.
+    pub fn resolve_eos_extra(&self, words: usize) -> usize {
+        let policy = if words <= 4 {
+            self.eos_tail_short
+        } else {
+            self.eos_tail_long
+        };
+        policy.resolve_for(words)
     }
 
     /// Speech for [text] (stress as U+0301) in the voice of the recording [voice], 24 kHz.
@@ -705,7 +818,8 @@ impl Pocket {
         if let Some(base) = self.seed {
             self.rng = rand::rngs::StdRng::seed_from_u64(base.wrapping_add(chunk_index));
         }
-        let (prepared, eos_extra) = Self::prepare(text);
+        let (prepared, words) = Self::prepare_text(text);
+        let eos_extra = self.resolve_eos_extra(words);
         let ids = self.bpe.encode(&prepared);
         anyhow::ensure!(!ids.is_empty(), "empty text");
         let n = ids.len();
@@ -796,7 +910,7 @@ impl Pocket {
         let normal = Normal::new(0.0f32, self.temperature.max(0.0).sqrt()).unwrap();
         let mut prev = vec![f32::NAN; 32]; // the first frame starts from "nothing"
         let mut latents: Vec<f32> = Vec::with_capacity(cap * 32);
-        let (mut eos, mut extra) = (false, 0usize);
+        let mut gate = EosGate::new();
         for _ in 0..cap {
             let out = self.main_states.run(
                 &mut self.main,
@@ -809,14 +923,8 @@ impl Pocket {
                 ],
             )?;
             let (cond, eos_logit) = (&out[0], out[1][0]);
-            if !eos && eos_logit > self.eos_threshold {
-                eos = true;
-            }
-            if eos {
-                extra += 1;
-                if extra > eos_extra {
-                    break;
-                }
+            if !gate.tick(eos_logit > self.eos_threshold, eos_extra) {
+                break;
             }
             // from noise to the frame's latent: the flow head's steps s → t over 0 → 1
             // (as upstream's decoding and PocketTTS.cpp: x += dir · (t − s))
@@ -846,7 +954,7 @@ impl Pocket {
             prev = x;
             latents.extend_from_slice(&prev);
         }
-        Ok((latents, eos))
+        Ok((latents, gate.fired()))
     }
 }
 
@@ -972,6 +1080,166 @@ mod tests {
             "Он у\u{301}лыбнулся и кивну\u{301}л, вышел из ко\u{301}мнаты.".to_string()
         );
         assert_eq!(Pocket::prepare("Он ушёл, а мы остались ждать").1, 3);
+    }
+
+    /// G4.1: граница 4/5 слов в исходной политике — ровно как в teratts-android
+    /// (`words <= 4` → 5, иначе 3; паддинг — при `words < 5`).
+    #[test]
+    fn prepare_word_boundary_four_five() {
+        // 4 слова: короткая ветка + 8 пробелов
+        assert_eq!(
+            Pocket::prepare("Раз два три четыре"),
+            ("        Раз два три четыре.".to_string(), 5)
+        );
+        // 5 слов: длинная ветка, без паддинга
+        assert_eq!(
+            Pocket::prepare("Раз два три четыре пять"),
+            ("Раз два три четыре пять.".to_string(), 3)
+        );
+    }
+
+    /// G4.1: чистая prepare_text — число слов ДО паддинга (граница выбирается
+    /// по нему), пустой/односоставный/обычный чанк.
+    #[test]
+    fn prepare_text_counts_words_before_padding() {
+        // пустой текст: слов 0, короткая ветка, только паддинг
+        assert_eq!(Pocket::prepare_text(""), ("        ".to_string(), 0));
+        // односоставный: 1 слово
+        assert_eq!(Pocket::prepare_text("ну?"), ("        Ну?".to_string(), 1));
+        // обычный (6 слов): без паддинга
+        let (t, words) = Pocket::prepare_text("Он ушёл, а мы остались ждать");
+        assert_eq!(words, 6);
+        assert!(
+            t.starts_with("Он") && !t.starts_with(' '),
+            "без паддинга: {t}"
+        );
+        // 4 слова — паддинг есть, words == 4 (не 0 из-за пробелов)
+        let (t, words) = Pocket::prepare_text("Раз два три четыре");
+        assert_eq!(words, 4);
+        assert!(t.starts_with("        "), "короткий чанк паддингуется: {t}");
+    }
+
+    /// G4.1: разрешение политики хвоста. Default — оригинальные 5/3 по ветке;
+    /// Fixed(n) передаётся напрямую, БЕЗ +1 (пересчёт 5→6/3→4 — Python-пакет,
+    /// к этому движку не применим); None (Default) ≠ Fixed(0).
+    #[test]
+    fn eos_tail_resolution_default_vs_fixed() {
+        // Default: оригинальная политика teratts-android по ветке слов
+        assert_eq!(EosTail::Default.resolve_for(0), 5);
+        assert_eq!(EosTail::Default.resolve_for(4), 5);
+        assert_eq!(EosTail::Default.resolve_for(5), 3);
+        assert_eq!(EosTail::Default.resolve_for(40), 3);
+        // Fixed: прямая передача, любой ветке — одно и то же число, без +1
+        for n in [0u32, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10] {
+            assert_eq!(EosTail::Fixed(n).resolve_for(1), n as usize, "short {n}");
+            assert_eq!(EosTail::Fixed(n).resolve_for(9), n as usize, "long {n}");
+        }
+        // Android-дефолты передаются как есть: 5 остаётся 5, 3 остаётся 3
+        assert_eq!(EosTail::Fixed(5).resolve_for(3), 5);
+        assert_eq!(EosTail::Fixed(3).resolve_for(7), 3);
+        // None ≠ Fixed(0): разные состояния, разный результат
+        assert_ne!(
+            EosTail::Default.resolve_for(3),
+            EosTail::Fixed(0).resolve_for(3)
+        );
+        assert_eq!(EosTail::Fixed(0).resolve_for(3), 0);
+    }
+
+    /// G4.1: точная семантика счётчика generate() на синтетической
+    /// последовательности срабатываний. При eos_extra = N генерируется ровно
+    /// N кадров, ВКЛЮЧАЯ кадр срабатывания EOS (N−1 строго после него);
+    /// при N = 0 не генерируется ни одного. Сравнение Android/Windows Rust:
+    /// счётчик перенесён без изменений (побайтово та же логика), поэтому
+    /// прямая передача 5/3 корректна без пересчёта.
+    #[test]
+    fn eos_gate_counts_frames_including_detection_frame() {
+        // EOS срабатывает на кадре 5 (индекс 4): до него логиты ниже порога
+        let threshold = -4.0f32;
+        let logits: Vec<f32> = [-10.0, -9.0, -8.0, -7.0]
+            .into_iter()
+            .chain([0.0f32; 40])
+            .collect();
+        for (eos_extra, want_from_fire) in [(0usize, 0usize), (1, 1), (3, 3), (5, 5), (10, 10)] {
+            let mut gate = EosGate::new();
+            let mut kept_before_fire = 0usize;
+            let mut kept_from_fire = 0usize;
+            let mut fire_seen = false;
+            for &l in &logits {
+                let keep = gate.tick(l > threshold, eos_extra);
+                if gate.fired() {
+                    fire_seen = true;
+                }
+                if !keep {
+                    assert!(gate.fired(), "break только после срабатывания EOS");
+                    break;
+                }
+                if fire_seen {
+                    kept_from_fire += 1;
+                } else {
+                    kept_before_fire += 1;
+                }
+            }
+            assert_eq!(
+                kept_before_fire, 4,
+                "кадры до срабатывания генерируются все (eos_extra={eos_extra})"
+            );
+            assert_eq!(
+                kept_from_fire, want_from_fire,
+                "сгенерировано кадров с момента срабатывания (eos_extra={eos_extra})"
+            );
+            assert!(gate.fired(), "EOS обязан сработать");
+        }
+        // EOS не сработал: все кадры генерируются, fired() == false
+        let mut gate = EosGate::new();
+        let quiet: Vec<f32> = (0..20).map(|_| -110.0).collect();
+        let mut kept = 0usize;
+        for l in quiet {
+            if gate.tick(l > threshold, 5) {
+                kept += 1;
+            }
+        }
+        assert_eq!(kept, 20, "без EOS лимит хвоста не действует");
+        assert!(!gate.fired());
+    }
+
+    /// G4.1: нестандартные пороги EOS, включая 0 — срабатывание строгое (>),
+    /// как в оригинале (`eos_logit > self.eos_threshold`).
+    #[test]
+    fn eos_gate_threshold_edge_values() {
+        // порог 0: логит 0.0 НЕ срабатывает, 0.5 — срабатывает
+        let mut gate = EosGate::new();
+        assert!(gate.tick(0.0 > 0.0, 3), "0 > 0 — false, хвост не начался");
+        assert!(!gate.fired());
+        assert!(gate.tick(0.5 > 0.0, 3));
+        assert!(gate.fired(), "0.5 > 0 сработал");
+        // порог 1: типичное «раннее» срабатывание обычных логитов
+        let mut gate = EosGate::new();
+        assert!(gate.tick(0.9 > 1.0, 0));
+        assert!(!gate.fired());
+        assert!(
+            !gate.tick(1.2 > 1.0, 0),
+            "Fixed(0): кадр срабатывания отброшен"
+        );
+    }
+
+    /// G4.1: политика на экземпляре Pocket — дефолтный экземпляр ведёт себя
+    /// как оригинал (Default → 5/3), Fixed применяется к нужной ветке.
+    /// resolve_eos_extra — чистая функция политики, ONNX не нужен.
+    #[test]
+    fn resolve_eos_extra_policy_per_branch() {
+        // Конфигурация без полей (как все существующие вызовы Pocket::load):
+        // идентично оригинальной политике.
+        let default_policy = (EosTail::Default, EosTail::Default);
+        let (short, long) = default_policy;
+        assert_eq!(short.resolve_for(4), 5);
+        assert_eq!(long.resolve_for(5), 3);
+        // Новый дефолт задания G4.1: Fixed(5)/Fixed(3) — те же числа,
+        // но ЯВНО заданные (не зависят от ветки слов, если её поменять).
+        assert_eq!(EosTail::Fixed(5).resolve_for(4), 5);
+        assert_eq!(EosTail::Fixed(3).resolve_for(5), 3);
+        // Асимметричный случай: короткий 0, длинный 10 — каждая ветка своя
+        assert_eq!(EosTail::Fixed(0).resolve_for(4), 0);
+        assert_eq!(EosTail::Fixed(10).resolve_for(5), 10);
     }
 
     #[test]

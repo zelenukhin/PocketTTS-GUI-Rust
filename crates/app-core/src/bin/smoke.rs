@@ -15,7 +15,24 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use shtorm_engine::{Device, LoadOptions, Pocket, POCKET_RATE};
+use shtorm_engine::{Device, EosTail, LoadOptions, Pocket, POCKET_RATE};
+
+/// Разбор значения хвоста EOS для smoke: `none` или число 0..=10.
+fn parse_eos_tail(s: &str) -> Result<EosTail, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "none" => Ok(EosTail::Default),
+        other => {
+            let n = other
+                .parse::<u32>()
+                .map_err(|_| format!("--eos-tail: 'none' или число 0..=10, получено '{other}'"))?;
+            if n > 10 {
+                Err(format!("--eos-tail: максимум 10, получено {n}"))
+            } else {
+                Ok(EosTail::Fixed(n))
+            }
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(about = "Shtorm PocketTTS smoke test (FP32, CPU/CUDA)")]
@@ -49,6 +66,12 @@ struct Args {
     seed: i64,
     #[arg(long, default_value_t = -4.0, allow_negative_numbers = true)]
     eos_threshold: f32,
+    /// Хвост EOS для чанков ≤4 слов: 0..=10 или none (штатная политика 5/3)
+    #[arg(long, value_parser = parse_eos_tail, default_value = "none")]
+    eos_tail_short: EosTail,
+    /// Хвост EOS для чанков ≥5 слов: 0..=10 или none
+    #[arg(long, value_parser = parse_eos_tail, default_value = "none")]
+    eos_tail_long: EosTail,
     /// Яркость, дБ high-shelf > 3 кГц (0 — выкл)
     #[arg(long, default_value_t = 0.0)]
     brightness_db: f32,
@@ -120,6 +143,8 @@ fn main() -> Result<()> {
 
     engine.temperature = args.temperature;
     engine.eos_threshold = args.eos_threshold;
+    engine.eos_tail_short = args.eos_tail_short;
+    engine.eos_tail_long = args.eos_tail_long;
     engine.decode_steps = args.decode_steps as usize;
     engine.anti_repeat = !args.no_anti_repeat;
     if args.denoise {
@@ -158,9 +183,10 @@ fn main() -> Result<()> {
             f32::INFINITY
         };
         println!(
-            "chunk {i}: {audio_s:.2} s audio in {gen_s:.2} s (RTF {rtf:.3}, {:.1}x realtime), peak {peak:.3}, samples {}",
+            "chunk {i}: {audio_s:.2} s audio in {gen_s:.2} s (RTF {rtf:.3}, {:.1}x realtime), peak {peak:.3}, samples {}, frames {}",
             if rtf > 0.0 { 1.0 / rtf } else { 0.0 },
-            audio.len()
+            audio.len(),
+            audio.len() / 1920 // латентных кадров по 80 мс (до trim_edges)
         );
         gen_secs_total += gen_s;
         audio_secs_total += audio_s;

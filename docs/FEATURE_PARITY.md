@@ -8,7 +8,8 @@
 | **Загрузка голоса: WAV любой частоты/битности, 30 с, кэш** | ✅ | pocket.rs `read_voice`/`voice` | нет |
 | **Нотация ударений `+`/U+0301 (NFC, ё)** | ✅ | text-processing (порт `to_model_stress_notation`) | нет; тесты 1:1 |
 | **temperature / decode_steps / eos_threshold** | ✅ | pocket.rs поля | нет |
-| **EOS-хвост «≤4 слов → 5, иначе 3» (teratts)** | ✅ | pocket.rs `prepare` | нет |
+| **EOS-хвост «≤4 слов → 5, иначе 3» (teratts)** | ✅ | pocket.rs `prepare`/`prepare_text` | нет |
+| **Настраиваемые параметры EOS (G4.1, намеренное отличие от Python)** | ✅ (2026-11-09) | pocket.rs `EosTail`/`EosGate` | **НЕ порт Python**: порог (Авто≡−4.0/−6…1) + хвосты None/0–10 на ветку числа слов; значение = `eos_extra` teratts-android напрямую (N кадров, включая кадр срабатывания), Python-пересчёт 6/4 не используется; EOS из runtime.json не читается; GUI/CLI/JSON-дефолты −4/5/3 |
 | **Детерминированный seed на чанк (seed+index)** | ✅ | добавлено в pocket.rs | проверено побитово |
 | **Анти-повторы (2 попытки, лимит 11 симв/с+1с)** | ✅ | pocket.rs `say` | вынесен в флаг `anti_repeat` |
 | **High-shelf яркость (RBJ, клип-гард 0.98)** | ✅ | pocket.rs `high_shelf` | нет |

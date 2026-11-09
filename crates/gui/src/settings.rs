@@ -9,6 +9,106 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use shtorm_engine::EosTail;
+
+/// Порог EOS в настройках GUI (G4.1). «Авто» — встроенное фиксированное
+/// значение −4.0 движка teratts-android: НЕ читает runtime.json модели
+/// и не создаёт отдельного автоматического алгоритма. Число передаётся
+/// движку непосредственно.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EosThresholdSetting {
+    Auto,
+    Fixed(f32),
+}
+
+impl EosThresholdSetting {
+    /// Значение «Авто» — константа порога teratts-android.
+    pub const AUTO_VALUE: f32 = -4.0;
+
+    pub fn value(self) -> f32 {
+        match self {
+            Self::Auto => Self::AUTO_VALUE,
+            Self::Fixed(v) => v,
+        }
+    }
+}
+
+/// Варианты порога EOS (как в Python GUI; «Авто» == −4.0).
+pub const EOS_THRESHOLD_CHOICES: &[f32] = &[
+    -6.0, -5.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0,
+];
+/// Варианты хвоста EOS (кадров), кроме None.
+pub const EOS_TAIL_CHOICES: &[u32] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+
+// ---- serde: «auto»/«none» — строки, числа — числа (None ≠ 0) ------------------
+
+mod eos_threshold_serde {
+    use super::EosThresholdSetting;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(t: &EosThresholdSetting, s: S) -> Result<S::Ok, S::Error> {
+        match t {
+            EosThresholdSetting::Auto => s.serialize_str("auto"),
+            EosThresholdSetting::Fixed(v) => s.serialize_f32(*v),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<EosThresholdSetting, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Str(String),
+            F32(f32),
+        }
+        match Repr::deserialize(d)? {
+            // старые конфиги хранят число (в т.ч. −4.0) — это Fixed
+            Repr::F32(v) => Ok(EosThresholdSetting::Fixed(v)),
+            Repr::Str(s) => match s.trim().to_ascii_lowercase().as_str() {
+                "auto" => Ok(EosThresholdSetting::Auto),
+                other => {
+                    // потерянные старые строковые метки («-4» и т.п.) — число
+                    other
+                        .replace(',', ".")
+                        .parse::<f32>()
+                        .map(EosThresholdSetting::Fixed)
+                        .map_err(serde::de::Error::custom)
+                }
+            },
+        }
+    }
+}
+
+mod eos_tail_serde {
+    use super::EosTail;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(t: &EosTail, s: S) -> Result<S::Ok, S::Error> {
+        match t {
+            EosTail::Default => s.serialize_str("none"),
+            EosTail::Fixed(n) => s.serialize_u32(*n),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<EosTail, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Str(String),
+            U32(u32),
+        }
+        match Repr::deserialize(d)? {
+            Repr::U32(n) if n <= 10 => Ok(EosTail::Fixed(n)),
+            Repr::U32(n) => Err(serde::de::Error::custom(format!(
+                "хвост EOS: максимум 10, получено {n}"
+            ))),
+            Repr::Str(s) if s.trim().eq_ignore_ascii_case("none") => Ok(EosTail::Default),
+            Repr::Str(s) => Err(serde::de::Error::custom(format!(
+                "хвост EOS: 'none' или число 0..=10, получено '{s}'"
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GuiSettings {
@@ -34,7 +134,17 @@ pub struct GuiSettings {
     // Параметры генерации
     pub temperature: f32,
     pub decode_steps: u32,
-    pub eos_threshold: f32,
+    /// Порог EOS: «Авто» (= −4.0) или число. G4.1.
+    #[serde(with = "eos_threshold_serde")]
+    pub eos_threshold: EosThresholdSetting,
+    /// Хвост EOS для чанков ≤4 слов: None (штатная политика движка 5/3)
+    /// или число 0..=10. Значение передаётся движку напрямую, без
+    /// пересчёта (Python-значения 6/4 не используются). G4.1.
+    #[serde(with = "eos_tail_serde")]
+    pub eos_tail_short: EosTail,
+    /// Хвост EOS для чанков ≥5 слов. G4.1.
+    #[serde(with = "eos_tail_serde")]
+    pub eos_tail_long: EosTail,
     pub seed: i64,
     pub brightness_db: f32,
     pub denoise: bool,
@@ -136,7 +246,11 @@ impl Default for GuiSettings {
             threads: 4,
             temperature: 0.3,
             decode_steps: 1,
-            eos_threshold: -4.0,
+            // G4.1: дефолты воспроизводят teratts-android — «Авто» (== −4.0)
+            // и явные Fixed(5)/Fixed(3). Python-пересчёт 6/4 не переносится.
+            eos_threshold: EosThresholdSetting::Auto,
+            eos_tail_short: EosTail::Fixed(5),
+            eos_tail_long: EosTail::Fixed(3),
             seed: 42,
             brightness_db: 8.0,
             denoise: false,
@@ -184,7 +298,16 @@ impl GuiSettings {
     pub fn clamped(&mut self) {
         self.temperature = self.temperature.clamp(0.05, 1.5);
         self.decode_steps = self.decode_steps.clamp(1, 8);
-        self.eos_threshold = self.eos_threshold.clamp(-20.0, 20.0);
+        // порог: зажимается только числовая часть, «Авто» сохраняется
+        if let EosThresholdSetting::Fixed(v) = self.eos_threshold {
+            self.eos_threshold = EosThresholdSetting::Fixed(v.clamp(-20.0, 20.0));
+        }
+        // хвосты: Fixed зажимается в 0..=10, None (Default) не меняется
+        for tail in [&mut self.eos_tail_short, &mut self.eos_tail_long] {
+            if let EosTail::Fixed(n) = *tail {
+                *tail = EosTail::Fixed(n.min(10));
+            }
+        }
         self.brightness_db = self.brightness_db.clamp(0.0, 12.0);
         self.pause_scale = self.pause_scale.clamp(0.0, 2.0);
         self.paragraph_pause_s = self.paragraph_pause_s.clamp(0.0, 3.0);
@@ -571,5 +694,102 @@ mod tests {
             ..s
         };
         assert_eq!(s.effective_workers(), 4, "ручной выбор не перезаписывается");
+    }
+
+    // ============ G4.1: настройки EOS ============
+
+    /// Дефолты новой конфигурации — значения teratts-android: «Авто» (== −4.0)
+    /// и явные Fixed(5)/Fixed(3) (не None!). «Авто» — фиксированное −4.0,
+    /// а не чтение модели.
+    #[test]
+    fn eos_defaults_are_teratts_android_values() {
+        let s = GuiSettings::default();
+        assert_eq!(s.eos_threshold, EosThresholdSetting::Auto);
+        assert_eq!(s.eos_threshold.value(), -4.0);
+        assert_eq!(s.eos_tail_short, EosTail::Fixed(5));
+        assert_eq!(s.eos_tail_long, EosTail::Fixed(3));
+        assert_ne!(s.eos_tail_short, EosTail::Default, "явные 5/3, не None");
+    }
+
+    /// Старый конфиг G1–G4 (числовой eos_threshold, нет новых ключей)
+    /// загружается: порог → Fixed(старое число), хвосты → новые дефолты 5/3.
+    #[test]
+    fn eos_migration_from_old_config() {
+        let d = tmpdir("eos_mig");
+        let p = d.join("s.json");
+        std::fs::write(&p, r#"{"temperature": 0.4, "eos_threshold": -3.5}"#).unwrap();
+        let s = load_settings(&p).unwrap();
+        assert_eq!(s.eos_threshold, EosThresholdSetting::Fixed(-3.5));
+        assert_eq!(s.eos_tail_short, EosTail::Fixed(5), "нет ключа → дефолт 5");
+        assert_eq!(s.eos_tail_long, EosTail::Fixed(3), "нет ключа → дефолт 3");
+        // старый −4.0 тоже просто число: без скрытых преобразований
+        std::fs::write(&p, r#"{"eos_threshold": -4.0}"#).unwrap();
+        assert_eq!(
+            load_settings(&p).unwrap().eos_threshold,
+            EosThresholdSetting::Fixed(-4.0)
+        );
+        // невалидный хвост (за диапазоном) — честная ошибка разбора
+        std::fs::write(&p, r#"{"eos_tail_short": 99}"#).unwrap();
+        assert!(load_settings(&p).is_err());
+    }
+
+    /// Round-trip новых значений: «auto»/«none»/0/10 сохраняются как есть
+    /// (None ≠ 0 в JSON: "none" против числа), unknown-ключи не теряются.
+    #[test]
+    fn eos_settings_round_trip_distinct_states() {
+        let d = tmpdir("eos_rt");
+        let p = d.join("s.json");
+        let s = GuiSettings {
+            eos_threshold: EosThresholdSetting::Auto,
+            eos_tail_short: EosTail::Default,
+            eos_tail_long: EosTail::Fixed(0),
+            ..Default::default()
+        };
+        save_settings(&s, &p).unwrap();
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(raw.contains("\"auto\""), "{raw}");
+        assert!(raw.contains("\"none\""), "None — строка, не число: {raw}");
+        assert!(raw.contains("\"eos_tail_long\": 0"), "{raw}");
+        let s2 = load_settings(&p).unwrap();
+        assert_eq!(s2.eos_threshold, EosThresholdSetting::Auto);
+        assert_eq!(s2.eos_tail_short, EosTail::Default);
+        assert_eq!(s2.eos_tail_long, EosTail::Fixed(0));
+        assert_ne!(s2.eos_tail_short, s2.eos_tail_long, "None ≠ Fixed(0)");
+        // числовой порог тоже проходит круг
+        let s = GuiSettings {
+            eos_threshold: EosThresholdSetting::Fixed(0.5),
+            eos_tail_short: EosTail::Fixed(10),
+            eos_tail_long: EosTail::Fixed(1),
+            ..Default::default()
+        };
+        save_settings(&s, &p).unwrap();
+        let s3 = load_settings(&p).unwrap();
+        assert_eq!(s3.eos_threshold, EosThresholdSetting::Fixed(0.5));
+        assert_eq!(s3.eos_tail_short, EosTail::Fixed(10));
+        assert_eq!(s3.eos_tail_long, EosTail::Fixed(1));
+    }
+
+    /// clamped() не разрушает состояния: «Авто» и None остаются собой,
+    /// Fixed зажимается в допустимый диапазон.
+    #[test]
+    fn eos_clamped_preserves_auto_and_none() {
+        let mut s = GuiSettings {
+            eos_threshold: EosThresholdSetting::Auto,
+            eos_tail_short: EosTail::Default,
+            eos_tail_long: EosTail::Fixed(99),
+            ..Default::default()
+        };
+        s.clamped();
+        assert_eq!(s.eos_threshold, EosThresholdSetting::Auto);
+        assert_eq!(s.eos_tail_short, EosTail::Default);
+        assert_eq!(s.eos_tail_long, EosTail::Fixed(10), "99 → 10");
+        let mut s = GuiSettings {
+            eos_threshold: EosThresholdSetting::Fixed(55.0),
+            eos_tail_long: EosTail::Fixed(0),
+            ..s
+        };
+        s.clamped();
+        assert_eq!(s.eos_threshold, EosThresholdSetting::Fixed(20.0));
+        assert_eq!(s.eos_tail_long, EosTail::Fixed(0), "0 — легальное значение");
     }
 }

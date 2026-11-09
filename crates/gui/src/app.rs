@@ -23,6 +23,24 @@ pub(crate) fn header_clicked<R>(resp: &egui::CollapsingResponse<R>, open: &mut b
     }
 }
 
+/// Подпись значения хвоста EOS в ComboBox: None — штатная политика движка.
+fn eos_tail_label(t: shtorm_engine::EosTail) -> String {
+    match t {
+        shtorm_engine::EosTail::Default => "None".into(),
+        shtorm_engine::EosTail::Fixed(n) => n.to_string(),
+    }
+}
+
+/// Точная семантика хвоста EOS — по фактической проверке счётчика движка
+/// (тест eos_gate_counts_frames_including_detection_frame): кадр
+/// срабатывания EOS входит в счёт.
+const EOS_TAIL_TOOLTIP: &str = "N передаётся движку напрямую, без пересчёта. \
+    Фактическая семантика счётчика teratts-android (проверена тестом): \
+    при N генерируется N кадров с момента срабатывания EOS ВКЛЮЧИТЕЛЬНО — \
+    то есть N−1 кадр после кадра срабатывания; при N=0 не генерируется \
+    ни одного (кадр срабатывания отбрасывается). None — штатная политика \
+    движка: 5 для чанков ≤4 слов и 3 для остальных.";
+
 pub struct ShtormApp {
     pub settings: GuiSettings,
     log: String,
@@ -637,14 +655,110 @@ impl eframe::App for ShtormApp {
                         ui.label("Шаги декодирования:");
                         ui.add(egui::Slider::new(&mut s.decode_steps, 1..=8));
                     });
-                    ui.horizontal(|ui| {
-                        ui.label("Порог EOS:");
-                        ui.add(
-                            egui::DragValue::new(&mut s.eos_threshold)
-                                .range(-20.0..=20.0)
-                                .speed(0.1),
-                        );
-                        ui.weak("(Auto из runtime.json — не поддержано, задано вручную)");
+                    // G4.1: компактная группа EOS — порог и оба хвоста.
+                    // Значения teratts-android: порог −4, хвосты 5/3 — без
+                    // Python-пересчёта 6/4.
+                    ui.group(|ui| {
+                        ui.vertical(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("EOS:").on_hover_text(
+                                    "Параметры конца речи (EOS) движка teratts-android. \
+                                     Дефолты −4/5/3 воспроизводят оригинальную Android-версию.",
+                                );
+                                if ui
+                                    .button("Значения teratts-android")
+                                    .on_hover_text(
+                                        "Установить порог −4 и хвосты 5/3 — встроенные значения \
+                                         оригинального teratts-android (без пересчёта).",
+                                    )
+                                    .clicked()
+                                {
+                                    s.eos_threshold =
+                                        crate::settings::EosThresholdSetting::Fixed(-4.0);
+                                    s.eos_tail_short = shtorm_engine::EosTail::Fixed(5);
+                                    s.eos_tail_long = shtorm_engine::EosTail::Fixed(3);
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Порог:");
+                                let selected = match s.eos_threshold {
+                                    crate::settings::EosThresholdSetting::Auto => {
+                                        "Авто".to_string()
+                                    }
+                                    crate::settings::EosThresholdSetting::Fixed(v) => {
+                                        format!("{v}")
+                                    }
+                                };
+                                egui::ComboBox::from_id_salt("eos_threshold")
+                                    .selected_text(selected)
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut s.eos_threshold,
+                                            crate::settings::EosThresholdSetting::Auto,
+                                            "Авто",
+                                        );
+                                        for v in crate::settings::EOS_THRESHOLD_CHOICES {
+                                            ui.selectable_value(
+                                                &mut s.eos_threshold,
+                                                crate::settings::EosThresholdSetting::Fixed(*v),
+                                                format!("{v}"),
+                                            );
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text(
+                                        "Логит EOS выше порога — конец речи. «Авто» = встроенное \
+                                         фиксированное −4.0 движка teratts-android (не читается \
+                                         из runtime.json). Значение передаётся движку как есть.",
+                                    );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Кадров хвоста EOS:");
+                                ui.label("≤4 слов:").on_hover_text(
+                                    "Хвост для коротких чанков (1–4 слова по подготовленному \
+                                     тексту до добавления служебных пробелов).",
+                                );
+                                egui::ComboBox::from_id_salt("eos_tail_short")
+                                    .selected_text(eos_tail_label(s.eos_tail_short))
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut s.eos_tail_short,
+                                            shtorm_engine::EosTail::Default,
+                                            "None",
+                                        );
+                                        for n in crate::settings::EOS_TAIL_CHOICES {
+                                            ui.selectable_value(
+                                                &mut s.eos_tail_short,
+                                                shtorm_engine::EosTail::Fixed(*n),
+                                                n.to_string(),
+                                            );
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text(EOS_TAIL_TOOLTIP);
+                                ui.label("≥5 слов:").on_hover_text(
+                                    "Хвост для длинных чанков (5 и более слов текущего чанка).",
+                                );
+                                egui::ComboBox::from_id_salt("eos_tail_long")
+                                    .selected_text(eos_tail_label(s.eos_tail_long))
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut s.eos_tail_long,
+                                            shtorm_engine::EosTail::Default,
+                                            "None",
+                                        );
+                                        for n in crate::settings::EOS_TAIL_CHOICES {
+                                            ui.selectable_value(
+                                                &mut s.eos_tail_long,
+                                                shtorm_engine::EosTail::Fixed(*n),
+                                                n.to_string(),
+                                            );
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text(EOS_TAIL_TOOLTIP);
+                            });
+                        });
                     });
                     ui.horizontal(|ui| {
                         ui.label("Seed:");

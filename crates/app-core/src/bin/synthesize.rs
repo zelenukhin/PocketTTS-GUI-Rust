@@ -15,7 +15,7 @@ use app_core::pipeline::{
     PipelineOptions, RunStatus, StreamError, StreamOutcome,
 };
 use app_core::sink::{make_sink, OutputFormat};
-use shtorm_engine::Device;
+use shtorm_engine::{Device, EosTail};
 use text_processing::CharRules;
 
 #[derive(Parser, Debug)]
@@ -51,6 +51,14 @@ struct Args {
     decode_steps: u32,
     #[arg(long, default_value_t = -4.0, allow_negative_numbers = true)]
     eos_threshold: f32,
+    /// Хвост EOS для чанков ≤4 слов: число 0..=10 или none (штатная политика
+    /// движка 5/3). Значение передаётся движку напрямую, без пересчёта.
+    /// Дефолт 5 — как teratts-android и GUI.
+    #[arg(long, value_parser = parse_eos_tail, default_value = "5")]
+    eos_tail_short: EosTail,
+    /// Хвост EOS для чанков ≥5 слов: число 0..=10 или none. Дефолт 3.
+    #[arg(long, value_parser = parse_eos_tail, default_value = "3")]
+    eos_tail_long: EosTail,
     #[arg(long, default_value_t = 42, allow_negative_numbers = true)]
     seed: i64,
     #[arg(long, default_value_t = 8.0)]
@@ -72,6 +80,24 @@ struct Args {
     /// Параллельные воркеры (каждый со своим экземпляром движка)
     #[arg(long, default_value_t = 1)]
     workers: usize,
+}
+
+/// Разбор значения хвоста EOS: `none` — отдельное состояние (штатная
+/// политика движка), число 0..=10 — Fixed. none ≠ 0.
+fn parse_eos_tail(s: &str) -> Result<EosTail, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "none" => Ok(EosTail::Default),
+        other => {
+            let n = other
+                .parse::<u32>()
+                .map_err(|_| format!("--eos-tail: 'none' или число 0..=10, получено '{other}'"))?;
+            if n > 10 {
+                Err(format!("--eos-tail: максимум 10, получено {n}"))
+            } else {
+                Ok(EosTail::Fixed(n))
+            }
+        }
+    }
 }
 
 fn parse_format(s: &str) -> Result<OutputFormat> {
@@ -161,6 +187,8 @@ fn run() -> Result<ExitCode> {
         temperature: args.temperature,
         decode_steps: args.decode_steps as usize,
         eos_threshold: args.eos_threshold,
+        eos_tail_short: args.eos_tail_short,
+        eos_tail_long: args.eos_tail_long,
         brightness_db: args.brightness_db,
         denoise: args.denoise,
         pause_scale: args.pause_scale,
@@ -320,4 +348,71 @@ fn print_outcome(out: &Path, o: &StreamOutcome, elapsed: f32) {
         o.max_buffered_bytes / 1024
     );
     println!("денойз: {}", o.denoise_report.summary());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn base_args() -> Vec<String> {
+        std::iter::once("synthesize".to_string())
+            .chain(
+                [
+                    "--model-dir",
+                    "m",
+                    "--voice",
+                    "v.wav",
+                    "--text-file",
+                    "t.txt",
+                    "--out",
+                    "o.wav",
+                ]
+                .into_iter()
+                .map(String::from),
+            )
+            .collect()
+    }
+
+    /// G4.1: дефолты CLI идентичны GUI — порог −4.0, хвосты Fixed(5)/Fixed(3)
+    /// (значения teratts-android, без Python-пересчёта 6/4).
+    #[test]
+    fn eos_defaults_match_gui() {
+        let a = Args::try_parse_from(base_args()).unwrap();
+        assert_eq!(a.eos_threshold, -4.0);
+        assert_eq!(a.eos_tail_short, EosTail::Fixed(5));
+        assert_eq!(a.eos_tail_long, EosTail::Fixed(3));
+    }
+
+    /// none — отдельное строковое представление, не числовой ноль;
+    /// числа 0..=10 передаются напрямую.
+    #[test]
+    fn eos_tail_parse_none_is_not_zero() {
+        let mut args = base_args();
+        args.extend([
+            "--eos-tail-short".into(),
+            "none".into(),
+            "--eos-tail-long".into(),
+            "0".into(),
+        ]);
+        let a = Args::try_parse_from(args).unwrap();
+        assert_eq!(a.eos_tail_short, EosTail::Default);
+        assert_eq!(a.eos_tail_long, EosTail::Fixed(0));
+        assert_ne!(a.eos_tail_short, a.eos_tail_long);
+
+        let mut args = base_args();
+        args.extend(["--eos-tail-short".into(), "10".into()]);
+        assert_eq!(
+            Args::try_parse_from(args).unwrap().eos_tail_short,
+            EosTail::Fixed(10)
+        );
+
+        // за пределами диапазона и мусор — ошибка разбора
+        let mut args = base_args();
+        args.extend(["--eos-tail-short".into(), "11".into()]);
+        assert!(Args::try_parse_from(args).is_err());
+        let mut args = base_args();
+        args.extend(["--eos-tail-long".into(), "auto".into()]);
+        assert!(Args::try_parse_from(args).is_err());
+    }
 }

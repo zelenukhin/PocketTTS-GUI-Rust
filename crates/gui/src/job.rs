@@ -209,7 +209,11 @@ pub fn pipeline_options(
         },
         temperature: s.temperature,
         decode_steps: s.decode_steps as usize,
-        eos_threshold: s.eos_threshold,
+        // «Авто» разрешается здесь во встроенное −4.0 (teratts-android);
+        // число передаётся как есть
+        eos_threshold: s.eos_threshold.value(),
+        eos_tail_short: s.eos_tail_short,
+        eos_tail_long: s.eos_tail_long,
         brightness_db: s.brightness_db,
         denoise: s.denoise,
         pause_scale: s.pause_scale,
@@ -802,7 +806,9 @@ mod tests {
             seed: 123456,
             temperature: 0.55,
             decode_steps: 2,
-            eos_threshold: -3.5,
+            eos_threshold: crate::settings::EosThresholdSetting::Fixed(-3.5),
+            eos_tail_short: shtorm_engine::EosTail::Fixed(7),
+            eos_tail_long: shtorm_engine::EosTail::Fixed(0),
             brightness_db: 6.0,
             denoise: true,
             pause_scale: 0.75,
@@ -822,6 +828,8 @@ mod tests {
         assert_eq!(o.temperature, 0.55);
         assert_eq!(o.decode_steps, 2);
         assert_eq!(o.eos_threshold, -3.5);
+        assert_eq!(o.eos_tail_short, shtorm_engine::EosTail::Fixed(7));
+        assert_eq!(o.eos_tail_long, shtorm_engine::EosTail::Fixed(0));
         assert_eq!(o.brightness_db, 6.0);
         assert!(o.denoise);
         assert_eq!(o.pause_scale, 0.75);
@@ -836,6 +844,58 @@ mod tests {
         // seed -1 -> случайный
         let s = GuiSettings { seed: -1, ..s };
         assert_eq!(pipeline_options(&s, dir, None).seed, None);
+    }
+
+    /// G4.1: сквозная цепочка GUI → PipelineOptions → Pocket. Дефолтные
+    /// настройки («Авто», 5/3) разрешаются в точные значения teratts-android
+    /// −4.0/5/3 — те же числа, что и дефолты CLI (паритет значений).
+    #[test]
+    fn eos_defaults_flow_gui_to_pipeline() {
+        let s = GuiSettings::default();
+        let o = pipeline_options(&s, PathBuf::from(r"C:\m"), None);
+        assert_eq!(
+            o.eos_threshold, -4.0,
+            "«Авто» == −4.0 (встроенное значение)"
+        );
+        assert_eq!(o.eos_tail_short, shtorm_engine::EosTail::Fixed(5));
+        assert_eq!(o.eos_tail_long, shtorm_engine::EosTail::Fixed(3));
+        // движок получает то же самое: снимок параметров воркера (worker.rs,
+        // mirror-тест engine_params) снимается ровно с этих PipelineOptions.
+        let params = app_core::worker::engine_params(&o);
+        assert_eq!(params.eos_threshold, -4.0);
+        assert_eq!(params.eos_tail_short, shtorm_engine::EosTail::Fixed(5));
+        assert_eq!(params.eos_tail_long, shtorm_engine::EosTail::Fixed(3));
+    }
+
+    /// G4.1: EOS-параметры НИКОГДА не читаются из runtime.json модели —
+    /// оттуда берутся только char_rules. EOS-ключи в файле игнорируются
+    /// молча и не влияют на PipelineOptions.
+    #[test]
+    fn eos_never_read_from_runtime_json() {
+        let d = tmpdir("eos_runtime");
+        let model = fake_model(&d, "ru-v2-slow");
+        // runtime.json с «соблазнительными» EOS-ключами и валидными char_rules
+        std::fs::write(
+            model.join("runtime.json"),
+            r#"{"eos_threshold": 9.9, "eos_tail": 77, "frames_after_eos": 6,
+                "char_rules": {"char_map": {"ё": "е"}}}"#,
+        )
+        .unwrap();
+        let s = GuiSettings {
+            eos_threshold: crate::settings::EosThresholdSetting::Fixed(0.5),
+            eos_tail_short: shtorm_engine::EosTail::Fixed(2),
+            eos_tail_long: shtorm_engine::EosTail::Default,
+            ..Default::default()
+        };
+        let rules = match load_char_rules(&model) {
+            CharRulesLoad::Loaded(r) => r,
+            other => panic!("char_rules должны загрузиться: {other:?}"),
+        };
+        assert_eq!(rules.char_map.len(), 1, "char_rules читаются как раньше");
+        let o = pipeline_options(&s, model, Some(rules));
+        assert_eq!(o.eos_threshold, 0.5, "порог — из GUI, не из runtime.json");
+        assert_eq!(o.eos_tail_short, shtorm_engine::EosTail::Fixed(2));
+        assert_eq!(o.eos_tail_long, shtorm_engine::EosTail::Default);
     }
 
     /// Fast/Slow резолвятся от onnx_base, Custom — по своему пути; отсутствие
@@ -1143,7 +1203,9 @@ mod tests {
             seed: 42,
             temperature: 0.3,
             decode_steps: 1,
-            eos_threshold: -4.0,
+            eos_threshold: crate::settings::EosThresholdSetting::Fixed(-4.0),
+            eos_tail_short: shtorm_engine::EosTail::Fixed(5),
+            eos_tail_long: shtorm_engine::EosTail::Fixed(3),
             brightness_db: 8.0,
             denoise: false,
             anti_repeat: true,
@@ -1367,6 +1429,10 @@ mod tests {
                     "1",
                     "--eos-threshold",
                     "-4.0",
+                    "--eos-tail-short",
+                    "5",
+                    "--eos-tail-long",
+                    "3",
                     "--seed",
                     "42",
                     "--brightness-db",
@@ -1396,5 +1462,126 @@ mod tests {
                 out.display()
             );
         }
+    }
+
+    /// G4.1: побитовый WAV-паритет GUI == CLI для НЕстандартных EOS-настроек
+    /// (порог −1 и хвосты 0/0; затем None/None). Дефолтный −4/5/3 паритет
+    /// проверяет real_matrix_device. Реальные модели + ORT (CPU).
+    /// cargo test -p shtorm-gui --release --lib real_eos_parity -- --ignored --nocapture
+    #[test]
+    #[ignore = "реальный синтез: модели + ORT DLL; CPU"]
+    fn real_eos_parity() {
+        let run_pair = |tag: &str, mutate: &dyn Fn(&mut GuiSettings), cli_eos: &[&str]| {
+            let d = tmpdir(tag);
+            let mut s = real_settings(OutputFormatChoice::Wav, &d);
+            s.workers = Some(2);
+            mutate(&mut s);
+            s.clamped();
+            let out = derive_out_path(&s);
+            let res = execute_job(
+                &JobConfig {
+                    settings: s.clone(),
+                    text: REAL_TEXT.into(),
+                    out_path: out.clone(),
+                },
+                &Arc::new(AtomicBool::new(false)),
+                &|_| {},
+            );
+            assert_eq!(res.status, JobStatus::Completed, "{}", res.summary);
+
+            let cli = crate::job::find_project_root()
+                .and_then(|r| {
+                    let p = r.join("target").join("release").join("synthesize.exe");
+                    p.is_file().then_some(p)
+                })
+                .expect("target/release/synthesize.exe");
+            let cli_out = d.join(format!("cli_{tag}.wav"));
+            let text_file = d.join("text.txt");
+            std::fs::write(&text_file, REAL_TEXT).unwrap();
+            let (dll, _) = resolve_ort_dylib(&s).expect("dll");
+            let model = resolve_model_dir(&s).unwrap().display().to_string();
+            let st = std::process::Command::new(&cli)
+                .args([
+                    "--model-dir",
+                    &model,
+                    "--voice",
+                    &s.voice_wav,
+                    "--text-file",
+                    &text_file.display().to_string(),
+                    "--out",
+                    &cli_out.display().to_string(),
+                    "--format",
+                    "wav",
+                    "--device",
+                    "cpu",
+                    "--threads",
+                    "4",
+                    "--workers",
+                    "2",
+                    "--temperature",
+                    "0.3",
+                    "--decode-steps",
+                    "1",
+                    "--seed",
+                    "42",
+                    "--brightness-db",
+                    "8.0",
+                    "--pause-scale",
+                    "1.0",
+                    "--paragraph-pause-s",
+                    "0.9",
+                    "--max-tokens",
+                    "40",
+                ])
+                .args(cli_eos)
+                .env("ORT_DYLIB_PATH", &dll)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("запуск CLI");
+            assert!(st.success(), "CLI завершился ошибкой: {st:?}");
+            let gui = std::fs::read(&out).unwrap();
+            let cli_b = std::fs::read(&cli_out).unwrap();
+            assert_eq!(
+                gui, cli_b,
+                "{tag}: GUI и CLI с одинаковыми EOS-настройками обязаны совпадать побитово"
+            );
+            eprintln!("EOS PARITY [{tag}]: {} байт, GUI == CLI", gui.len());
+        };
+
+        // 0/0 с порогом −1
+        run_pair(
+            "g41_min_tail",
+            &|s| {
+                s.eos_threshold = crate::settings::EosThresholdSetting::Fixed(-1.0);
+                s.eos_tail_short = shtorm_engine::EosTail::Fixed(0);
+                s.eos_tail_long = shtorm_engine::EosTail::Fixed(0);
+            },
+            &[
+                "--eos-threshold",
+                "-1.0",
+                "--eos-tail-short",
+                "0",
+                "--eos-tail-long",
+                "0",
+            ],
+        );
+        // None/None (штатный fallback движка 5/3)
+        run_pair(
+            "g41_none_tail",
+            &|s| {
+                s.eos_threshold = crate::settings::EosThresholdSetting::Auto;
+                s.eos_tail_short = shtorm_engine::EosTail::Default;
+                s.eos_tail_long = shtorm_engine::EosTail::Default;
+            },
+            &[
+                "--eos-threshold",
+                "-4.0",
+                "--eos-tail-short",
+                "none",
+                "--eos-tail-long",
+                "none",
+            ],
+        );
     }
 }

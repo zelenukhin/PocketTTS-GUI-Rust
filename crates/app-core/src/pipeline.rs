@@ -11,7 +11,7 @@
 use anyhow::Result;
 use std::path::PathBuf;
 
-use shtorm_engine::{Device, POCKET_RATE};
+use shtorm_engine::{Device, EosTail, POCKET_RATE};
 use text_processing::{apply_char_rules, CharRules};
 
 /// Полные параметры прогона (зеркалируют SynthSettings + пути).
@@ -26,6 +26,11 @@ pub struct PipelineOptions {
     pub temperature: f32,
     pub decode_steps: usize,
     pub eos_threshold: f32,
+    /// Хвост EOS для чанков ≤4 слов (G4.1; передаётся движку напрямую,
+    /// без пересчёта — семантика eos_extra teratts-android).
+    pub eos_tail_short: EosTail,
+    /// Хвост EOS для чанков ≥5 слов (G4.1).
+    pub eos_tail_long: EosTail,
     /// дБ high-shelf > 3 кГц; <= 0.05 — выключен.
     pub brightness_db: f32,
     /// Включить DPDFNet; если файла модели нет — прогон без очистки
@@ -815,6 +820,8 @@ mod stream_error_tests {
             temperature: 0.3,
             decode_steps: 1,
             eos_threshold: -4.0,
+            eos_tail_short: EosTail::Fixed(5),
+            eos_tail_long: EosTail::Fixed(3),
             brightness_db: 0.0,
             denoise: false,
             pause_scale: 1.0,

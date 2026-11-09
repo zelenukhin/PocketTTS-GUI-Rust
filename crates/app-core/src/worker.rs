@@ -6,7 +6,7 @@ use anyhow::Result;
 use std::path::PathBuf;
 
 use shtorm_engine::dsp::{fade_out, trim_edges};
-use shtorm_engine::{high_shelf, resample, Device, LoadOptions, Pocket, POCKET_RATE};
+use shtorm_engine::{high_shelf, resample, Device, EosTail, LoadOptions, Pocket, POCKET_RATE};
 
 use crate::pipeline::{resolve_denoise, PipelineOptions};
 use crate::pool::{ChunkAudio, ChunkWorker, DenoiseChunkStatus, Task};
@@ -21,6 +21,33 @@ pub struct RealWorker {
     denoise_missing: bool,
 }
 
+/// Параметры генерации, снимаемые с `PipelineOptions` на КАЖДЫЙ экземпляр
+/// Pocket (G4.1): воркеры одного задания получают идентичные значения.
+/// Выделено в структуру для регрессионного теста без ONNX — сам Pocket
+/// загрузить без моделей нельзя, а соответствие opts → движок проверяемо.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EngineParams {
+    pub temperature: f32,
+    pub decode_steps: usize,
+    pub eos_threshold: f32,
+    pub eos_tail_short: EosTail,
+    pub eos_tail_long: EosTail,
+    pub anti_repeat: bool,
+}
+
+/// Снять параметры движка с параметров задания (одинаково для всех воркеров,
+/// независимо от их номера и количества).
+pub fn engine_params(opts: &PipelineOptions) -> EngineParams {
+    EngineParams {
+        temperature: opts.temperature,
+        decode_steps: opts.decode_steps,
+        eos_threshold: opts.eos_threshold,
+        eos_tail_short: opts.eos_tail_short,
+        eos_tail_long: opts.eos_tail_long,
+        anti_repeat: opts.anti_repeat,
+    }
+}
+
 /// Фабрика воркеров из параметров задания: каждый вызов загружает СВОЙ
 /// экземпляр Pocket (seed = base_seed — общий для задания), выставляет
 /// параметры и настройку денойза (файл модели проверен заранее).
@@ -30,14 +57,11 @@ pub fn real_worker_factory(
 ) -> impl Fn(usize, u64) -> Result<RealWorker> + Send + Sync + use<> {
     let model_dir: PathBuf = opts.model_dir.clone();
     let voice = opts.voice.to_string_lossy().to_string();
-    let temperature = opts.temperature;
-    let decode_steps = opts.decode_steps;
-    let eos_threshold = opts.eos_threshold;
+    let params = engine_params(opts);
     let threads = opts.threads;
     let brightness_db = opts.brightness_db;
     let device: Device = opts.device.clone();
     let denoise_requested = opts.denoise;
-    let anti_repeat = opts.anti_repeat;
     move |_worker_id: usize, _seed: u64| {
         let mut engine = Pocket::load(
             &model_dir,
@@ -48,10 +72,12 @@ pub fn real_worker_factory(
                 profile_dir: None,
             },
         )?;
-        engine.temperature = temperature;
-        engine.decode_steps = decode_steps;
-        engine.eos_threshold = eos_threshold;
-        engine.anti_repeat = anti_repeat;
+        engine.temperature = params.temperature;
+        engine.decode_steps = params.decode_steps;
+        engine.eos_threshold = params.eos_threshold;
+        engine.eos_tail_short = params.eos_tail_short;
+        engine.eos_tail_long = params.eos_tail_long;
+        engine.anti_repeat = params.anti_repeat;
         let denoise_model = model_dir.join(denoise_mod::MODEL_FILE);
         let model_present = denoise_model.exists();
         engine.denoise_on = resolve_denoise(denoise_requested, model_present);
@@ -101,5 +127,68 @@ impl ChunkWorker for RealWorker {
             pause_s: task.pause_s,
             denoise,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::PipelineOptions;
+    use shtorm_engine::Device;
+
+    fn opts() -> PipelineOptions {
+        PipelineOptions {
+            model_dir: PathBuf::from(r"C:\m"),
+            voice: PathBuf::from(r"C:\v.wav"),
+            device: Device::Cpu,
+            threads: 4,
+            seed: Some(42),
+            temperature: 0.3,
+            decode_steps: 1,
+            eos_threshold: -4.0,
+            eos_tail_short: EosTail::Fixed(5),
+            eos_tail_long: EosTail::Fixed(3),
+            brightness_db: 8.0,
+            denoise: false,
+            pause_scale: 1.0,
+            paragraph_pause_s: 0.9,
+            max_tokens: 50,
+            char_rules: None,
+            anti_repeat: true,
+        }
+    }
+
+    /// G4.1: PipelineOptions → параметры движка переносятся без потерь,
+    /// включая обе ветки хвоста EOS и порог. Чистая функция — ONNX не нужен.
+    #[test]
+    fn engine_params_mirror_options() {
+        let o = opts();
+        let p = engine_params(&o);
+        assert_eq!(p.temperature, 0.3);
+        assert_eq!(p.decode_steps, 1);
+        assert_eq!(p.eos_threshold, -4.0);
+        assert_eq!(p.eos_tail_short, EosTail::Fixed(5));
+        assert_eq!(p.eos_tail_long, EosTail::Fixed(3));
+        assert!(p.anti_repeat);
+    }
+
+    /// G4.1: все экземпляры Pocket задания (1 воркер или 10) получают
+    /// ОДИНАКОВЫЕ параметры — engine_params не зависит от номера воркера,
+    /// а фабрика закрывает над одним и тем же снимком opts.
+    #[test]
+    fn engine_params_identical_for_every_worker() {
+        let o = opts();
+        let first = engine_params(&o);
+        for _ in 0..10 {
+            assert_eq!(engine_params(&o), first);
+        }
+        // Default-политики тоже проходят без искажения (None ≠ Fixed(0))
+        let mut o = opts();
+        o.eos_tail_short = EosTail::Default;
+        o.eos_tail_long = EosTail::Fixed(0);
+        let p = engine_params(&o);
+        assert_eq!(p.eos_tail_short, EosTail::Default);
+        assert_eq!(p.eos_tail_long, EosTail::Fixed(0));
+        assert_ne!(p.eos_tail_short, p.eos_tail_long);
     }
 }
