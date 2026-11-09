@@ -337,14 +337,14 @@ fn same_path(a: &Path, b: &Path) -> bool {
 // автоматическое следование по такой точке.
 
 #[cfg(windows)]
-fn is_reparse_metadata(md: &std::fs::Metadata) -> bool {
+pub(crate) fn is_reparse_metadata(md: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
     md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 #[cfg(not(windows))]
-fn is_reparse_metadata(md: &std::fs::Metadata) -> bool {
+pub(crate) fn is_reparse_metadata(md: &std::fs::Metadata) -> bool {
     md.file_type().is_symlink()
 }
 

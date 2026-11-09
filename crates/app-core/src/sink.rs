@@ -23,11 +23,31 @@ use audio_processing::stream::{
 /// Потоковый приёмник готовых чанков (строго по порядку).
 pub trait AudioSink {
     fn write_chunk(&mut self, index: usize, pcm: &[f32], pause_s: Option<f32>) -> Result<()>;
-    /// Завершить: дописать контейнер, опубликовать итоговый файл
-    /// (потребляет синк — дальнейшие записи невозможны).
-    fn finalize(self: Box<Self>) -> Result<PathBuf>;
+    /// Завершить кодирование/запись БЕЗ публикации итога (ffmpeg дожат и
+    /// проверен, WAV-контейнер закрыт). После успеха этого шага конвейер
+    /// принимает решение о публикации; сама публикация — отдельный
+    /// необратимый шаг `FinalizedSink::publish`.
+    fn finish(self: Box<Self>) -> Result<Box<dyn FinalizedSink>>;
     /// Черновик (для сообщений при отмене/ошибке).
     fn partial_path(&self) -> PathBuf;
+}
+
+/// Дожатый, но ещё не опубликованный результат. Публикация необратима
+/// (при `overwrite` — атомарная замена готового файла), поэтому выполняется
+/// только после однозначного решения конвейера не отменять задание.
+pub trait FinalizedSink {
+    /// Опубликовать итоговый файл; возвращает его путь.
+    fn publish(self: Box<Self>) -> Result<PathBuf>;
+    /// Черновик (не меняется после finish).
+    fn partial_path(&self) -> PathBuf;
+}
+
+impl dyn AudioSink {
+    /// Совмещённые `finish` + `publish` (прежний `finalize`): тесты и
+    /// внешние вызовы, которым не нужен контроль точки публикации.
+    pub fn finalize(self: Box<Self>) -> Result<PathBuf> {
+        self.finish()?.publish()
+    }
 }
 
 /// Формат вывода.
@@ -74,11 +94,20 @@ impl AudioSink for WavSink {
     fn write_chunk(&mut self, _index: usize, pcm: &[f32], pause_s: Option<f32>) -> Result<()> {
         self.inner.write_chunk(pcm, pause_s)
     }
-    fn finalize(self: Box<Self>) -> Result<PathBuf> {
-        self.inner.finalize()
+    fn finish(self: Box<Self>) -> Result<Box<dyn FinalizedSink>> {
+        Ok(Box::new(self.inner.finish()?))
     }
     fn partial_path(&self) -> PathBuf {
         self.inner.partial_path().to_path_buf()
+    }
+}
+
+impl FinalizedSink for audio_processing::stream::FinalizedWav {
+    fn publish(self: Box<Self>) -> Result<PathBuf> {
+        audio_processing::stream::FinalizedWav::publish(*self)
+    }
+    fn partial_path(&self) -> PathBuf {
+        audio_processing::stream::FinalizedWav::partial_path(self).to_path_buf()
     }
 }
 
@@ -550,7 +579,7 @@ impl AudioSink for FfmpegSink {
         Ok(())
     }
 
-    fn finalize(mut self: Box<Self>) -> Result<PathBuf> {
+    fn finish(mut self: Box<Self>) -> Result<Box<dyn FinalizedSink>> {
         // корректно закрыть stdin (через писателя) и дождаться энкодера.
         // Порядок как в abort: сначала дожать процесс (kill при висе
         // закрывает пайпы и разблокирует писателя), потом join писателя.
@@ -597,16 +626,38 @@ impl AudioSink for FfmpegSink {
                 self.partial.display()
             );
         }
-        // публикация только после успешного кодирования. По умолчанию —
-        // MoveFileW без замены (занятое имя → отказ, черновик остаётся).
-        // G5 overwrite: атомарная замена MoveFileExW; старый файл не удалён
-        // заранее и остаётся при любой ошибке замены.
+        // кодирование успешно: до собственно публикации итог не тронут
+        Ok(Box::new(FinalizedFfmpeg {
+            partial: self.partial.clone(),
+            final_path: self.final_path.clone(),
+            overwrite: self.overwrite,
+        }))
+    }
+
+    fn partial_path(&self) -> PathBuf {
+        self.partial.clone()
+    }
+}
+
+/// G5.1: успешно закодированный ffmpeg-результат, готовый к публикации.
+struct FinalizedFfmpeg {
+    partial: PathBuf,
+    final_path: PathBuf,
+    overwrite: bool,
+}
+
+impl FinalizedSink for FinalizedFfmpeg {
+    /// Публикация только после успешного кодирования. По умолчанию —
+    /// MoveFileW без замены (занятое имя → отказ, черновик остаётся).
+    /// G5 overwrite: атомарная замена MoveFileExW; старый файл не удалён
+    /// заранее и остаётся при любой ошибке замены.
+    fn publish(self: Box<Self>) -> Result<PathBuf> {
         if self.overwrite {
             publish_replace(&self.partial, &self.final_path)?;
         } else {
             publish_no_replace(&self.partial, &self.final_path)?;
         }
-        Ok(self.final_path.clone())
+        Ok(self.final_path)
     }
 
     fn partial_path(&self) -> PathBuf {
@@ -843,7 +894,8 @@ mod tests {
         sink.write_chunk(0, &big, None)
             .expect("одна отправка проходит");
         let t0 = std::time::Instant::now();
-        let err = Box::new(sink).finalize().unwrap_err();
+        let boxed: Box<dyn AudioSink> = Box::new(sink);
+        let err = boxed.finalize().unwrap_err();
         assert!(
             t0.elapsed() < std::time::Duration::from_secs(10),
             "finalize с таймаутом не виснет ({:?})",

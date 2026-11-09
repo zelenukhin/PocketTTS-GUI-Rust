@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crate::job::{JobEvent, JobStatus};
+use crate::job::{JobEvent, JobPhase, JobStatus};
 use crate::settings::{
     load_settings, save_settings, settings_path, DeviceChoice, GuiSettings, ModelChoice,
     OutputFormatChoice,
@@ -55,6 +55,9 @@ pub struct ShtormApp {
     file_progress: (usize, usize),
     /// Текущее задание — пакетное (для отображения прогресса по файлам).
     batch_running: bool,
+    /// G5.1: задание перешло фазу Finalizing/Publishing — публикация уже
+    /// необратима, «Стоп» отключается (он не может предотвратить замену).
+    publishing: bool,
     /// Пользователь закрыл окно при живом задании: отменяем и закрываем сами,
     /// когда поток завершится (без сиротских ffmpeg).
     close_pending: bool,
@@ -114,6 +117,7 @@ impl ShtormApp {
             progress: (0, 0),
             file_progress: (0, 0),
             batch_running: false,
+            publishing: false,
             close_pending: false,
             ffmpeg_check_key: None,
             ffmpeg_check_err: None,
@@ -189,6 +193,7 @@ impl ShtormApp {
         self.progress = (0, 0);
         self.file_progress = (0, 0);
         self.batch_running = batch;
+        self.publishing = false;
         self.status = "задание запущено…".into();
     }
 
@@ -199,6 +204,25 @@ impl ShtormApp {
             JobEvent::Progress { done, total } => {
                 self.progress = (done, total);
                 self.status = format!("синтез: {done}/{total} чанков");
+            }
+            JobEvent::Phase(ph) => {
+                // G5.1: после точки решения о публикации «Стоп» больше не
+                // может предотвратить замену файла — отключаем кнопку и
+                // честно показываем сохранение результата.
+                match ph {
+                    JobPhase::Generating => {
+                        self.publishing = false;
+                        self.status = "генерация…".into();
+                    }
+                    JobPhase::Finalizing => {
+                        self.publishing = true;
+                        self.status = "Сохранение результата: завершение кодирования…".into();
+                    }
+                    JobPhase::Publishing => {
+                        self.publishing = true;
+                        self.status = "Сохранение результата: публикация…".into();
+                    }
+                }
             }
             JobEvent::FileProgress {
                 index,
@@ -217,6 +241,9 @@ impl ShtormApp {
             } => {
                 // K/N обновляется на КАЖДОМ завершённом файле, включая
                 // Failed/Skipped, — иначе прогресс пакета «замирает».
+                // Публикация этого файла закончилась: между файлами пакета
+                // «Стоп» снова доступен (отменит ДО старта следующего).
+                self.publishing = false;
                 self.file_progress = (index, total);
                 self.progress = (report.chunks_done, report.chunks_total);
                 self.status = format!("файл {index}/{total}: {}", report.status.label());
@@ -225,6 +252,7 @@ impl ShtormApp {
             JobEvent::Log(line) => self.push_log(&line),
             JobEvent::Finished(res) => {
                 let warn = matches!(res.status, JobStatus::Partial | JobStatus::NoWork);
+                self.publishing = false;
                 self.status = format!(
                     "{}{} — {}",
                     if warn { "⚠ " } else { "" },
@@ -326,10 +354,16 @@ impl ShtormApp {
         } else if !voice_path.is_file() {
             errs.push(format!("WAV-голос не найден: {}", voice_path.display()));
         }
-        // модель — единым резолвером запуска (fast/slow через onnx_base)
-        if let Err(e) = crate::job::resolve_model_dir(s) {
-            errs.push(e.to_string());
-        }
+        // модель — единым резолвером запуска (fast/slow через onnx_base);
+        // ошибки резолва не глотаются: без модели проверка пути результата
+        // по каталогу модели бессмысленна, а задание всё равно не стартует
+        let model_dir = match crate::job::resolve_model_dir(s) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                errs.push(e.to_string());
+                None
+            }
+        };
         if s.out_dir.trim().is_empty() {
             errs.push("не указана папка результата".into());
         }
@@ -339,9 +373,11 @@ impl ShtormApp {
         // Пути вывода проверяются на reparse point и защищённые файлы здесь,
         // чтобы пользователь увидел проблему до запуска.
         if !s.batch && !s.out_dir.trim().is_empty() {
-            let out = crate::job::derive_out_path(s);
-            if let Err(e) = crate::job::ensure_output_path_safe(s, &out) {
-                errs.push(format!("{e:#}"));
+            if let Some(model_dir) = &model_dir {
+                let out = crate::job::derive_out_path(s);
+                if let Err(e) = crate::job::ensure_output_path_safe(s, &out, model_dir) {
+                    errs.push(format!("{e:#}"));
+                }
             }
         }
         if needs_ffmpeg {
@@ -419,7 +455,16 @@ impl eframe::App for ShtormApp {
                     self.start_job(ctx);
                 }
                 if job_running {
-                    let stop = ui.add_enabled(true, egui::Button::new("Стоп"));
+                    // G5.1: после точки решения о публикации (фазы
+                    // Finalizing/Publishing) «Стоп» уже не может
+                    // предотвратить замену файла — кнопка отключается и
+                    // статус честно показывает сохранение результата.
+                    let stop = ui
+                        .add_enabled(!self.publishing, egui::Button::new("Стоп"))
+                        .on_disabled_hover_text(
+                            "идёт сохранение результата — отмена уже не может предотвратить \
+                             замену файла; кнопка вернётся после завершения",
+                        );
                     if stop.clicked() {
                         if let Some(job) = &self.job {
                             job.cancel.store(true, Ordering::SeqCst);
@@ -1016,6 +1061,7 @@ mod tests {
                 chunk_log_path: None,
                 rtf: Some(0.5),
                 progress: (3, 7),
+                replaced_existing: false,
                 batch: None,
             },
         )));
@@ -1039,6 +1085,7 @@ mod tests {
                 chunk_log_path: None,
                 rtf: Some(0.123),
                 progress: (7, 7),
+                replaced_existing: false,
                 batch: None,
             },
         )));
@@ -1128,6 +1175,7 @@ mod tests {
                 chunk_log_path: None,
                 rtf: None,
                 progress: (5, 5),
+                replaced_existing: false,
                 batch: None,
             },
         )));
@@ -1144,9 +1192,59 @@ mod tests {
                 chunk_log_path: None,
                 rtf: None,
                 progress: (0, 0),
+                replaced_existing: false,
                 batch: None,
             },
         )));
         assert!(app.status.starts_with("⚠ Нет работы"), "{}", app.status);
+    }
+
+    /// G5.1: фазы задания управляют доступностью «Стоп». Generating —
+    /// кнопка доступна; Finalizing/Publishing — публикация необратима,
+    /// кнопка отключена и статус показывает сохранение результата;
+    /// Finished/FileDone возвращают кнопку.
+    #[test]
+    fn job_phases_drive_stop_availability_and_status() {
+        let mut app = ShtormApp::new();
+        app.apply_event(crate::job::JobEvent::Phase(JobPhase::Generating));
+        assert!(!app.publishing, "во время генерации «Стоп» доступен");
+        assert!(app.status.contains("генерация"), "{}", app.status);
+
+        app.apply_event(crate::job::JobEvent::Phase(JobPhase::Finalizing));
+        assert!(app.publishing, "после точки решения «Стоп» отключается");
+        assert!(
+            app.status.contains("Сохранение результата"),
+            "{}",
+            app.status
+        );
+        app.apply_event(crate::job::JobEvent::Phase(JobPhase::Publishing));
+        assert!(app.publishing);
+        assert!(app.status.contains("Сохранение результата"));
+
+        // пакетный режим: после готового файла кнопка возвращается
+        let report = crate::batch::FileReport::new(
+            &crate::batch::BatchFile {
+                input: PathBuf::from("C:/src/a.txt"),
+                relative: PathBuf::from("a.txt"),
+            },
+            Some(PathBuf::from("C:/out/a.wav")),
+        );
+        app.apply_event(crate::job::JobEvent::FileDone {
+            index: 1,
+            total: 2,
+            report: Box::new(report),
+        });
+        assert!(
+            !app.publishing,
+            "между файлами пакета «Стоп» снова доступен"
+        );
+
+        // итог задания тоже возвращает кнопку
+        app.apply_event(crate::job::JobEvent::Phase(JobPhase::Publishing));
+        assert!(app.publishing);
+        app.apply_event(crate::job::JobEvent::Finished(Box::new(
+            crate::job::JobResult::failed("тест".into()),
+        )));
+        assert!(!app.publishing, "после итога «Стоп» не нужен");
     }
 }

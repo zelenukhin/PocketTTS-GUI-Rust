@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use app_core::pipeline::{
     log_path_for, synthesize_stream, write_chunk_log, write_diag_log, ChunkLogMeta, DiagMeta,
-    PipelineOptions, RunStatus, StreamError,
+    PipelineOptions, RunPhase, RunStatus, StreamError,
 };
 use app_core::sink::{make_sink_with_overwrite, OutputFormat};
 use shtorm_engine::Device;
@@ -36,6 +36,26 @@ pub struct JobConfig {
     pub out_path: PathBuf,
 }
 
+/// G5.1: фаза задания для UI. После [JobPhase::Finalizing] отмена уже не
+/// может предотвратить публикацию/замену результата — кнопка «Стоп» должна
+/// быть отключена, а статус честно показывать сохранение результата.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobPhase {
+    Generating,
+    Finalizing,
+    Publishing,
+}
+
+impl From<RunPhase> for JobPhase {
+    fn from(p: RunPhase) -> Self {
+        match p {
+            RunPhase::Generating => JobPhase::Generating,
+            RunPhase::Finalizing => JobPhase::Finalizing,
+            RunPhase::Publishing => JobPhase::Publishing,
+        }
+    }
+}
+
 /// События задания для UI-потока (канал + `ctx.request_repaint`).
 #[derive(Debug, Clone)]
 pub enum JobEvent {
@@ -43,6 +63,8 @@ pub enum JobEvent {
         done: usize,
         total: usize,
     },
+    /// G5.1: смена фазы (генерация/финализация/публикация).
+    Phase(JobPhase),
     /// Пакетный режим: прогресс чанков текущего файла + номер файла K/N.
     FileProgress {
         index: usize,
@@ -72,6 +94,8 @@ pub struct JobResult {
     pub chunk_log_path: Option<PathBuf>,
     pub rtf: Option<f32>,
     pub progress: (usize, usize),
+    /// G5.1: Completed И существовавший файл реально заменён (не создан новый).
+    pub replaced_existing: bool,
     /// Пакетный отчёт (None — одиночный режим).
     pub batch: Option<BatchReport>,
 }
@@ -88,6 +112,7 @@ impl JobResult {
             chunk_log_path: None,
             rtf: None,
             progress: (0, 0),
+            replaced_existing: false,
             batch: None,
         }
     }
@@ -104,6 +129,7 @@ impl JobResult {
             chunk_log_path: None,
             rtf: None,
             progress: (0, 0),
+            replaced_existing: false,
             batch: None,
         }
     }
@@ -261,12 +287,15 @@ pub fn derive_out_path(s: &GuiSettings) -> PathBuf {
     resources::resolve_user_path(&s.out_dir).join(format!("{stem}.{}", s.format.extension_str()))
 }
 
-/// G5: защита пути результата. Замена разрешена только для готового
+/// G5/G5.1: защита пути результата. Замена разрешена только для готового
 /// аудиофайла назначения; путь не должен проходить через symlink/junction,
 /// выходить из каталога вывода или совпадать с исходным текстом/голосом/
 /// каталогом модели. Проверки физические (canonicalize существующего
 /// префикса), поэтому альтернативные имена не обходят ограничения.
-pub fn ensure_output_path_safe(s: &GuiSettings, out_path: &Path) -> Result<()> {
+/// `model_dir` — уже РАЗРЕШЁННЫЙ каталог модели (ошибка резолва не может
+/// молча пропустить проверку: она случилась раньше и задание не дошло бы
+/// сюда).
+pub fn ensure_output_path_safe(s: &GuiSettings, out_path: &Path, model_dir: &Path) -> Result<()> {
     let out_root = resources::resolve_user_path(&s.out_dir);
     crate::batch::ensure_no_reparse_components(out_path)?;
     anyhow::ensure!(
@@ -286,12 +315,44 @@ pub fn ensure_output_path_safe(s: &GuiSettings, out_path: &Path) -> Result<()> {
         "выходной путь совпадает с WAV-голосом: {}",
         out_path.display()
     );
-    if let Ok(model_dir) = resolve_model_dir(s) {
-        anyhow::ensure!(
-            !crate::batch::physically_under(out_path, &model_dir),
-            "выходной путь внутри каталога модели: {}",
-            out_path.display()
-        );
+    anyhow::ensure!(
+        !crate::batch::physically_under(out_path, model_dir),
+        "выходной путь внутри каталога модели: {}",
+        out_path.display()
+    );
+    Ok(())
+}
+
+/// G5.1: создать недостающие каталоги пути, НЕ следуя по symlink/junction.
+/// Каждый существующий компонент проверяется на reparse point ПЕРЕД тем,
+/// как через него создаётся следующий; создаются только отсутствующие
+/// компоненты (по одному, `create_dir`). `std::fs::create_dir_all` так не
+/// умеет: он молча проходит существующие junction и создаёт каталоги уже
+/// «по ту сторону» ссылки — поэтому здесь ручной обход.
+pub fn create_dir_all_no_reparse(path: &Path) -> Result<()> {
+    let abs = crate::batch::absolute_lexical(path);
+    let mut chain: Vec<&Path> = abs.ancestors().collect();
+    chain.reverse();
+    for anc in chain {
+        if anc.as_os_str().is_empty() {
+            continue;
+        }
+        match std::fs::symlink_metadata(anc) {
+            Ok(md) => {
+                if crate::batch::is_reparse_metadata(&md) {
+                    bail!(
+                        "путь проходит через ссылку/точку перенаправления (reparse point): {} — укажите физический каталог",
+                        anc.display()
+                    );
+                }
+                anyhow::ensure!(md.is_dir(), "компонент пути не каталог: {}", anc.display());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(anc)
+                    .map_err(|e| anyhow::anyhow!("создать каталог {}: {e}", anc.display()))?;
+            }
+            Err(e) => bail!("проверить компонент пути {}: {e}", anc.display()),
+        }
     }
     Ok(())
 }
@@ -437,28 +498,33 @@ pub fn execute_job(cfg: &JobConfig, cancel: &AtomicBool, emit: &dyn Fn(JobEvent)
     if let Err(e) = setup_ort_environment(s) {
         return attach_warning(fail(format!("{e:#}")), &char_warning);
     }
-    // папка результата может не существовать — создаём (безопасно, без удалений)
+    // G5.1: защита путей — СТРОГО ДО любого создания каталогов. Существующие
+    // компоненты (включая reparse-точки) и физическое расположение проверяются
+    // до mkdir: junction в пути результата не может «провести» создание
+    // каталога за пределы разрешённого каталога вывода.
+    if let Err(e) = ensure_output_path_safe(s, &cfg.out_path, &model_dir) {
+        return attach_warning(fail(format!("{e:#}")), &char_warning);
+    }
+    // Папка результата может не существовать — создаём без следования по
+    // symlink/junction (каждый существующий компонент перепроверяется).
     if let Some(parent) = cfg.out_path.parent() {
-        if !parent.exists() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                return attach_warning(
-                    fail(format!(
-                        "создать папку результата {}: {e}",
-                        parent.display()
-                    )),
-                    &char_warning,
-                );
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            if let Err(e) = create_dir_all_no_reparse(parent) {
+                return attach_warning(fail(format!("{e:#}")), &char_warning);
             }
         }
     }
-    // G5: защита путей — до любых проверок существования/замены. Тот же
-    // физический контроль, что в пакетном режиме G3.1: reparse-точки,
-    // выход за каталог результата, совпадение с входом/голосом/моделью.
-    if let Err(e) = ensure_output_path_safe(s, &cfg.out_path) {
+    // G5.1: повторная валидация ПОСЛЕ создания — закрывает окно TOCTOU
+    // (появившаяся между проверкой и созданием ссылка была бы раскрыта
+    // canonicalize как физически чужое расположение).
+    if let Err(e) = ensure_output_path_safe(s, &cfg.out_path, &model_dir) {
         return attach_warning(fail(format!("{e:#}")), &char_warning);
     }
     let overwrite = s.overwrite_existing;
-    if cfg.out_path.exists() {
+    // G5.1: существовал ли готовый файл ДО запуска — семантика сообщений
+    // («создан новый» vs «обновлён существующий») и замены при отмене.
+    let existed_before = cfg.out_path.exists();
+    if existed_before {
         if !overwrite {
             // Не ошибка и не модальное окно: файл просто пропускается и
             // остаётся побайтово неизменным.
@@ -504,7 +570,8 @@ pub fn execute_job(cfg: &JobConfig, cancel: &AtomicBool, emit: &dyn Fn(JobEvent)
         if preset.is_empty() { "-" } else { preset }
     )));
 
-    // --- синтез (прогресс → UI; отмена → Cancelled без публикации) ---
+    // --- синтез (прогресс/фазы → UI; отмена до точки решения — Cancelled
+    // без публикации; после неё конвейер доходит до конца, UI знает фазу) ---
     let result = synthesize_stream(
         &cfg.text,
         &opts,
@@ -515,11 +582,14 @@ pub fn execute_job(cfg: &JobConfig, cancel: &AtomicBool, emit: &dyn Fn(JobEvent)
             emit(JobEvent::Progress { done, total });
         },
         cancel,
+        &|ph| emit(JobEvent::Phase(ph.into())),
     );
     let elapsed = t0.elapsed().as_secs_f32();
 
     let mut res = match result {
-        Ok(outcome) => finish_from_outcome(cfg, outcome, elapsed, cancel, overwrite),
+        Ok(outcome) => {
+            finish_from_outcome(cfg, outcome, elapsed, cancel, overwrite, existed_before)
+        }
         Err(e) => finish_from_error(cfg, &e, elapsed),
     };
     res.progress = progress;
@@ -573,6 +643,7 @@ pub fn execute_batch(
             chunk_log_path: None,
             rtf: None,
             progress: (0, 0),
+            replaced_existing: false,
             batch: Some(report),
         };
     }
@@ -673,9 +744,14 @@ pub fn execute_batch(
             match res.status {
                 JobStatus::Completed => {
                     rep.status = FileStatus::Completed;
-                    if overwrite {
-                        rep.reason = Some("Файл обновлён".into());
-                    }
+                    // G5.1: та же семантика, что в одиночном режиме, —
+                    // «обновлён» только для реально существовавшего файла,
+                    // новый файл не называется «обновлённым».
+                    rep.reason = Some(if res.replaced_existing {
+                        "файл обновлён (старый заменён)".into()
+                    } else {
+                        "создан новый файл".into()
+                    });
                 }
                 JobStatus::Cancelled => {
                     rep.status = FileStatus::Cancelled;
@@ -718,6 +794,7 @@ pub fn execute_batch(
         chunk_log_path: None,
         rtf: None,
         progress: (report.total(), report.total()),
+        replaced_existing: false,
         batch: Some(report),
     }
 }
@@ -733,12 +810,16 @@ fn attach_warning(mut r: JobResult, warning: &Option<String>) -> JobResult {
 
 /// Успешный возврат synthesize_stream: Completed (итог + RTF + лог чанков)
 /// или Cancelled (черновик + диагностический журнал, итог не публикуется).
+/// `existed_before` — существовал ли готовый файл до запуска: отделяет
+/// «создан новый файл» от «обновлён существующий» и в отмене уточняет,
+/// что старый файл сохранён.
 fn finish_from_outcome(
     cfg: &JobConfig,
     o: app_core::pipeline::StreamOutcome,
     elapsed: f32,
     cancel: &AtomicBool,
     overwrite: bool,
+    existed_before: bool,
 ) -> JobResult {
     let total_s = (o.speech_samples + o.pause_samples) as f64 / o.sample_rate as f64;
     let rtf = if total_s > 1e-9 {
@@ -752,16 +833,26 @@ fn finish_from_outcome(
         } else {
             "отменено"
         };
+        // G5.1: при отмене до точки решения старый готовый файл гарантированно
+        // не тронут — говорим об этом явно, а не «итоговый файл не создан».
+        let outcome_note = if existed_before && overwrite {
+            "замена НЕ выполнена — старый файл сохранён побайтово"
+        } else {
+            "итоговый файл не создан"
+        };
         let diag = write_diag_log(
             &cfg.out_path,
             "Cancelled",
-            &format!("{reason}; черновик сохранён: {}", o.partial_path.display()),
+            &format!(
+                "{reason}; {outcome_note}; черновик сохранён: {}",
+                o.partial_path.display()
+            ),
             &DiagMeta::from_outcome(&o),
         );
         return JobResult {
             status: JobStatus::Cancelled,
             summary: format!(
-                "ОТМЕНЕНО на {}/{} чанках; итоговый файл не создан; черновик: {}",
+                "ОТМЕНЕНО на {}/{} чанках; {outcome_note}; черновик: {}",
                 o.chunks_done,
                 o.total_chunks,
                 o.partial_path.display()
@@ -772,16 +863,18 @@ fn finish_from_outcome(
             chunk_log_path: None,
             rtf,
             progress: (o.chunks_done, o.total_chunks),
+            replaced_existing: false,
             batch: None,
         };
     }
     // Completed: RTF/паузы/денойз в сводку; лог чанков опционален (сбой
-    // журнала не маскирует успешное аудио)
+    // журнала не маскирует успешное аудио). G5.1: «обновлён» — только когда
+    // готовый файл реально существовал и был заменён; иначе — новый файл.
     let speech_s = o.speech_samples as f64 / o.sample_rate as f64;
-    let prefix = if overwrite {
-        "ФАЙЛ ОБНОВЛЁН"
+    let (prefix, replaced) = if existed_before {
+        ("ФАЙЛ ОБНОВЛЁН (старый заменён)", true)
     } else {
-        "ГОТОВО"
+        ("ГОТОВО (создан новый файл)", false)
     };
     let mut summary = format!(
         "{prefix}: {} ({:.2} с: речь {:.2} с + паузы {:.2} с; чанков {}; RTF {:.3})",
@@ -820,12 +913,15 @@ fn finish_from_outcome(
         chunk_log_path,
         rtf,
         progress: (o.chunks_done, o.total_chunks),
+        replaced_existing: replaced,
         batch: None,
     }
 }
 
 /// Ошибка synthesize_stream: типизированный StreamError (прогресс/seed/
 /// черновик уже внутри) + диагностический журнал рядом с итогом.
+/// G5.1: сбой собственно публикации (кодирование прошло успешно) выделен
+/// отдельным статусом сообщения — старый готовый файл не изменён.
 fn finish_from_error(cfg: &JobConfig, e: &anyhow::Error, elapsed: f32) -> JobResult {
     let _ = elapsed;
     if let Some(se) = e.downcast_ref::<StreamError>() {
@@ -835,15 +931,21 @@ fn finish_from_error(cfg: &JobConfig, e: &anyhow::Error, elapsed: f32) -> JobRes
             &format!("{}\nпричина: ошибка выполнения задания", se.message),
             &DiagMeta::from_error(se),
         );
+        let summary = if se.publish_failed {
+            format!("ОШИБКА ПУБЛИКАЦИИ: {se} — старый файл не изменён, черновик цел")
+        } else {
+            format!("ОШИБКА: {se}")
+        };
         return JobResult {
             status: JobStatus::Failed,
-            summary: format!("ОШИБКА: {se}"),
+            summary,
             final_path: None,
             partial_path: Some(se.partial.clone()),
             diag_path: diag,
             chunk_log_path: None,
             rtf: None,
             progress: (se.chunks_done, se.total),
+            replaced_existing: false,
             batch: None,
         };
     }
@@ -856,6 +958,7 @@ fn finish_from_error(cfg: &JobConfig, e: &anyhow::Error, elapsed: f32) -> JobRes
         chunk_log_path: None,
         rtf: None,
         progress: (0, 0),
+        replaced_existing: false,
         batch: None,
     }
 }
@@ -1203,6 +1306,130 @@ mod tests {
         assert_eq!(std::fs::read(&cfg.out_path).unwrap(), b"keep");
     }
 
+    // ===== G5.1: порядок проверок путей (песочницы %TEMP%, без удалений) =====
+
+    #[cfg(windows)]
+    fn make_junction(target: &Path, link: &Path) -> bool {
+        std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// G5.1: create_dir_all_no_reparse создаёт обычную вложенность, но
+    /// отказывает на junction-компоненте, НЕ создавая ничего «по ту сторону»
+    /// ссылки (create_dir_all прошёл бы молча).
+    #[cfg(windows)]
+    #[test]
+    fn create_dirs_refuses_junction_and_creates_clean_paths() {
+        let d = tmpdir("mkdirs");
+        // обычная вложенность — создаётся
+        let clean = d.join("out").join("book").join("deep");
+        create_dir_all_no_reparse(&clean).unwrap();
+        assert!(clean.is_dir());
+        // junction в середине пути — отказ, цель не тронута
+        let real = d.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = d.join("alias");
+        if !make_junction(&real, &link) {
+            eprintln!("SKIP create_dirs_refuses_junction: нет прав на junction");
+            return;
+        }
+        let through = link.join("newdir").join("deeper");
+        let err = create_dir_all_no_reparse(&through).unwrap_err();
+        assert!(format!("{err:#}").contains("перенаправления"), "{err:#}");
+        assert!(
+            !real.join("newdir").exists(),
+            "по ту сторону junction ничего не создано"
+        );
+        // файл на месте компонента-каталога — отказ
+        let blocker = d.join("blocker");
+        std::fs::write(&blocker, b"f").unwrap();
+        let err = create_dir_all_no_reparse(&blocker.join("sub")).unwrap_err();
+        assert!(format!("{err:#}").contains("не каталог"), "{err:#}");
+    }
+
+    /// G5.1: полный путь execute_job — проверка безопасности строго ДО
+    /// создания каталогов. Junction в родителе результата + отсутствующие
+    /// вложенные каталоги: задание отказывает, по ту сторону ссылки ничего
+    /// не создаётся (прежний порядок создал бы real/newdir/ до проверки).
+    #[cfg(windows)]
+    #[test]
+    fn execute_job_checks_junction_before_creating_dirs() {
+        let d = tmpdir("job_junction");
+        let base = tmpdir("job_junction_models");
+        fake_model(&base, "ru-v2-slow");
+        let real = d.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = d.join("alias");
+        if !make_junction(&real, &link) {
+            eprintln!(
+                "SKIP execute_job_checks_junction_before_creating_dirs: нет прав на junction"
+            );
+            return;
+        }
+        let text_file = d.join("book.txt");
+        std::fs::write(&text_file, "Текст.").unwrap();
+        let out_dir = link.join("newdir");
+        let s = GuiSettings {
+            onnx_base: base.display().to_string(),
+            text_file: text_file.display().to_string(),
+            out_dir: out_dir.display().to_string(),
+            ..Default::default()
+        };
+        let cfg = JobConfig {
+            settings: s,
+            text: "Текст.".into(),
+            out_path: out_dir.join("book.wav"),
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let res = execute_job(&cfg, &cancel, &|_| {});
+        assert_eq!(res.status, JobStatus::Failed, "{}", res.summary);
+        assert!(
+            res.summary.contains("перенаправления"),
+            "ожидается отказ по reparse-точке: {}",
+            res.summary
+        );
+        assert!(
+            !real.join("newdir").exists(),
+            "каталоги НЕ созданы до проверки безопасности"
+        );
+    }
+
+    /// G5.1: ensure_output_path_safe проверяет каталог модели по РАЗРЕШЁННОМУ
+    /// пути (ошибка резолва не может молча пропустить проверку — параметр).
+    #[test]
+    fn output_path_inside_model_dir_is_rejected() {
+        let d = tmpdir("model_overlap");
+        let model = fake_model(&d, "ru-v2-slow");
+        let text_file = d.join("book.txt");
+        std::fs::write(&text_file, "Текст.").unwrap();
+        let s = GuiSettings {
+            onnx_base: d.display().to_string(),
+            text_file: text_file.display().to_string(),
+            out_dir: model.display().to_string(),
+            ..Default::default()
+        };
+        let out = model.join("book.wav");
+        let err = ensure_output_path_safe(&s, &out, &model).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("внутри каталога модели"),
+            "{err:#}"
+        );
+        // выход вне каталога модели — норма
+        let ok_dir = d.join("out");
+        let s = GuiSettings {
+            out_dir: ok_dir.display().to_string(),
+            ..s
+        };
+        ensure_output_path_safe(&s, &ok_dir.join("book.wav"), &model).unwrap();
+    }
+
     /// Пустой пакет: не «Завершено», а NoWork — синтез не выполнялся.
     #[test]
     fn empty_batch_is_no_work() {
@@ -1411,34 +1638,44 @@ mod tests {
             .any(|e| matches!(e, JobEvent::FileDone { .. })));
     }
 
-    /// G5: реальная перезапись WAV. Старый файл заменяется только после
-    /// успешного синтеза; при отмене старый файл остаётся, `.partial` — для
-    /// диагностики. Запуск: `cargo test -p shtorm-gui --release --lib
-    /// real_overwrite_wav -- --ignored --nocapture`.
+    /// G5/G5.1: реальная перезапись WAV — существующий файл, новый файл при
+    /// включённой перезаписи, отмена до публикации, повтор после отмены.
+    /// Старый файл заменяется только после успешного синтеза; при отмене
+    /// остаётся побайтово неизменным, `.partial` — для диагностики.
+    /// Запуск: `cargo test -p shtorm-gui --release --lib
+    /// real_overwrite_wav -- --ignored --nocapture` (для CUDA:
+    /// SHTORM_GUI_TEST_DEVICE=cuda).
     #[test]
-    #[ignore = "реальный синтез: модели + ORT DLL; CPU"]
+    #[ignore = "реальный синтез: модели + ORT DLL"]
     fn real_overwrite_wav() {
-        // 1) успешная замена: «старый» файл становится настоящим WAV
-        let d = tmpdir("g5_overwrite_ok");
+        let cancel_false = || Arc::new(AtomicBool::new(false));
+
+        // 1) существующий + overwrite: файл ОБНОВЛЁН, не «создан»
+        let d = tmpdir("g51_ow_update");
         let mut s = real_settings(OutputFormatChoice::Wav, &d);
         s.overwrite_existing = true;
         let out = derive_out_path(&s);
         std::fs::write(&out, b"old").unwrap();
-        let cancel = Arc::new(AtomicBool::new(false));
         let res = execute_job(
             &JobConfig {
                 settings: s.clone(),
                 text: REAL_TEXT.into(),
                 out_path: out.clone(),
             },
-            &cancel,
+            &cancel_false(),
             &|_| {},
         );
-        eprintln!("[g5_overwrite_ok] {} | {}", res.status.label(), res.summary);
+        eprintln!("[g51_ow_update] {} | {}", res.status.label(), res.summary);
         assert_eq!(res.status, JobStatus::Completed, "{}", res.summary);
-        let bytes = std::fs::read(&out).unwrap();
-        assert!(bytes.len() > 44, "WAV записан");
-        assert!(bytes.starts_with(b"RIFF"), "старый файл заменён WAV");
+        assert!(res.summary.contains("ФАЙЛ ОБНОВЛЁН"), "{}", res.summary);
+        assert!(!res.summary.contains("создан новый"), "{}", res.summary);
+        assert!(
+            res.replaced_existing,
+            "существовавший файл помечен заменённым"
+        );
+        let new_bytes = std::fs::read(&out).unwrap();
+        assert!(new_bytes.starts_with(b"RIFF"), "старый файл заменён WAV");
+        assert_ne!(new_bytes, b"old".as_slice(), "содержимое изменилось");
         assert!(
             !std::fs::read_dir(&d)
                 .unwrap()
@@ -1447,33 +1684,299 @@ mod tests {
             "после успешной замены .partial не остался"
         );
 
-        // 2) отмена до публикации: старый файл не тронут, .partial остался
-        let d2 = tmpdir("g5_overwrite_cancel");
+        // 2) НОВЫЙ файл при включённой перезаписи — «создан новый файл»,
+        // не «обновлён»
+        let d2 = tmpdir("g51_ow_new");
         let mut s2 = real_settings(OutputFormatChoice::Wav, &d2);
         s2.overwrite_existing = true;
         let out2 = derive_out_path(&s2);
-        std::fs::write(&out2, b"old").unwrap();
-        let cancel2 = Arc::new(AtomicBool::new(true));
         let res2 = execute_job(
             &JobConfig {
                 settings: s2,
                 text: REAL_TEXT.into(),
                 out_path: out2.clone(),
             },
-            &cancel2,
+            &cancel_false(),
             &|_| {},
         );
+        eprintln!("[g51_ow_new] {} | {}", res2.status.label(), res2.summary);
+        assert_eq!(res2.status, JobStatus::Completed, "{}", res2.summary);
+        assert!(
+            res2.summary.contains("создан новый файл"),
+            "новый файл не называется «обновлённым»: {}",
+            res2.summary
+        );
+        assert!(!res2.summary.contains("ОБНОВЛЁН"), "{}", res2.summary);
+        assert!(!res2.replaced_existing);
+        assert!(out2.is_file());
+
+        // 3) отмена после ≥1 чанка при существующем результате: старый файл
+        // побайтово (строже SHA256) неизменен, черновик сохранён
+        let d3 = tmpdir("g51_ow_cancel");
+        let mut s3 = real_settings(OutputFormatChoice::Wav, &d3);
+        s3.overwrite_existing = true;
+        s3.max_tokens = 20; // гарантированно несколько чанков
+        let out3 = derive_out_path(&s3);
+        std::fs::write(&out3, b"old-bytes-cancel").unwrap();
+        let cancel3 = Arc::new(AtomicBool::new(false));
+        let c3 = Arc::clone(&cancel3);
+        let res3 = execute_job(
+            &JobConfig {
+                settings: s3.clone(),
+                text: REAL_TEXT.into(),
+                out_path: out3.clone(),
+            },
+            &cancel3,
+            &|ev| {
+                if let JobEvent::Progress { done, .. } = &ev {
+                    if *done >= 1 {
+                        c3.store(true, Ordering::SeqCst);
+                    }
+                }
+            },
+        );
+        eprintln!("[g51_ow_cancel] {} | {}", res3.status.label(), res3.summary);
+        assert_eq!(res3.status, JobStatus::Cancelled, "{}", res3.summary);
+        assert_eq!(
+            std::fs::read(&out3).unwrap(),
+            b"old-bytes-cancel",
+            "старый файл побайтово цел (эквивалент SHA256-совпадения)"
+        );
+        assert!(
+            res3.summary.contains("старый файл сохранён"),
+            "отмена явно сообщает о сохранении старого файла: {}",
+            res3.summary
+        );
+        assert!(res3.partial_path.as_ref().is_some_and(|p| p.is_file()));
+
+        // 4) повторная генерация после отмены: тот же путь, файл обновлён
+        let res4 = execute_job(
+            &JobConfig {
+                settings: s3,
+                text: REAL_TEXT.into(),
+                out_path: out3.clone(),
+            },
+            &cancel_false(),
+            &|_| {},
+        );
+        eprintln!("[g51_ow_retry] {} | {}", res4.status.label(), res4.summary);
+        assert_eq!(res4.status, JobStatus::Completed, "{}", res4.summary);
+        assert!(res4.summary.contains("ФАЙЛ ОБНОВЛЁН"), "{}", res4.summary);
+        assert!(res4.replaced_existing);
+        let bytes4 = std::fs::read(&out3).unwrap();
+        assert!(bytes4.starts_with(b"RIFF"), "итог — настоящий WAV");
+        assert_ne!(bytes4, b"old-bytes-cancel");
+    }
+
+    /// G5.1: реальная перезапись MP3/Opus через ffmpeg — существующий файл
+    /// заменяется только после успешного кодирования; новый файл при
+    /// включённой перезаписи сообщается как созданный; сиротских процессов
+    /// ffmpeg после заданий нет.
+    #[test]
+    #[ignore = "реальный синтез: модели + ORT DLL + ffmpeg"]
+    fn real_overwrite_mp3_opus() {
+        fn ffmpeg_count() -> u32 {
+            let out = std::process::Command::new("tasklist")
+                .arg("/FI")
+                .arg("IMAGENAME eq ffmpeg.exe")
+                .arg("/FO")
+                .arg("CSV")
+                .arg("/NH")
+                .output()
+                .expect("tasklist");
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|l| l.to_ascii_lowercase().starts_with("\"ffmpeg.exe"))
+                .count() as u32
+        }
+        let baseline = ffmpeg_count();
+
+        for (tag, fmt, magic) in [
+            ("g51_ow_mp3", OutputFormatChoice::Mp3, &b"ID3"[..]),
+            ("g51_ow_opus", OutputFormatChoice::Opus, &b"OggS"[..]),
+        ] {
+            // существующий + overwrite → заменён корректным контейнером
+            let d = tmpdir(tag);
+            let mut s = real_settings(fmt, &d);
+            s.overwrite_existing = true;
+            let out = derive_out_path(&s);
+            std::fs::write(&out, b"old-bytes").unwrap();
+            let res = execute_job(
+                &JobConfig {
+                    settings: s.clone(),
+                    text: REAL_TEXT.into(),
+                    out_path: out.clone(),
+                },
+                &Arc::new(AtomicBool::new(false)),
+                &|_| {},
+            );
+            eprintln!("[{tag}] {} | {}", res.status.label(), res.summary);
+            assert_eq!(res.status, JobStatus::Completed, "{}", res.summary);
+            assert!(res.summary.contains("ФАЙЛ ОБНОВЛЁН"), "{}", res.summary);
+            assert!(res.replaced_existing);
+            let bytes = std::fs::read(&out).unwrap();
+            assert!(bytes.starts_with(magic), "заменён корректным контейнером");
+            assert_ne!(bytes, b"old-bytes");
+            assert!(
+                !std::fs::read_dir(&d)
+                    .unwrap()
+                    .filter_map(|e| e.ok())
+                    .any(|e| e.file_name().to_string_lossy().contains(".partial")),
+                ".partial убран после публикации"
+            );
+
+            // новый файл при включённой перезаписи — «создан новый файл»
+            let d2 = tmpdir(&format!("{tag}_new"));
+            let mut s2 = real_settings(fmt, &d2);
+            s2.overwrite_existing = true;
+            let out2 = derive_out_path(&s2);
+            let res2 = execute_job(
+                &JobConfig {
+                    settings: s2,
+                    text: REAL_TEXT.into(),
+                    out_path: out2.clone(),
+                },
+                &Arc::new(AtomicBool::new(false)),
+                &|_| {},
+            );
+            eprintln!("[{tag}_new] {} | {}", res2.status.label(), res2.summary);
+            assert_eq!(res2.status, JobStatus::Completed, "{}", res2.summary);
+            assert!(
+                res2.summary.contains("создан новый файл"),
+                "{}",
+                res2.summary
+            );
+            assert!(!res2.replaced_existing);
+            assert!(std::fs::read(&out2).unwrap().starts_with(magic));
+        }
+
+        // после всех ffmpeg-заданий сиротских процессов не осталось
+        let after = ffmpeg_count();
+        assert_eq!(
+            after, baseline,
+            "ffmpeg-процессы завершены ({baseline} → {after})"
+        );
+    }
+
+    /// G5.1: ошибка ffmpeg при существующем результате и включённой
+    /// перезаписи — Failed, старый файл побайтово цел, черновик для
+    /// диагностики. «ffmpeg» — cmd-заглушка, проходящая проверку -version,
+    /// но падающая на аргументах энкодера.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "реальный прогон с cmd-заглушкой ffmpeg; модели + ORT DLL"]
+    fn real_ffmpeg_error_existing_result() {
+        let d = tmpdir("g51_ff_err");
+        let stub = d.join("ffmpeg_stub.bat");
+        std::fs::write(
+            &stub,
+            "@echo off\r\nif \"%1\"==\"-version\" exit /b 0\r\nexit /b 1\r\n",
+        )
+        .unwrap();
+        let mut s = real_settings(OutputFormatChoice::Mp3, &d);
+        s.overwrite_existing = true;
+        s.ffmpeg_path = stub.display().to_string();
+        let out = derive_out_path(&s);
+        std::fs::write(&out, b"old-bytes-ffmpeg-err").unwrap();
+        let res = execute_job(
+            &JobConfig {
+                settings: s,
+                text: REAL_TEXT.into(),
+                out_path: out.clone(),
+            },
+            &Arc::new(AtomicBool::new(false)),
+            &|_| {},
+        );
+        eprintln!("[g51_ff_err] {} | {}", res.status.label(), res.summary);
+        assert_eq!(res.status, JobStatus::Failed, "{}", res.summary);
+        assert!(
+            res.summary.contains("ffmpeg"),
+            "ошибка связана с ffmpeg: {}",
+            res.summary
+        );
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            b"old-bytes-ffmpeg-err",
+            "старый файл побайтово цел при ошибке — итог не заменён"
+        );
+    }
+
+    /// G5.1: пакетный режим с существующим и новым результатом при
+    /// overwrite=true — существующий обновляется («файл обновлён»), новый
+    /// создаётся («создан новый файл»); повтор с overwrite=false — оба
+    /// пропущены без изменения.
+    #[test]
+    #[ignore = "реальный пакетный синтез: модели + ORT DLL; CPU"]
+    fn real_batch_overwrite_mixed() {
+        let d = tmpdir("g51_batch_ow");
+        let src = d.join("src");
+        let out = d.join("out");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(src.join("a.txt"), "П+ервый пакетный текст.").unwrap();
+        std::fs::write(src.join("b.txt"), "Вт+орой пакетный текст.").unwrap();
+        std::fs::write(out.join("a.wav"), b"old-a").unwrap(); // существующий
+
+        let mut s = real_settings(OutputFormatChoice::Wav, &out);
+        s.device = DeviceChoice::Cpu;
+        s.workers = Some(2);
+        s.overwrite_existing = true;
+        s.clamped();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let res = execute_batch(&s, &src, &cancel, &|_| {});
+        eprintln!("[g51_batch_ow] {} | {}", res.status.label(), res.summary);
+        assert_eq!(res.status, JobStatus::Completed, "{}", res.summary);
+        let report = res.batch.expect("отчёт");
+        assert_eq!(report.completed(), 2, "{}", report.summary());
+        let rep_a = report
+            .files
+            .iter()
+            .find(|f| f.input.ends_with("a.txt"))
+            .unwrap();
+        let rep_b = report
+            .files
+            .iter()
+            .find(|f| f.input.ends_with("b.txt"))
+            .unwrap();
+        assert_eq!(rep_a.status, FileStatus::Completed);
+        assert!(
+            rep_a.reason.as_deref().unwrap().contains("обновлён")
+                && !rep_a.reason.as_deref().unwrap().contains("создан"),
+            "существующий — «обновлён»: {:?}",
+            rep_a.reason
+        );
+        assert_eq!(rep_b.status, FileStatus::Completed);
+        assert!(
+            rep_b
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("создан новый файл"),
+            "новый — «создан»: {:?}",
+            rep_b.reason
+        );
+        // старый байтовый мусор заменён настоящим WAV
+        assert!(std::fs::read(out.join("a.wav"))
+            .unwrap()
+            .starts_with(b"RIFF"));
+        assert!(out.join("b.wav").is_file());
+
+        // повтор с выключенной перезаписью: оба пропущены, файлы не тронуты
+        let before_a = std::fs::read(out.join("a.wav")).unwrap();
+        let before_b = std::fs::read(out.join("b.wav")).unwrap();
+        let mut s2 = s.clone();
+        s2.overwrite_existing = false;
+        let res2 = execute_batch(&s2, &src, &Arc::new(AtomicBool::new(false)), &|_| {});
         eprintln!(
-            "[g5_overwrite_cancel] {} | {}",
+            "[g51_batch_ow_skip] {} | {}",
             res2.status.label(),
             res2.summary
         );
-        assert_eq!(res2.status, JobStatus::Cancelled, "{}", res2.summary);
-        assert_eq!(std::fs::read(&out2).unwrap(), b"old", "старый файл цел");
-        assert!(
-            res2.partial_path.as_ref().is_some_and(|p| p.is_file()),
-            "черновик сохранён для диагностики"
-        );
+        assert_eq!(res2.status, JobStatus::NoWork, "{}", res2.summary);
+        let report2 = res2.batch.expect("отчёт");
+        assert_eq!(report2.skipped(), 2);
+        assert_eq!(std::fs::read(out.join("a.wav")).unwrap(), before_a);
+        assert_eq!(std::fs::read(out.join("b.wav")).unwrap(), before_b);
     }
 
     /// Матрица одного устройства: WAV, MP3/Opus, отмена после первого чанка,

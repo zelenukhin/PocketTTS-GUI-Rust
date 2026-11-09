@@ -174,20 +174,24 @@ impl StreamingWav {
         Ok(())
     }
 
-    /// Финализация: заголовок, закрытие, публикация итога. По умолчанию —
-    /// без замены (MoveFileW; при занятом имени отказ, черновик остаётся).
-    /// При `overwrite=true` — атомарная замена MoveFileExW после успешной
-    /// записи; старый файл до этого момента не удаляется.
-    pub fn finalize(mut self) -> Result<PathBuf> {
+    /// G5.1: финализация записи БЕЗ публикации — заголовок и закрытие
+    /// черновика. Публикация (необратимый шаг) выделена в `FinalizedWav`,
+    /// чтобы конвейер мог принять решение об отмене между ними.
+    pub fn finish(mut self) -> Result<FinalizedWav> {
         let mut w = self.writer.take().expect("writer ещё открыт");
         w.flush()?;
         w.finalize()?;
-        if self.overwrite {
-            publish_replace(&self.partial_path, &self.final_path)?;
-        } else {
-            publish_no_replace(&self.partial_path, &self.final_path)?;
-        }
-        Ok(self.final_path)
+        Ok(FinalizedWav {
+            partial_path: self.partial_path,
+            final_path: self.final_path,
+            overwrite: self.overwrite,
+        })
+    }
+
+    /// Финализация + публикация одним шагом (прежнее поведение; тесты и
+    /// совместимые вызовы). Семантика публикации — как у `FinalizedWav::publish`.
+    pub fn finalize(self) -> Result<PathBuf> {
+        self.finish()?.publish()
     }
 
     pub fn samples_written(&self) -> u64 {
@@ -196,6 +200,34 @@ impl StreamingWav {
     pub fn data_bytes(&self) -> u64 {
         self.data_bytes
     }
+    pub fn partial_path(&self) -> &Path {
+        &self.partial_path
+    }
+}
+
+/// G5.1: записанный и закрытый WAV-черновик, готовый к публикации.
+/// Публикация — отдельный необратимый шаг: конвейер выполняет её только
+/// после однозначного решения не отменять задание.
+pub struct FinalizedWav {
+    partial_path: PathBuf,
+    final_path: PathBuf,
+    overwrite: bool,
+}
+
+impl FinalizedWav {
+    /// Опубликовать черновик под итоговым именем. По умолчанию — без замены
+    /// (MoveFileW; при занятом имени отказ, черновик остаётся). При
+    /// `overwrite=true` — атомарная замена MoveFileExW; старый файл не
+    /// удалялся заранее и остаётся при любой ошибке замены.
+    pub fn publish(self) -> Result<PathBuf> {
+        if self.overwrite {
+            publish_replace(&self.partial_path, &self.final_path)?;
+        } else {
+            publish_no_replace(&self.partial_path, &self.final_path)?;
+        }
+        Ok(self.final_path)
+    }
+
     pub fn partial_path(&self) -> &Path {
         &self.partial_path
     }
@@ -476,6 +508,27 @@ mod tests {
         drop(w);
         assert_eq!(std::fs::read(&final_p).unwrap(), b"old audio");
         assert!(partial.exists(), "черновик сохранён для диагностики");
+    }
+
+    /// G5.1: finish закрывает черновик БЕЗ публикации — итог ещё не создан и
+    /// старый файл не тронут; publish отдельно заменяет его. Между шагами
+    /// конвейер может принять решение об отмене без всяких последствий.
+    #[test]
+    fn finish_then_publish_split_keeps_old_file_between_steps() {
+        let d = unique_dir("ow_split");
+        let final_p = d.join("book.wav");
+        std::fs::write(&final_p, b"old audio").unwrap();
+        let mut w = StreamingWav::create_with_overwrite(&final_p, 24000, true).unwrap();
+        w.write_chunk(&[0.5f32; 100], None).unwrap();
+        let fin = w.finish().unwrap();
+        // черновик закрыт и корректен, итог ещё НЕ опубликован
+        assert_eq!(std::fs::read(&final_p).unwrap(), b"old audio");
+        let (_, pcm) = read_wav(fin.partial_path());
+        assert_eq!(pcm.len(), 100, "черновик дописан до закрытия");
+        // публикация — отдельный необратимый шаг
+        let published = fin.publish().unwrap();
+        assert_eq!(published, final_p);
+        assert_ne!(std::fs::read(&final_p).unwrap(), b"old audio");
     }
 
     /// G5: каталог на месте итога — не «готовый аудиофайл»; замена отвергается.

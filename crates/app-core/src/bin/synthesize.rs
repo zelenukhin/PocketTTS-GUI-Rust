@@ -251,6 +251,15 @@ fn run() -> Result<ExitCode> {
         sink,
         |done, total| println!("  [{done}/{total}] готов"),
         &cancel,
+        &|p| match p {
+            app_core::pipeline::RunPhase::Finalizing => {
+                println!("финализация кодирования…")
+            }
+            app_core::pipeline::RunPhase::Publishing => {
+                println!("публикация результата…")
+            }
+            app_core::pipeline::RunPhase::Generating => {}
+        },
     );
     let elapsed = t.elapsed().as_secs_f32();
 

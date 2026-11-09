@@ -34,16 +34,20 @@ GUI для Pocket-TTS на Rust. Оперативное состояние — *
   (`trailing_pause_s`, `chunk_pause_s` с исправленной приоритетностью;
   golden 20 кейсов).
 - `crates/audio-processing` — `lib.rs` (write_wav16 create_new),
-  `stream.rs` (`StreamingWav`: потоковый WAV, уникальный `.partial`,
-  `publish_no_replace` = MoveFileW без замены по умолчанию, G5
-  `publish_replace` = MoveFileExW REPLACE|WRITE_THROUGH только при явном
-  `overwrite=true`, RIFF-лимит).
-- `crates/app-core` — оркестрация: `pipeline.rs` (`synthesize_stream`,
-  RunStatus/StreamError/DiagMeta/write_diag_log, `write_chunk_log`/
-  `log_path_for` — общий журнал чанков CLI и GUI), `pool.rs` (N воркеров,
-  скользящее окно backpressure, catch_unwind, строгий порядок, отмена),
-  `worker.rs` (RealWorker: Pocket+DSP на воркер, base_seed),
-  `sink.rs` (AudioSink: WavSink/FfmpegSink — writer-поток stdin,
+  `stream.rs` (`StreamingWav`: потоковый WAV, уникальный `.partial`;
+  G5.1 `finish()` закрывает контейнер БЕЗ публикации, отдельная
+  необратимая `FinalizedWav::publish()` — `MoveFileW` без замены по
+  умолчанию, G5 `overwrite=true` → `MoveFileExW REPLACE|WRITE_THROUGH`;
+  RIFF-лимит).
+- `crates/app-core` — оркестрация: `pipeline.rs` (`synthesize_stream`
+  с фазами G5.1 `RunPhase::{Generating,Finalizing,Publishing}` и ЕДИНОЙ
+  точкой решения о публикации — отмена до неё не публикует, после неё
+  конвейер доходит до конца; RunStatus/StreamError (с `publish_failed`)/
+  DiagMeta/write_diag_log, `write_chunk_log`/`log_path_for` — общий журнал
+  чанков CLI и GUI), `pool.rs` (N воркеров, скользящее окно backpressure,
+  catch_unwind, строгий порядок, отмена), `worker.rs` (RealWorker:
+  Pocket+DSP на воркер, base_seed), `sink.rs` (AudioSink: `finish()` +
+  `FinalizedSink::publish()`; WavSink/FfmpegSink — writer-поток stdin,
   wait_with_timeout, kill только своего child), `trace_dir.rs` (уникальные
   каталоги трасс, только создание), `diagnostics.rs`, `settings.rs`
   (SynthSettings — имена полей Python GUI), бинари `bin/{smoke,bench,
@@ -53,10 +57,14 @@ GUI для Pocket-TTS на Rust. Оперативное состояние — *
   unknown keys, атомарная запись tmp create_new + MoveFileExW; G5 — без
   импорта Python-настроек, EOS по умолчанию `Fixed(-4.0)`, флаг
   `overwrite_existing`), `app.rs` (форма, валидация, прогресс/Стоп/статусы,
-  управляемые свёртки `.open(Some(field))`, закрытие окна с отменой
-  задания), `job.rs` (G2: резолв модели fast/slow, ORT env + init один
-  раз на процесс, конвертация GuiSettings→PipelineOptions с паритетом
-  CLI, execute_job в фоновом потоке — напрямую app-core, НЕ subprocess),
+  G5.1 фазы: на Finalizing/Publishing «Стоп» отключён и статус «Сохранение
+  результата…», управляемые свёртки `.open(Some(field))`, закрытие окна с
+  отменой задания), `job.rs` (G2: резолв модели fast/slow, ORT env + init
+  один раз на процесс, конвертация GuiSettings→PipelineOptions с паритетом
+  CLI, execute_job в фоновом потоке — напрямую app-core, НЕ subprocess;
+  G5.1: `ensure_output_path_safe` ДО создания каталогов,
+  `create_dir_all_no_reparse`, повторная валидация, семантика
+  «создан/обновлён/пропущен/отменён/ошибка публикации»),
   `resources.rs` (G4: единый exe-relative резолвер моделей/ORT CPU/CUDA/
   ffmpeg; портативный комплект не требует Cargo.toml/CWD),
   `main.rs` (шрифты/кириллица + диагностические `--portable-*` режимы).
@@ -89,10 +97,13 @@ GUI для Pocket-TTS на Rust. Оперативное состояние — *
   `overwrite_existing=true` (GUI-чекбокс) разрешена замена готового файла
   назначения. Старый файл НЕ удаляется заранее; замена — атомарная
   `MoveFileExW REPLACE_EXISTING|WRITE_THROUGH` только после успешной
-  финализации sink. При ошибке/отмене старый файл остаётся, `.partial`
-  сохраняется для диагностики. Каталоги, reparse-точки и пути вне каталога
-  результата отвергаются. Входные тексты, WAV-голос, модели и настройки
-  замене не подлежат.
+  финализации sink (G5.1: решение принимается в ЕДИНОЙ точке после
+  генерации; отмена после неё уже не отзывает замену — UI отключает
+  «Стоп» и показывает «Сохранение результата…»). При ошибке/отмене старый
+  файл остаётся, `.partial` сохраняется для диагностики. Каталоги,
+  reparse-точки и пути вне каталога результата отвергаются ДО создания
+  каталогов (`create_dir_all_no_reparse` — без следования по ссылкам).
+  Входные тексты, WAV-голос, модели и настройки замене не подлежат.
 - Другая разрешённая замена — собственный конфиг GUI
   `shtorm_gui_settings.json` (atomic: unique tmp + `MoveFileExW
   REPLACE_EXISTING|WRITE_THROUGH`).

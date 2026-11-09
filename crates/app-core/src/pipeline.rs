@@ -355,6 +355,20 @@ pub enum RunStatus {
     Failed,
 }
 
+/// G5.1: фаза выполнения задания. `Generating` — синтез чанков воркерами;
+/// `Finalizing` — дожатие энкодера (ffmpeg) / закрытие контейнера БЕЗ
+/// публикации; `Publishing` — необратимая публикация (перенос/замена).
+/// Точка принятия решения о публикации — между `Generating` и `Finalizing`:
+/// отмена, принятая до неё, предотвращает публикацию; после неё конвейер
+/// доходит до конца независимо от флага (UI к этому моменту знает фазу и
+/// не обещает, что «Стоп» отменит замену).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunPhase {
+    Generating,
+    Finalizing,
+    Publishing,
+}
+
 /// Ошибка потокового задания с контекстом для диагностики/журнала:
 /// сохраняется исходный текст, путь черновика и точный прогресс.
 #[derive(Debug)]
@@ -364,6 +378,9 @@ pub struct StreamError {
     pub chunks_done: usize,
     pub total: usize,
     pub base_seed: u64,
+    /// G5.1: сбой случился уже НА ПУБЛИКАЦИИ (кодирование прошло успешно):
+    /// старый готовый файл не изменён, черновик цел.
+    pub publish_failed: bool,
 }
 
 impl std::fmt::Display for StreamError {
@@ -396,6 +413,7 @@ pub fn stream_error_from_run(
         chunks_done,
         total,
         base_seed,
+        publish_failed: false,
     }
 }
 
@@ -581,6 +599,8 @@ pub struct StreamOutcome {
 /// Потоковый конвейер A5: чанки пишутся в `sink` строго по порядку, полное
 /// аудио в памяти НЕ накапливается (буферы ограничены окном воркеров).
 /// Тот же расчёт пауз/seed, что в A3/A4; при отмене итог не публикуется.
+/// `phase` уведомляет о фазах (Generating/Finalizing/Publishing) — UI
+/// использует это, чтобы честно отражать отмену после точки решения.
 pub fn synthesize_stream<F>(
     raw_text: &str,
     opts: &PipelineOptions,
@@ -588,18 +608,27 @@ pub fn synthesize_stream<F>(
     sink: Box<dyn AudioSink>,
     progress: F,
     cancel: &AtomicBool,
+    phase: &dyn Fn(RunPhase),
 ) -> Result<StreamOutcome>
 where
     F: FnMut(usize, usize),
 {
-    synthesize_stream_impl(raw_text, opts, workers, sink, progress, cancel, |seed| {
-        real_worker_factory(opts, seed)
-    })
+    synthesize_stream_impl(
+        raw_text,
+        opts,
+        workers,
+        sink,
+        progress,
+        cancel,
+        phase,
+        |seed| real_worker_factory(opts, seed),
+    )
 }
 
 /// Реализация с инъекцией фабрики воркеров: публичная обёртка всегда берёт
 /// `real_worker_factory`; тесты подставляют мок и проверяют аварийный путь
 /// целиком (run_job → StreamError с реальным прогрессом/seed/черновиком).
+#[allow(clippy::too_many_arguments)]
 fn synthesize_stream_impl<W, Fac, FacW, F>(
     raw_text: &str,
     opts: &PipelineOptions,
@@ -607,6 +636,7 @@ fn synthesize_stream_impl<W, Fac, FacW, F>(
     sink: Box<dyn AudioSink>,
     mut progress: F,
     cancel: &AtomicBool,
+    phase: &dyn Fn(RunPhase),
     factory_of: Fac,
 ) -> Result<StreamOutcome>
 where
@@ -656,6 +686,7 @@ where
     };
     let factory = factory_of(base_seed);
 
+    phase(RunPhase::Generating);
     let mut done_ref = 0usize;
     let mut sink = sink;
     let run = run_job(
@@ -727,23 +758,39 @@ where
         RunStatus::Failed
     };
 
-    // G5: закрываем гонку «воркеры завершились → пользователь нажал Стоп →
-    // публикация». Отмена, пришедшая до финализации sink, не публикует и не
-    // заменяет готовый файл: статус понижается до Cancelled, черновик
-    // остаётся, старый результат не тронут.
+    // G5.1: ОДНОЗНАЧНАЯ ТОЧКА ПРИНЯТИЯ РЕШЕНИЯ О ПУБЛИКАЦИИ.
+    // Все чанки выданы; отмена, принятая ДО этого момента, предотвращает
+    // публикацию и замену готового файла (статус понижается до Cancelled,
+    // черновик остаётся). После этого решения конвейер финализирует и
+    // публикует результат ДО КОНЦА независимо от флага: публикация
+    // необратима, а UI через RunPhase знает, что «Стоп» больше не может
+    // её предотвратить (кнопка отключается на фазах Finalizing/Publishing).
     if status == RunStatus::Completed && cancel.load(std::sync::atomic::Ordering::SeqCst) {
         status = RunStatus::Cancelled;
     }
 
     let (path, final_partial) = match status {
         RunStatus::Completed => {
-            let published = sink.finalize().map_err(|e| {
+            phase(RunPhase::Finalizing);
+            let fin = sink.finish().map_err(|e| {
                 anyhow::Error::new(StreamError {
-                    message: format!("не удалось завершить/опубликовать файл: {e:#}"),
+                    message: format!("не удалось завершить кодирование: {e:#}"),
                     partial: partial_path.clone(),
                     chunks_done: summary.chunks_done,
                     total,
                     base_seed,
+                    publish_failed: false,
+                })
+            })?;
+            phase(RunPhase::Publishing);
+            let published = fin.publish().map_err(|e| {
+                anyhow::Error::new(StreamError {
+                    message: format!("ошибка публикации: {e:#}"),
+                    partial: partial_path.clone(),
+                    chunks_done: summary.chunks_done,
+                    total,
+                    base_seed,
+                    publish_failed: true,
                 })
             })?;
             (Some(published), partial_path)
@@ -759,6 +806,7 @@ where
                 chunks_done: summary.chunks_done,
                 total,
                 base_seed,
+                publish_failed: false,
             }));
         }
     };
@@ -854,6 +902,7 @@ mod stream_error_tests {
                 progress_calls += 1;
             },
             &cancel,
+            &|_| {},
             |_seed| |_wid, _s| Ok(FailingOnThird),
         )
         .unwrap_err();
@@ -943,5 +992,315 @@ mod stream_error_tests {
         assert!(text.contains("book.partial.wav"));
         // готовый файл отсутствует
         assert!(!final_p.exists());
+    }
+}
+
+#[cfg(test)]
+mod publish_phase_tests {
+    //! G5.1: детерминированные тесты конкурентной отмены вокруг точки
+    //! принятия решения о публикации. Порядок событий задаётся барьером и
+    //! явными флагами — никаких sleep и случайных задержек.
+
+    use super::*;
+    use crate::pool::{ChunkWorker, Task};
+    use crate::sink::{AudioSink, FinalizedSink};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Barrier, Mutex};
+
+    struct OkWorker;
+
+    impl ChunkWorker for OkWorker {
+        fn process(&mut self, task: &Task) -> anyhow::Result<crate::pool::ChunkAudio> {
+            Ok(crate::pool::ChunkAudio {
+                speech: vec![0.5f32; 240],
+                pause_s: task.pause_s,
+                denoise: crate::pool::DenoiseChunkStatus::Off,
+            })
+        }
+    }
+
+    /// Синк с управляемой публикацией: publish() сигнализирует о входе
+    /// флагом и ждёт на барьере — тест выставляет cancel строго ВНУТРИ
+    /// фазы Publishing.
+    struct GatedSink {
+        partial: PathBuf,
+        final_path: PathBuf,
+        publish_entered: Arc<AtomicBool>,
+        gate: Arc<Barrier>,
+        publish_done: Arc<AtomicBool>,
+    }
+
+    impl AudioSink for GatedSink {
+        fn write_chunk(
+            &mut self,
+            _index: usize,
+            _pcm: &[f32],
+            _pause_s: Option<f32>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn finish(self: Box<Self>) -> anyhow::Result<Box<dyn FinalizedSink>> {
+            Ok(self)
+        }
+        fn partial_path(&self) -> PathBuf {
+            self.partial.clone()
+        }
+    }
+
+    impl FinalizedSink for GatedSink {
+        fn publish(self: Box<Self>) -> anyhow::Result<PathBuf> {
+            self.publish_entered.store(true, Ordering::SeqCst);
+            self.gate.wait(); // публикация удерживается до команды теста
+            self.publish_done.store(true, Ordering::SeqCst);
+            Ok(self.final_path)
+        }
+        fn partial_path(&self) -> PathBuf {
+            self.partial.clone()
+        }
+    }
+
+    /// Синк с мгновенной публикацией и флагом вызова: отмена до точки
+    /// решения не должна вызвать publish вовсе.
+    struct CountingSink {
+        partial: PathBuf,
+        final_path: PathBuf,
+        publish_called: Arc<AtomicBool>,
+    }
+
+    impl AudioSink for CountingSink {
+        fn write_chunk(
+            &mut self,
+            _index: usize,
+            _pcm: &[f32],
+            _pause_s: Option<f32>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn finish(self: Box<Self>) -> anyhow::Result<Box<dyn FinalizedSink>> {
+            Ok(self)
+        }
+        fn partial_path(&self) -> PathBuf {
+            self.partial.clone()
+        }
+    }
+
+    impl FinalizedSink for CountingSink {
+        fn publish(self: Box<Self>) -> anyhow::Result<PathBuf> {
+            self.publish_called.store(true, Ordering::SeqCst);
+            Ok(self.final_path)
+        }
+        fn partial_path(&self) -> PathBuf {
+            self.partial.clone()
+        }
+    }
+
+    fn opts_for(model_dir: &std::path::Path) -> PipelineOptions {
+        PipelineOptions {
+            model_dir: model_dir.to_path_buf(),
+            voice: model_dir.join("voice.wav"),
+            device: Device::Cpu,
+            threads: 1,
+            seed: Some(42),
+            temperature: 0.3,
+            decode_steps: 1,
+            eos_threshold: -4.0,
+            eos_tail_short: EosTail::Fixed(5),
+            eos_tail_long: EosTail::Fixed(3),
+            brightness_db: 0.0,
+            denoise: false,
+            pause_scale: 1.0,
+            paragraph_pause_s: 0.0,
+            max_tokens: 10,
+            char_rules: None,
+            anti_repeat: true,
+        }
+    }
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|t| t.subsec_nanos())
+            .unwrap_or(0);
+        let d = std::env::temp_dir().join(format!(
+            "shtorm_phase_{}_{}_{}",
+            std::process::id(),
+            tag,
+            nanos
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Ожидание явного флага с дедлайном: зависание превращается в понятный
+    /// panic, а не в вечную блокировку теста.
+    fn wait_flag(flag: &AtomicBool, what: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !flag.load(Ordering::SeqCst) {
+            if std::time::Instant::now() > deadline {
+                panic!("не дождались: {what} (30 с)");
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    const TEXT: &str = "П+ервый предл+ог. Вт+орой предл+ог. Тр+етий предл+ог.";
+
+    /// Отмена, пришедшая ПОСЛЕ точки решения (строго внутри Publishing,
+    /// что гарантируется барьером), не предотвращает публикацию — и статус
+    /// остаётся Completed: задание не сообщает «Отменено» о замене, которая
+    /// реально состоялась.
+    #[test]
+    fn cancel_during_publishing_does_not_prevent_replacement() {
+        let d = tmpdir("during");
+        let final_p = d.join("book.wav");
+        std::fs::write(&final_p, b"old audio").unwrap();
+        let entered = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(Barrier::new(2));
+        let sink = Box::new(GatedSink {
+            partial: d.join("book.partial.wav"),
+            final_path: final_p.clone(),
+            publish_entered: Arc::clone(&entered),
+            gate: Arc::clone(&gate),
+            publish_done: Arc::clone(&done),
+        });
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_t = Arc::clone(&cancel);
+        let phases = Arc::new(Mutex::new(Vec::new()));
+        let phases_t = Arc::clone(&phases);
+        let opts = opts_for(&d);
+        let handle = std::thread::spawn(move || {
+            synthesize_stream_impl(
+                TEXT,
+                &opts,
+                1,
+                sink,
+                |_, _| {},
+                &cancel_t,
+                &move |p| phases_t.lock().unwrap().push(p),
+                |_seed| |_wid, _s| Ok(OkWorker),
+            )
+        });
+        // детерминированный порядок: публикация началась → «Стоп» → отпуск
+        wait_flag(&entered, "публикация должна начаться");
+        cancel.store(true, Ordering::SeqCst);
+        gate.wait();
+        let out = handle
+            .join()
+            .expect("поток задания")
+            .expect("успешный прогон");
+        assert_eq!(
+            out.status,
+            RunStatus::Completed,
+            "отмена после точки решения не понижает статус"
+        );
+        assert!(out.path.is_some(), "итог опубликован");
+        assert!(done.load(Ordering::SeqCst), "publish дошёл до конца");
+        assert_eq!(
+            phases.lock().unwrap().clone(),
+            vec![
+                RunPhase::Generating,
+                RunPhase::Finalizing,
+                RunPhase::Publishing
+            ],
+            "фазы идут в строгом порядке"
+        );
+    }
+
+    /// Отмена во время генерации (после первого выданного чанка) — до точки
+    /// решения: публикация не вызывается вовсе, статус Cancelled, старый
+    /// файл не тронут.
+    #[test]
+    fn cancel_during_generating_prevents_publish_entirely() {
+        let d = tmpdir("before");
+        let final_p = d.join("book.wav");
+        std::fs::write(&final_p, b"old audio").unwrap();
+        let publish_called = Arc::new(AtomicBool::new(false));
+        let sink = Box::new(CountingSink {
+            partial: d.join("book.partial.wav"),
+            final_path: final_p.clone(),
+            publish_called: Arc::clone(&publish_called),
+        });
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_t = Arc::clone(&cancel);
+        let phases = Arc::new(Mutex::new(Vec::new()));
+        let phases_t = Arc::clone(&phases);
+        let opts = opts_for(&d);
+        let out = std::thread::spawn(move || {
+            synthesize_stream_impl(
+                TEXT,
+                &opts,
+                1,
+                sink,
+                |done, _total| {
+                    if done >= 1 {
+                        // «Стоп» после первого готового чанка — во время
+                        // генерации, до точки решения о публикации
+                        cancel_t.store(true, Ordering::SeqCst);
+                    }
+                },
+                &cancel,
+                &move |p| phases_t.lock().unwrap().push(p),
+                |_seed| |_wid, _s| Ok(OkWorker),
+            )
+        })
+        .join()
+        .expect("поток задания")
+        .expect("отмена — не ошибка");
+        assert_eq!(out.status, RunStatus::Cancelled);
+        assert!(out.path.is_none(), "итог не опубликован");
+        assert!(
+            !publish_called.load(Ordering::SeqCst),
+            "publish не вызывался вовсе"
+        );
+        assert_eq!(
+            phases.lock().unwrap().clone(),
+            vec![RunPhase::Generating],
+            "финализация/публикация не начинались"
+        );
+        assert_eq!(
+            std::fs::read(&final_p).unwrap(),
+            b"old audio",
+            "старый файл не тронут"
+        );
+        assert!(out.chunks_done >= 1, "отмена после готового чанка");
+    }
+
+    /// Успешный прогон без отмены проходит все три фазы и публикует итог.
+    #[test]
+    fn phases_sequence_generating_finalizing_publishing() {
+        let d = tmpdir("sequence");
+        let final_p = d.join("book.wav");
+        let publish_called = Arc::new(AtomicBool::new(false));
+        let sink = Box::new(CountingSink {
+            partial: d.join("book.partial.wav"),
+            final_path: final_p.clone(),
+            publish_called: Arc::clone(&publish_called),
+        });
+        let cancel = AtomicBool::new(false);
+        let phases = Mutex::new(Vec::new());
+        let opts = opts_for(&d);
+        let out = synthesize_stream_impl(
+            TEXT,
+            &opts,
+            1,
+            sink,
+            |_, _| {},
+            &cancel,
+            &|p| phases.lock().unwrap().push(p),
+            |_seed| |_wid, _s| Ok(OkWorker),
+        )
+        .unwrap();
+        assert_eq!(out.status, RunStatus::Completed);
+        assert!(out.path.is_some());
+        assert!(publish_called.load(Ordering::SeqCst));
+        assert_eq!(
+            phases.lock().unwrap().clone(),
+            vec![
+                RunPhase::Generating,
+                RunPhase::Finalizing,
+                RunPhase::Publishing
+            ]
+        );
     }
 }
