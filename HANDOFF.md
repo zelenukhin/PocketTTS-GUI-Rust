@@ -293,11 +293,15 @@ Python `pocket-tts_gui.py`. Постоянные правила и архите�
   - **GUI↔CLI WAV-паритет**: дефолты −4/5/3 — 374444 байта (real_matrix,
     CPU); нестандартные −1/0/0 — 377324 байта и None/None — 374444 байта
     (real_eos_parity, CPU) — побитово совпадают.
-- **G4.1 портативный комплект** `ShtormTTS-Portable-2026-11-09-g41`:
+- **G4.1 портативный комплект**: финальный
+  `dist\ShtormTTS-Portable-2026-11-09-g41-final` (manifest git `824f2a1`,
+  dirty=false, 54 файла, 3403.1 MiB, exe SHA256 `6A23DDE8…D9797963`;
+  штатные настройки — новый формат auto/5/3) и тестовый `-g41` (тот же exe):
   `--portable-check`, CPU selftest (старый числовой конфиг — миграция;
   `"auto"`/5/3 — WAV побитово `80CB7288…` = базе G4), −1/0/0 (параметры
-  проходят), CUDA selftest (RTF 0.762), batch 2/2, окно GUI, паритет
-  комплект-GUI == CLI (`80CB7288…`). Детали — `docs/PORTABLE_BUILD.md`.
+  проходят), CUDA selftest (RTF 0.762–0.767), batch 2/2, окно GUI, паритет
+  комплект-GUI == CLI (`80CB7288…`). Детали — `docs/PORTABLE_BUILD.md`;
+  комплекты G4 не тронуты.
 
 ## Состояние подсистем
 
@@ -393,9 +397,9 @@ powershell -ExecutionPolicy Bypass -File tools/build-portable.ps1 `
 G4.1 завершён: настраиваемые параметры EOS (−4/«Авто»/−6…1; хвосты
 None/0–10 на ветку слов, семантика teratts-android без пересчёта 6/4) в
 GUI/CLI/JSON; портативный комплект
-`C:\PocketTTS-GUI-Rust\dist\ShtormTTS-Portable-2026-11-09-g41` (см.
-`docs/PORTABLE_BUILD.md`; предыдущий g4e не тронут). Следующий отдельный
-этап — G5.
+`C:\PocketTTS-GUI-Rust\dist\ShtormTTS-Portable-2026-11-09-g41-final`
+(manifest git `824f2a1`, dirty=false; см. `docs/PORTABLE_BUILD.md`;
+предыдущие g41/g4e не тронуты). Следующий отдельный этап — G5.
 
 1. G5-полировка: интерактивный клик-проход окна (кнопки/Стоп/прогресс/
    журнал), тема/копирование лога, RTF без времени загрузки моделей,

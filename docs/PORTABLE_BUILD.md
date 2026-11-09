@@ -291,10 +291,20 @@ shtorm-gui.exe --portable-selftest-batch [--device cpu|cuda]
 
 ## Результаты проверки G4.1 (2026-11-09)
 
+**Финальный комплект: `ShtormTTS-Portable-2026-11-09-g41-final`** —
+54 файла, 3403.1 MiB, `manifest.json` git `824f2a1`, dirty=false; exe
+SHA256 `6A23DDE8CA494DB99F1EBC4A481F1FF7D9512640CB3A5B50E4BE520AD9797963`
+(тот же exe, что в тестовой сборке `-g41`, на которой выполнены все пункты
+ниже; финальный комплект дополнительно перепроверен: portable-check, CPU
+selftest с комплектным шаблоном настроек, CUDA selftest). Штатный
+`shtorm_gui_settings.json` комплекта — новый формат
+(`"eos_threshold": "auto"`, `"eos_tail_short": 5`, `"eos_tail_long": 3`).
+Предыдущие комплекты (g4e и более ранние) не изменялись.
+
 G4.1 добавляет группу «EOS» (порог «Авто»≡−4.0/−6…1; хвосты None/0–10 для
 чанков ≤4 и ≥5 слов) в GUI, CLI и `shtorm_gui_settings.json`
 (см. GUI_PLAN.md / NEXT_STEPS.md). Проверка комплекта
-`ShtormTTS-Portable-2026-11-09-g41`:
+`ShtormTTS-Portable-2026-11-09-g41` (тот же exe):
 
 - `--portable-check` из корня комплекта — OK; GUI-окно запускается и живёт.
 - CPU selftest с настройками СТАРОГО формата (`eos_threshold: -4.0` числом,
