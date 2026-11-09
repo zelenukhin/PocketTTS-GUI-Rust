@@ -37,6 +37,9 @@ pub struct PipelineOptions {
     pub max_tokens: u32,
     /// char_rules из runtime.json модели (если заданы).
     pub char_rules: Option<CharRules>,
+    /// Защита от повторов (двухпопытная схема Pocket). GUI-переключатель
+    /// передаётся в движок реально (G1).
+    pub anti_repeat: bool,
 }
 
 /// Итоговая сводка по одному чанку.

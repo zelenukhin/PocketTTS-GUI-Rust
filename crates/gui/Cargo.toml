@@ -1,0 +1,29 @@
+[package]
+name = "shtorm-gui"
+description = "ShtormTTS native GUI (eframe/egui) — G1: статическая форма, валидация, настройки"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eframe = "0.31"
+egui = "0.31"
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+app-core = { path = "../app-core" }
+text-processing = { path = "../text-processing" }
+
+[lib]
+name = "shtorm_gui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "shtorm-gui"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }

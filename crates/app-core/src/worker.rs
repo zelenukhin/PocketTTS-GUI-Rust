@@ -37,6 +37,7 @@ pub fn real_worker_factory(
     let brightness_db = opts.brightness_db;
     let device: Device = opts.device.clone();
     let denoise_requested = opts.denoise;
+    let anti_repeat = opts.anti_repeat;
     move |_worker_id: usize, _seed: u64| {
         let mut engine = Pocket::load(
             &model_dir,
@@ -50,6 +51,7 @@ pub fn real_worker_factory(
         engine.temperature = temperature;
         engine.decode_steps = decode_steps;
         engine.eos_threshold = eos_threshold;
+        engine.anti_repeat = anti_repeat;
         let denoise_model = model_dir.join(denoise_mod::MODEL_FILE);
         let model_present = denoise_model.exists();
         engine.denoise_on = resolve_denoise(denoise_requested, model_present);

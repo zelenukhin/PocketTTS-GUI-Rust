@@ -5,6 +5,7 @@ members = [
     "crates/text-processing",
     "crates/audio-processing",
     "crates/app-core",
+        "crates/gui",
 ]
 
 [workspace.package]

@@ -167,6 +167,7 @@ fn run() -> Result<ExitCode> {
         paragraph_pause_s: args.paragraph_pause_s,
         max_tokens: args.max_tokens,
         char_rules,
+        anti_repeat: true,
     };
 
     println!(
