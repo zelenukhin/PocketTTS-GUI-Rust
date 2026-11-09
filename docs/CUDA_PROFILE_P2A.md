@@ -427,3 +427,18 @@ CUDA I/O Binding включён обычным путём для `Device::Cuda`;
 `SHTORM_CUDA_IO_BINDING=0`. CPU-путь не менялся. CUDA=1 остаётся
 рекомендованным автоматическим режимом GUI (2 воркера дают ~4% wall при
 +2 ГБ VRAM). P2B не начинался.
+
+### 13.6. Портативный комплект P2A.1
+
+`C:\PocketTTS-GUI-Rust\dist\ShtormTTS-Portable-2026-11-09-p2a1-final` —
+54 файла, 3403.2 MiB, manifest git `107acf3`, dirty=false, exe SHA256
+`156BD8D90AC8AAA92F05770446CE90A987FBEAFDF6AA53534CC69FA631279BB3`.
+Тестовый комплект `…-p2a1` (git `e99c056`, без cancel-режима) и предыдущий
+`…-g41-final` не изменялись. Проверено из `C:\`: portable-check; CPU WAV
+(Completed, RTF 0.898, `80CB7288…`); CUDA WAV (Completed, RTF 0.414, в логе
+`io binding active`, `85A26977…`); MP3/Opus (Completed); batch CUDA 2/2;
+`--portable-selftest-cancel` (Cancelled 1/6 без итога, `.partial` есть,
+повтор Completed 6 чанков); GUI-окно и сохранение настроек через UI
+Automation; WAV-паритет комплект-GUI == CLI; DLL процесса — из комплекта
+(CPU: только `onnxruntime\cpu`; CUDA: `onnxruntime\cuda` + cuBLAS/cuDNN;
+MSVC++ runtime из корня). Детали — `docs/PORTABLE_BUILD.md`.

@@ -214,6 +214,11 @@ shtorm-gui.exe --portable-selftest [--device cpu|cuda] [--format wav|mp3|opus]
 shtorm-gui.exe --portable-selftest-batch [--device cpu|cuda]
   Два файла во временном уникальном каталоге, результат в новом
   подкаталоге output; печатает отчёт по файлам.
+
+shtorm-gui.exe --portable-selftest-cancel [--device cpu|cuda]
+  Многочанковое задание, отмена после первого готового чанка (Cancelled,
+  итог не опубликован, черновик остаётся), затем повтор на том же пути
+  (Completed). P2A.1.
 ```
 
 Это тот же `execute_job`/`execute_batch`, что и в GUI. Они не заменяют
@@ -322,3 +327,51 @@ G4.1 добавляет группу «EOS» (порог «Авто»≡−4.0/�
 - Штатный fallback None/None и увеличенный хвост 10/10 проверены
   движковыми/конвейерными smoke в репозитории (None ≡ 5/3 побитово;
   хвост 10 против 3 на длинном чанке — ровно +7 кадров).
+
+## Результаты проверки CUDA-P2A.1 (2026-11-09)
+
+**Финальный комплект: `ShtormTTS-Portable-2026-11-09-p2a1-final`** —
+54 файла, 3403.2 MiB, `manifest.json` git `107acf3`, dirty=false; exe
+SHA256 `156BD8D90AC8AAA92F05770446CE90A987FBEAFDF6AA53534CC69FA631279BB3`.
+Комплект содержит CUDA I/O Binding **по умолчанию** (P2A.1) и новый
+диагностический режим `--portable-selftest-cancel`. Тестовый комплект
+`ShtormTTS-Portable-2026-11-09-p2a1` (тот же код без cancel-режима, git
+`e99c056`, exe `4577C9AA…AFA68333`) сохранён; предыдущий
+`…-g41-final` не изменялся.
+
+Проверки финального комплекта (запуск exe из `C:\`, рабочий каталог вне
+комплекта):
+
+- `--portable-check`: model/Slow, CPU ORT и ffmpeg разрешены из
+  относительных путей комплекта — PORTABLE CHECK OK.
+- CPU FP32 WAV selftest: Completed, 6.80 с, 2 чанка, RTF 0.898, воркеров 2;
+  SHA256 `80CB7288…AD3D43B` — как в G4/G4.1.
+- CUDA FP32 WAV selftest: Completed, 6.80 с, RTF 0.414, воркер 1; в логе
+  `CUDA-P2A: io binding active; state[0] on AllocationDevice("Cuda"),
+  states 46.9 MiB one-way` — пользователь комплекта действительно получает
+  новый путь. SHA256 `85A26977…D7C61A00` — побитово равен G4/G4.1
+  (старый и новый CUDA-пути совпадают).
+- MP3 (`-V2`) и Opus (`opus 64k`) на CUDA: Completed, RTF 0.403/0.408 через
+  комплектный ffmpeg.
+- Batch на CUDA: 2/2 готово, 4.8 с, подкаталог сохранён; в логе два
+  сообщения об активном I/O Binding (пул создаётся на каждый файл).
+- **Stop/Cancel** (`--portable-selftest-cancel --device cuda`): отмена
+  после первого из 6 чанков → Cancelled, итоговый файл не создан,
+  `.partial` существует; повтор на том же пути → Completed (6 чанков,
+  RTF 0.164). CANCEL SELFTEST OK.
+- GUI-окно из `C:\`: заголовок «ShtormTTS - нативный GUI», процесс
+  корректно закрывается; UI Automation видит все элементы формы.
+- **Сохранение настроек** (UI Automation): тумблер «Лог чанков» →
+  «Сохранить настройки» → `chunk_log: true` в JSON; обратный тумблер и
+  сохранение возвращают значение; набор ключей и значения сохраняются.
+  После теста `shtorm_gui_settings.json` восстановлен из шаблона
+  (SHA256 `628F06EE…593CB5` = запись manifest), комплект побитово
+  соответствует сборке.
+- **WAV-паритет комплект-GUI == CLI** (dev `synthesize.exe`, те же
+  параметры): CPU `80CB7288…`, CUDA `85A26977…` — совпадают.
+- **Зависимости процесса**: CUDA-прогон загружает `onnxruntime.dll`,
+  `cublasLt64_12`, `cudnn_*64_9` из `<dist>\onnxruntime\cuda\`,
+  `MSVCP140*`/`VCRUNTIME140*` из корня комплекта; из System32 — только
+  `nvcuda.dll` (драйвер NVIDIA) и `msvcp_win.dll` (API-set Windows).
+  CPU-прогон загружает только `<dist>\onnxruntime\cpu\onnxruntime.dll`.
+  Python/Torch/системный ORT/FFmpeg не используются.

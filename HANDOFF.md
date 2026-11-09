@@ -46,6 +46,17 @@
   OK; CPU матрица и GUI↔CLI паритет 374444 байта — без изменений; VRAM
   после всех прогонов 539 МБ; `graph_meta` пишет только `create_new`
   (повторный запуск с тем же путём — ошибка, файл не изменён).
+- **Портативный комплект P2A.1**:
+  `C:\PocketTTS-GUI-Rust\dist\ShtormTTS-Portable-2026-11-09-p2a1-final`
+  — 54 файла, 3403.2 MiB, manifest git `107acf3`, dirty=false, exe SHA256
+  `156BD8D90AC8AAA92F05770446CE90A987FBEAFDF6AA53534CC69FA631279BB3`.
+  Проверено из `C:\`: portable-check; CPU WAV RTF 0.898 `80CB7288…`;
+  CUDA WAV RTF 0.414 `85A26977…` с логом `io binding active`; MP3/Opus;
+  batch CUDA 2/2; `--portable-selftest-cancel` (Cancelled 1/6 без итога,
+  `.partial` есть; повтор Completed 6 чанков); GUI-окно + сохранение
+  настроек через UI Automation; паритет комплект-GUI == CLI; DLL только
+  из комплекта. Тестовый `…-p2a1` (git `e99c056`) и `…-g41-final` не
+  изменялись. Детали — `docs/PORTABLE_BUILD.md`.
 - **Решение**: CUDA=1 — рекомендованный автоматический режим GUI
   (2 воркера дают ~4% wall при +2 ГБ VRAM). P2B не начинался.
 
