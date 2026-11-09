@@ -495,7 +495,6 @@ impl AudioSink for FfmpegSink {
             .as_ref()
             .and_then(|m| m.lock().unwrap().clone())
         {
-            let _ = wait_with_timeout(&mut self.child, self.wait_timeout);
             self.stderr_text = Some(
                 self.stderr_thread
                     .take()
