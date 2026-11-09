@@ -92,16 +92,22 @@ impl JobResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobStatus {
     Completed,
+    /// Пакет: часть файлов готова, часть — с ошибками.
+    Partial,
     Cancelled,
     Failed,
+    /// Пакет: синтезировать было нечего (пустой план или все файлы пропущены).
+    NoWork,
 }
 
 impl JobStatus {
     pub fn label(&self) -> &'static str {
         match self {
             JobStatus::Completed => "Завершено",
+            JobStatus::Partial => "Частично",
             JobStatus::Cancelled => "Отменено",
             JobStatus::Failed => "Ошибка",
+            JobStatus::NoWork => "Нет работы",
         }
     }
 }
@@ -537,10 +543,23 @@ pub fn execute_batch(
         plan.out_root.display()
     )));
     if plan.files.is_empty() {
-        let report = BatchReport { files: Vec::new() };
+        // Пустой пакет — не «успешный синтез»: отдельный статус NoWork.
+        let cancelled = cancel.load(Ordering::SeqCst);
+        let report = BatchReport {
+            files: Vec::new(),
+            conflicts: plan.conflicts.clone(),
+            cancelled,
+        };
         return JobResult {
-            status: JobStatus::Completed,
-            summary: format!("{}; файлов .txt/.md/.log не найдено", report.summary()),
+            status: if cancelled {
+                JobStatus::Cancelled
+            } else {
+                JobStatus::NoWork
+            },
+            summary: format!(
+                "{}; файлов .txt/.md/.log не найдено — синтез не выполнялся",
+                report.summary()
+            ),
             final_path: None,
             partial_path: None,
             diag_path: None,
@@ -652,6 +671,16 @@ pub fn execute_batch(
                     rep.status = FileStatus::Failed;
                     rep.reason = Some(res.summary);
                 }
+                // для одного файла эти статусы не возникают; не маскируем
+                // неожиданное состояние под успех
+                JobStatus::Partial => {
+                    rep.status = FileStatus::Failed;
+                    rep.reason = Some(format!("частичный результат: {}", res.summary));
+                }
+                JobStatus::NoWork => {
+                    rep.status = FileStatus::Skipped;
+                    rep.reason = Some(res.summary);
+                }
             }
             rep
         },
@@ -659,8 +688,10 @@ pub fn execute_batch(
 
     let status = match report.status() {
         BatchStatus::Completed => JobStatus::Completed,
+        BatchStatus::Partial => JobStatus::Partial,
         BatchStatus::Cancelled => JobStatus::Cancelled,
         BatchStatus::Failed => JobStatus::Failed,
+        BatchStatus::NoWork => JobStatus::NoWork,
     };
     let mut summary = report.summary();
     summary.push_str(&format!("; {:.1} с", t0.elapsed().as_secs_f32()));
@@ -1091,6 +1122,70 @@ mod tests {
         assert_eq!(std::fs::read(&cfg.out_path).unwrap(), b"keep");
     }
 
+    /// Пустой пакет: не «Завершено», а NoWork — синтез не выполнялся.
+    #[test]
+    fn empty_batch_is_no_work() {
+        let d = tmpdir("empty_batch");
+        let src = d.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let s = GuiSettings {
+            out_dir: d.join("out").display().to_string(),
+            ..Default::default()
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let res = execute_batch(&s, &src, &cancel, &|_| {});
+        assert_eq!(res.status, JobStatus::NoWork, "{}", res.summary);
+        assert!(res.summary.contains("не найдено"), "{}", res.summary);
+        assert!(res.summary.contains("НЕЧЕГО ДЕЛАТЬ"), "{}", res.summary);
+        assert_eq!(res.batch.expect("отчёт").total(), 0);
+    }
+
+    /// Все файлы пропущены (результаты уже есть): тоже NoWork, без
+    /// полноценного «успешного синтеза».
+    #[test]
+    fn all_skipped_batch_is_no_work() {
+        let d = tmpdir("skipped_batch");
+        let src = d.join("src");
+        let out = d.join("out");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(src.join("a.txt"), "Текст.").unwrap();
+        std::fs::write(out.join("a.wav"), b"keep").unwrap();
+        let s = GuiSettings {
+            out_dir: out.display().to_string(),
+            ..Default::default()
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let res = execute_batch(&s, &src, &cancel, &|_| {});
+        assert_eq!(res.status, JobStatus::NoWork, "{}", res.summary);
+        assert!(res.summary.contains("НЕЧЕГО ДЕЛАТЬ"), "{}", res.summary);
+        let report = res.batch.expect("отчёт");
+        assert_eq!(report.skipped(), 1);
+        assert_eq!(report.completed(), 0);
+        assert_eq!(std::fs::read(out.join("a.wav")).unwrap(), b"keep");
+    }
+
+    /// Отмена до первого файла через execute_batch — общий статус Cancelled.
+    #[test]
+    fn cancel_before_first_batch_file_is_cancelled() {
+        let d = tmpdir("cancel_batch");
+        let src = d.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.txt"), "Текст.").unwrap();
+        std::fs::write(src.join("b.txt"), "Текст.").unwrap();
+        let s = GuiSettings {
+            out_dir: d.join("out").display().to_string(),
+            ..Default::default()
+        };
+        let cancel = Arc::new(AtomicBool::new(true));
+        let res = execute_batch(&s, &src, &cancel, &|_| {});
+        assert_eq!(res.status, JobStatus::Cancelled, "{}", res.summary);
+        assert!(res.summary.contains("ОТМЕНЕНО"), "{}", res.summary);
+        let report = res.batch.expect("отчёт");
+        assert!(report.cancelled);
+        assert_eq!(report.skipped(), 2);
+    }
+
     // ============ реальные прогоны (нужны модели + ORT DLL + ffmpeg) ============
     // Запускать ПО ОДНОМУ устройству на процесс (ORT грузится в процесс
     // один раз; смена CPU/CUDA внутри процесса невозможна — честная ошибка):
@@ -1193,7 +1288,9 @@ mod tests {
             eprintln!("  {line}");
         }
 
-        assert_eq!(res.status, JobStatus::Completed, "{}", res.summary);
+        // 3 готово + 1 ошибка + 1 пропущено = частичный успех, не Completed
+        assert_eq!(res.status, JobStatus::Partial, "{}", res.summary);
+        assert!(res.summary.contains("ЧАСТИЧНЫЙ УСПЕХ"), "{}", res.summary);
         let report = res.batch.expect("пакетный отчёт");
         assert_eq!(report.total(), 5, "{}", report.summary());
         assert_eq!(report.completed(), 3, "{}", report.summary());

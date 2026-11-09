@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crate::job::JobEvent;
+use crate::job::{JobEvent, JobStatus};
 use crate::settings::{
     load_settings, save_settings, settings_path, DeviceChoice, GuiSettings, ModelChoice,
     OutputFormatChoice,
@@ -191,12 +191,22 @@ impl ShtormApp {
                 total,
                 report,
             } => {
+                // K/N обновляется на КАЖДОМ завершённом файле, включая
+                // Failed/Skipped, — иначе прогресс пакета «замирает».
+                self.file_progress = (index, total);
+                self.progress = (report.chunks_done, report.chunks_total);
                 self.status = format!("файл {index}/{total}: {}", report.status.label());
                 self.push_log(&report.line());
             }
             JobEvent::Log(line) => self.push_log(&line),
             JobEvent::Finished(res) => {
-                self.status = format!("{} — {}", res.status.label(), res.summary);
+                let warn = matches!(res.status, JobStatus::Partial | JobStatus::NoWork);
+                self.status = format!(
+                    "{}{} — {}",
+                    if warn { "⚠ " } else { "" },
+                    res.status.label(),
+                    res.summary
+                );
                 self.push_log(&res.summary);
             }
         }
@@ -929,5 +939,67 @@ mod tests {
         });
         assert!(app.status.contains("файл 2/5"), "{}", app.status);
         assert!(app.log.contains("sub/a.txt") && app.log.contains("sub/a.wav"));
+    }
+
+    /// G3.1: K/N обновляется на Failed/Skipped, а частичный успех и пустой
+    /// пакет явно предупреждают пользователя.
+    #[test]
+    fn batch_failed_skipped_and_partial_states() {
+        let mut app = ShtormApp::new();
+        app.batch_running = true;
+        let file = crate::batch::BatchFile {
+            input: PathBuf::from("C:/src/b.txt"),
+            relative: PathBuf::from("b.txt"),
+        };
+        let mut failed = crate::batch::FileReport::failed(&file, None, "мок-сбой");
+        failed.chunks_done = 1;
+        failed.chunks_total = 3;
+        app.apply_event(crate::job::JobEvent::FileDone {
+            index: 2,
+            total: 5,
+            report: Box::new(failed),
+        });
+        assert_eq!(app.file_progress, (2, 5), "K/N обновился на Failed");
+        assert_eq!(app.progress, (1, 3));
+        assert!(app.status.contains("ошибка"), "{}", app.status);
+
+        let skipped = crate::batch::FileReport::skipped(&file, None, "конфликт");
+        app.apply_event(crate::job::JobEvent::FileDone {
+            index: 3,
+            total: 5,
+            report: Box::new(skipped),
+        });
+        assert_eq!(app.file_progress, (3, 5), "K/N обновился на Skipped");
+
+        app.apply_event(crate::job::JobEvent::Finished(Box::new(
+            crate::job::JobResult {
+                status: JobStatus::Partial,
+                summary: "ПАКЕТ: готово 1 | ошибок 1 | ЧАСТИЧНЫЙ УСПЕХ".into(),
+                final_path: None,
+                partial_path: None,
+                diag_path: None,
+                chunk_log_path: None,
+                rtf: None,
+                progress: (5, 5),
+                batch: None,
+            },
+        )));
+        assert!(app.status.starts_with("⚠ Частично"), "{}", app.status);
+        assert!(app.log.contains("ЧАСТИЧНЫЙ УСПЕХ"));
+
+        app.apply_event(crate::job::JobEvent::Finished(Box::new(
+            crate::job::JobResult {
+                status: JobStatus::NoWork,
+                summary: "ПАКЕТ: НЕЧЕГО ДЕЛАТЬ".into(),
+                final_path: None,
+                partial_path: None,
+                diag_path: None,
+                chunk_log_path: None,
+                rtf: None,
+                progress: (0, 0),
+                batch: None,
+            },
+        )));
+        assert!(app.status.starts_with("⚠ Нет работы"), "{}", app.status);
     }
 }

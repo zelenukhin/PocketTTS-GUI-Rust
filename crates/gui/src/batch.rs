@@ -12,6 +12,7 @@
 //! поэтому вся логика планирования/отчёта тестируется на моках.
 
 use anyhow::{bail, Context, Result};
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -25,6 +26,15 @@ pub struct BatchFile {
     pub relative: PathBuf,
 }
 
+/// Коллизия выходных имён: несколько входов дают один и тот же результат
+/// (`chapter.txt` + `chapter.md` → `chapter.<ext>`), в том числе совпадение
+/// без учёта регистра (Windows). `output` — путь без расширения результата.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputConflict {
+    pub output: PathBuf,
+    pub inputs: Vec<PathBuf>,
+}
+
 /// Снимок пакетного задания: список файлов зафиксирован до начала генерации.
 #[derive(Debug, Clone)]
 pub struct BatchPlan {
@@ -32,6 +42,8 @@ pub struct BatchPlan {
     pub out_root: PathBuf,
     pub files: Vec<BatchFile>,
     pub warnings: Vec<String>,
+    /// Конфликты имён обнаружены ДО генерации; такие файлы не синтезируются.
+    pub conflicts: Vec<OutputConflict>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,17 +143,34 @@ impl FileReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchStatus {
     Completed,
+    /// Есть и успешные файлы, и ошибки — полноценным успехом это не считается.
+    Partial,
     Failed,
     Cancelled,
+    /// Нечего синтезировать: пустой план или все файлы пропущены.
+    NoWork,
 }
 
 /// Итоговый отчёт пакета: все файлы + агрегированные счётчики.
 #[derive(Debug, Clone)]
 pub struct BatchReport {
     pub files: Vec<FileReport>,
+    /// Конфликты имён, обнаруженные при построении плана.
+    pub conflicts: Vec<OutputConflict>,
+    /// Пользователь отменил пакет (флаг НЕ выводится из статусов файлов:
+    /// отмена может совпасть с ошибкой текущего файла или произойти до старта).
+    pub cancelled: bool,
 }
 
 impl BatchReport {
+    pub fn empty() -> Self {
+        Self {
+            files: Vec::new(),
+            conflicts: Vec::new(),
+            cancelled: false,
+        }
+    }
+
     pub fn total(&self) -> usize {
         self.files.len()
     }
@@ -162,15 +191,28 @@ impl BatchReport {
         self.count(FileStatus::Skipped)
     }
 
-    pub fn cancelled(&self) -> bool {
-        self.files.iter().any(|f| f.status == FileStatus::Cancelled)
+    /// Отмена пакета: явный флаг ИЛИ файл, сообщивший Cancelled. Ошибка
+    /// текущего файла сама по себе отмену не отменяет.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled || self.count(FileStatus::Cancelled) > 0
     }
 
     pub fn status(&self) -> BatchStatus {
-        if self.cancelled() {
-            BatchStatus::Cancelled
-        } else if self.completed() == 0 && self.failed() > 0 {
-            BatchStatus::Failed
+        if self.is_cancelled() {
+            return BatchStatus::Cancelled;
+        }
+        if self.total() == 0 {
+            return BatchStatus::NoWork;
+        }
+        if self.completed() == 0 {
+            return if self.failed() > 0 {
+                BatchStatus::Failed
+            } else {
+                BatchStatus::NoWork
+            };
+        }
+        if self.failed() > 0 {
+            BatchStatus::Partial
         } else {
             BatchStatus::Completed
         }
@@ -184,8 +226,15 @@ impl BatchReport {
             self.skipped(),
             self.total()
         );
-        if self.cancelled() {
-            s.push_str(" | ОТМЕНЕНО");
+        if !self.conflicts.is_empty() {
+            s.push_str(&format!(" | конфликтов имён: {}", self.conflicts.len()));
+        }
+        match self.status() {
+            BatchStatus::Cancelled => s.push_str(" | ОТМЕНЕНО"),
+            BatchStatus::Partial => s.push_str(" | ЧАСТИЧНЫЙ УСПЕХ — есть ошибки"),
+            BatchStatus::NoWork => s.push_str(" | НЕЧЕГО ДЕЛАТЬ — синтез не выполнялся"),
+            BatchStatus::Failed => s.push_str(" | ОШИБКА — ни один файл не готов"),
+            BatchStatus::Completed => {}
         }
         s
     }
@@ -278,6 +327,98 @@ fn same_path(a: &Path, b: &Path) -> bool {
     norm_str(a) == norm_str(b)
 }
 
+// ===== физическая проверка путей (G3.1) =====
+// Лексической нормализации недостаточно: symlink/junction/reparse point может
+// направить запись за пределы выбранного каталога. Политика — отказ, а не
+// автоматическое следование по такой точке.
+
+#[cfg(windows)]
+fn is_reparse_metadata(md: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_metadata(md: &std::fs::Metadata) -> bool {
+    md.file_type().is_symlink()
+}
+
+/// Проверить сам компонент, не переходя по ссылке.
+fn is_reparse_point(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|md| is_reparse_metadata(&md))
+        .unwrap_or(false)
+}
+
+/// Отказ, если любой существующий компонент пути — ссылка/точка
+/// перенаправления. Проверяются все предки (включая сам путь, если существует).
+pub fn ensure_no_reparse_components(path: &Path) -> Result<()> {
+    let abs = absolute_lexical(path);
+    let mut chain: Vec<&Path> = abs.ancestors().collect();
+    chain.reverse();
+    for anc in chain {
+        if anc.as_os_str().is_empty() {
+            continue;
+        }
+        match std::fs::symlink_metadata(anc) {
+            Ok(md) => {
+                if is_reparse_metadata(&md) {
+                    bail!(
+                        "путь проходит через ссылку/точку перенаправления (reparse point): {} — укажите физический каталог",
+                        anc.display()
+                    );
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // дальнейшие компоненты тоже не существуют
+            }
+            Err(e) => bail!("проверить компонент пути {}: {e}", anc.display()),
+        }
+    }
+    Ok(())
+}
+
+/// Физический путь: разрешает существующий префикс (canonicalize), а
+/// несуществующий хвост добавляет лексически. Нужен для сравнения путей,
+/// скрытых за альтернативными именами/junction.
+pub fn physical_path(path: &Path) -> PathBuf {
+    let abs = absolute_lexical(path);
+    for anc in abs.ancestors() {
+        if let Ok(canon) = std::fs::canonicalize(anc) {
+            let rest = abs.strip_prefix(anc).unwrap_or_else(|_| Path::new(""));
+            return lexical_normalize(&canon.join(rest));
+        }
+    }
+    abs
+}
+
+fn physical_components(path: &Path) -> Vec<String> {
+    physical_path(path)
+        .components()
+        .map(|c| {
+            let s = c.as_os_str().to_string_lossy().to_string();
+            if cfg!(windows) {
+                s.to_ascii_lowercase()
+            } else {
+                s
+            }
+        })
+        .collect()
+}
+
+/// `child` физически равен `root` или лежит внутри него (component-wise,
+/// без опоры только на строковый starts_with лексического пути).
+pub fn physically_under(child: &Path, root: &Path) -> bool {
+    let c = physical_components(child);
+    let r = physical_components(root);
+    !r.is_empty() && c.len() >= r.len() && c[..r.len()] == r[..]
+}
+
+pub fn physically_same(a: &Path, b: &Path) -> bool {
+    physical_components(a) == physical_components(b)
+}
+
 fn has_batch_extension(name: &std::ffi::OsStr) -> bool {
     Path::new(name)
         .extension()
@@ -285,19 +426,53 @@ fn has_batch_extension(name: &std::ffi::OsStr) -> bool {
         .is_some_and(|e| BATCH_EXTENSIONS.iter().any(|x| e.eq_ignore_ascii_case(x)))
 }
 
+/// Путь результата без расширения: `<out_root>/<относительный каталог>/<stem>`.
+/// Нужен для обнаружения конфликтов имён ДО генерации (расширение одинаково
+/// для всех файлов текущего запуска).
+fn output_stem_path(out_root: &Path, relative: &Path) -> PathBuf {
+    let stem = relative
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "output".into());
+    let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+    out_root.join(parent).join(stem)
+}
+
+fn find_conflicts(out_root: &Path, files: &[BatchFile]) -> Vec<OutputConflict> {
+    let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (i, f) in files.iter().enumerate() {
+        // norm_str приводит к абсолютному виду и нижнему регистру на Windows —
+        // `chapter.txt` и `CHAPTER.md` попадают в одну группу.
+        let key = norm_str(&output_stem_path(out_root, &f.relative));
+        groups.entry(key).or_default().push(i);
+    }
+    let mut conflicts = Vec::new();
+    for idxs in groups.values().filter(|v| v.len() > 1) {
+        let output = output_stem_path(out_root, &files[idxs[0]].relative);
+        let inputs = idxs.iter().map(|&i| files[i].input.clone()).collect();
+        conflicts.push(OutputConflict { output, inputs });
+    }
+    conflicts
+}
+
 /// Построить план: один файл или рекурсивный обход каталога.
 ///
 /// Список фиксируется здесь и больше не перечитывается; порядок стабилен
-/// (относительный путь без учёта регистра, затем точный).
+/// (относительный путь без учёта регистра, затем точный). Конфликты выходных
+/// имён обнаруживаются на этом же шаге — до первого синтеза.
 pub fn plan_batch(source: &Path, out_root: &Path) -> Result<BatchPlan> {
     let meta = std::fs::symlink_metadata(source)
         .with_context(|| format!("источник не найден: {}", source.display()))?;
-    if meta.file_type().is_symlink() {
+    if is_reparse_metadata(&meta) {
         bail!(
-            "источник — символическая ссылка (не поддерживается): {}",
+            "источник — ссылка/точка перенаправления (reparse point), не поддерживается: {}",
             source.display()
         );
     }
+    // Выходная папка не должна проходить через symlink/junction: иначе
+    // лексическая проверка «внутри out_root» ничего не гарантирует.
+    ensure_no_reparse_components(out_root)?;
     let mut warnings = Vec::new();
     let (source_root, mut files) = if meta.is_file() {
         if !has_batch_extension(source.file_name().unwrap_or_default()) {
@@ -323,18 +498,20 @@ pub fn plan_batch(source: &Path, out_root: &Path) -> Result<BatchPlan> {
         let root = source.to_path_buf();
         let root_abs = absolute_lexical(&root);
         let out_abs = absolute_lexical(out_root);
-        if same_path(&out_abs, &root_abs) {
+        // not only textual equality: the same directory can be reached via
+        // symlink/junction/alternative spelling.
+        if same_path(&out_abs, &root_abs) || physically_same(out_root, &root) {
             bail!(
-                "выходная папка совпадает с исходной — выберите другую папку результата: {}",
+                "выходная папка физически совпадает с исходной (в т.ч. через ссылку/альтернативный путь) — выберите другую папку результата: {}",
                 out_root.display()
             );
         }
         // Строгое исключение выходной папки нужно ТОЛЬКО когда она внутри
         // источника. Если выход — предок источника, исключать нельзя.
-        let exclude_out = is_under(&out_abs, &root_abs);
+        let exclude_out = is_under(&out_abs, &root_abs) || physically_under(out_root, &root);
         (
             root,
-            collect_files(source, &out_abs, exclude_out, &mut warnings)?,
+            collect_files(source, &out_abs, out_root, exclude_out, &mut warnings)?,
         )
     } else {
         bail!("источник не файл и не каталог: {}", source.display());
@@ -346,22 +523,46 @@ pub fn plan_batch(source: &Path, out_root: &Path) -> Result<BatchPlan> {
         ka.cmp(&kb).then_with(|| a.relative.cmp(&b.relative))
     });
 
+    let conflicts = find_conflicts(out_root, &files);
+    for c in &conflicts {
+        let names = c
+            .inputs
+            .iter()
+            .map(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| p.display().to_string())
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let out_name = c
+            .output
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| c.output.display().to_string());
+        warnings.push(format!(
+            "КОНФЛИКТ выходных имён: {names} → {out_name}.<формат> — синтез этих файлов не запускается"
+        ));
+    }
+
     Ok(BatchPlan {
         source_root,
         out_root: out_root.to_path_buf(),
         files,
         warnings,
+        conflicts,
     })
 }
 
 fn collect_files(
     root: &Path,
     out_abs: &Path,
+    out_root: &Path,
     exclude_out: bool,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<BatchFile>> {
     let mut files = Vec::new();
-    // DFS без рекурсии; каталоги-ссылки не раскрываются.
+    // DFS без рекурсии; каталоги-ссылки/точки перенаправления не раскрываются.
     let mut stack: Vec<(PathBuf, PathBuf)> = vec![(root.to_path_buf(), PathBuf::new())];
     while let Some((dir, rel)) = stack.pop() {
         let rd = match std::fs::read_dir(&dir) {
@@ -389,17 +590,20 @@ fn collect_files(
                     continue;
                 }
             };
-            if ft.is_symlink() {
+            let child = entry.path();
+            if is_reparse_point(&child) {
                 warnings.push(format!(
-                    "символическая ссылка пропущена: {}",
-                    entry.path().display()
+                    "ссылка/точка перенаправления пропущена: {}",
+                    child.display()
                 ));
                 continue;
             }
-            let child = entry.path();
             let child_rel = rel.join(entry.file_name());
             if ft.is_dir() {
-                if exclude_out && is_under(&child, out_abs) {
+                // Физическое сравнение ловит выходную папку, заданную через
+                // альтернативный путь (source — alias, out — реальный путь).
+                if exclude_out && (is_under(&child, out_abs) || physically_under(&child, out_root))
+                {
                     continue;
                 }
                 stack.push((child, child_rel));
@@ -446,7 +650,18 @@ pub fn output_path_for(out_root: &Path, relative: &Path, ext: &str) -> Result<Pa
             out.display()
         );
     }
+    // Даже при лексически корректном пути существующий компонент может быть
+    // ссылкой/точкой перенаправления — запись по такому пути запрещена.
+    ensure_no_reparse_components(&out)?;
     Ok(out)
+}
+
+fn conflict_path_with_ext(stem_path: &Path, ext: &str) -> PathBuf {
+    let name = stem_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "output".into());
+    stem_path.with_file_name(format!("{name}.{ext}"))
 }
 
 /// Прогнать план. `synth` инжектируется (в GUI — реальный `execute_job`,
@@ -471,12 +686,62 @@ where
         emit(BatchEvent::Log(format!("ВНИМАНИЕ: {w}")));
     }
 
+    let mut conflict_by_key: BTreeMap<String, usize> = BTreeMap::new();
+    for (i, c) in plan.conflicts.iter().enumerate() {
+        conflict_by_key.insert(norm_str(&c.output), i);
+    }
+    // Точные пути конфликтов сообщаем ДО первого синтеза.
+    for c in &plan.conflicts {
+        let out = conflict_path_with_ext(&c.output, extension);
+        let names = c
+            .inputs
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        emit(BatchEvent::Log(format!(
+            "КОНФЛИКТ ВЫХОДНЫХ ИМЁН: {names} → {} — синтез не запускается",
+            out.display()
+        )));
+    }
+
     let mut reports = Vec::with_capacity(total);
     let mut stopped = false;
     for (idx, file) in plan.files.iter().enumerate() {
         if stopped || cancel.load(Ordering::SeqCst) {
+            stopped = true;
             let out = output_path_for(&plan.out_root, &file.relative, extension).ok();
             let r = FileReport::skipped(file, out, "отменено до запуска");
+            emit(BatchEvent::FileFinished {
+                index: idx + 1,
+                total,
+                report: Box::new(r.clone()),
+            });
+            reports.push(r);
+            continue;
+        }
+        // Конфликт имён обнаружен ещё в плане: не синтезируем и не
+        // переименовываем молча — файл пропускается с явной причиной.
+        if let Some(ci) =
+            conflict_by_key.get(&norm_str(&output_stem_path(&plan.out_root, &file.relative)))
+        {
+            let c = &plan.conflicts[*ci];
+            let conflict_out = conflict_path_with_ext(&c.output, extension);
+            let names = c
+                .inputs
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let out = output_path_for(&plan.out_root, &file.relative, extension).ok();
+            let r = FileReport::skipped(
+                file,
+                out,
+                format!(
+                    "конфликт выходных имён: {names} → {} — синтез не запускался",
+                    conflict_out.display()
+                ),
+            );
             emit(BatchEvent::FileFinished {
                 index: idx + 1,
                 total,
@@ -539,7 +804,18 @@ where
         }
     }
 
-    BatchReport { files: reports }
+    BatchReport {
+        files: reports,
+        conflicts: plan
+            .conflicts
+            .iter()
+            .map(|c| OutputConflict {
+                output: conflict_path_with_ext(&c.output, extension),
+                inputs: c.inputs.clone(),
+            })
+            .collect(),
+        cancelled: stopped,
+    }
 }
 
 #[cfg(test)]
@@ -705,7 +981,13 @@ mod tests {
         assert_eq!(report.completed(), 2);
         assert_eq!(report.failed(), 1);
         assert_eq!(report.skipped(), 0);
-        assert_eq!(report.status(), BatchStatus::Completed);
+        // часть файлов готова, часть — с ошибками: это не полный успех
+        assert_eq!(report.status(), BatchStatus::Partial);
+        assert!(
+            report.summary().contains("ЧАСТИЧНЫЙ УСПЕХ"),
+            "{}",
+            report.summary()
+        );
         let bad = report
             .files
             .iter()
@@ -768,6 +1050,8 @@ mod tests {
         });
         assert_eq!(r1.completed(), 1);
         assert_eq!(r1.skipped(), 1);
+        assert_eq!(r1.status(), BatchStatus::Cancelled);
+        assert!(r1.cancelled, "отмена после готового файла сохранена");
         assert!(out.join("a.wav").is_file());
 
         // повторный прогон: a пропущен (результат есть), b доделан
@@ -811,6 +1095,318 @@ mod tests {
         assert!(plan
             .warnings
             .iter()
-            .any(|w| w.contains("символическая ссылка")));
+            .any(|w| w.contains("ссылка/точка перенаправления пропущена")));
+    }
+
+    // ===== G3.1: отмена пакета (4 сценария) =====
+
+    #[test]
+    fn cancel_before_first_file_is_cancelled() {
+        let d = tmpdir("cancel_first");
+        let src = d.join("src");
+        write(&src.join("a.txt"), b"a");
+        write(&src.join("b.txt"), b"b");
+        let plan = plan_batch(&src, &d.join("out")).unwrap();
+        let cancel = AtomicBool::new(true);
+        let mut called = 0usize;
+        let report = run_batch(&plan, "wav", &cancel, &|_| {}, |file, o, c, p| {
+            called += 1;
+            mock_ok(file, o, c, p)
+        });
+        assert_eq!(called, 0, "ни один файл не запускается");
+        assert_eq!(report.skipped(), 2);
+        assert_eq!(report.status(), BatchStatus::Cancelled);
+        assert!(report.cancelled);
+        assert!(report.summary().contains("ОТМЕНЕНО"));
+        assert!(report
+            .files
+            .iter()
+            .all(|f| f.reason.as_deref() == Some("отменено до запуска")));
+    }
+
+    #[test]
+    fn cancel_after_one_completed_file_is_cancelled() {
+        let d = tmpdir("cancel_after_ok");
+        let src = d.join("src");
+        write(&src.join("a.txt"), b"a");
+        write(&src.join("b.txt"), b"b");
+        write(&src.join("c.txt"), b"c");
+        let plan = plan_batch(&src, &d.join("out")).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut calls = Vec::new();
+        let report = run_batch(&plan, "wav", &cancel, &|_| {}, |file, o, c, p| {
+            calls.push(file.relative.clone());
+            let r = mock_ok(file, o, c, p);
+            // «Стоп» после первого успешного файла
+            c.store(true, Ordering::SeqCst);
+            r
+        });
+        assert_eq!(calls, vec![PathBuf::from("a.txt")]);
+        assert_eq!(report.completed(), 1);
+        assert_eq!(report.skipped(), 2);
+        assert_eq!(report.status(), BatchStatus::Cancelled);
+        assert!(report.cancelled);
+    }
+
+    #[test]
+    fn cancel_concurrent_with_current_file_error_is_cancelled() {
+        let d = tmpdir("cancel_error");
+        let src = d.join("src");
+        write(&src.join("a.txt"), b"a");
+        write(&src.join("b.txt"), b"b");
+        let plan = plan_batch(&src, &d.join("out")).unwrap();
+        let cancel = AtomicBool::new(false);
+        let report = run_batch(&plan, "wav", &cancel, &|_| {}, |file, o, c, _p| {
+            // «Стоп» пришёл одновременно с ошибкой файла
+            c.store(true, Ordering::SeqCst);
+            FileReport::failed(file, Some(o.to_path_buf()), "мок-сбой")
+        });
+        assert_eq!(report.failed(), 1);
+        assert_eq!(report.skipped(), 1);
+        assert_eq!(report.status(), BatchStatus::Cancelled);
+        assert!(report.cancelled, "ошибка не маскирует факт отмены");
+    }
+
+    #[test]
+    fn cancel_before_next_file_is_cancelled() {
+        let d = tmpdir("cancel_next");
+        let src = d.join("src");
+        write(&src.join("a.txt"), b"a");
+        write(&src.join("b.txt"), b"b");
+        let plan = plan_batch(&src, &d.join("out")).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut calls = 0usize;
+        let report = run_batch(&plan, "wav", &cancel, &|_| {}, |file, o, c, p| {
+            calls += 1;
+            // отмена устанавливается ПОСЛЕ завершения файла, до проверки
+            // следующего — следующий не должен стартовать
+            let r = mock_ok(file, o, c, p);
+            c.store(true, Ordering::SeqCst);
+            r
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(report.completed(), 1);
+        assert_eq!(report.skipped(), 1);
+        assert_eq!(report.status(), BatchStatus::Cancelled);
+    }
+
+    // ===== G3.1: конфликты выходных имён =====
+
+    #[test]
+    fn stem_conflict_is_detected_before_generation_and_skipped() {
+        let d = tmpdir("conflict_stem");
+        let src = d.join("src");
+        write(&src.join("chapter.txt"), b"a");
+        write(&src.join("chapter.md"), b"b");
+        let plan = plan_batch(&src, &d.join("out")).unwrap();
+        assert_eq!(plan.conflicts.len(), 1);
+        assert_eq!(plan.conflicts[0].inputs.len(), 2);
+        assert!(plan
+            .warnings
+            .iter()
+            .any(|w| w.contains("КОНФЛИКТ выходных имён")));
+
+        let cancel = AtomicBool::new(false);
+        let mut called = 0usize;
+        let report = run_batch(&plan, "wav", &cancel, &|_| {}, |file, o, c, p| {
+            called += 1;
+            mock_ok(file, o, c, p)
+        });
+        assert_eq!(called, 0, "конфликтующие файлы не синтезируются");
+        assert_eq!(report.skipped(), 2);
+        assert_eq!(report.status(), BatchStatus::NoWork);
+        assert_eq!(report.conflicts.len(), 1);
+        assert!(report.conflicts[0].output.ends_with("chapter.wav"));
+        assert!(report.files.iter().all(|f| f
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("конфликт выходных имён")));
+    }
+
+    #[test]
+    fn conflict_is_case_insensitive_on_windows() {
+        let d = tmpdir("conflict_case");
+        let src = d.join("src");
+        write(&src.join("Chapter.txt"), b"a");
+        write(&src.join("chapter.md"), b"b");
+        let plan = plan_batch(&src, &d.join("out")).unwrap();
+        assert_eq!(plan.conflicts.len(), 1, "регистр не создаёт разные имена");
+        assert_eq!(plan.conflicts[0].inputs.len(), 2);
+        let report = run_batch(
+            &plan,
+            "wav",
+            &AtomicBool::new(false),
+            &|_| {},
+            |f, o, c, p| mock_ok(f, o, c, p),
+        );
+        assert_eq!(report.skipped(), 2);
+        assert_eq!(report.completed(), 0);
+    }
+
+    #[test]
+    fn conflict_with_existing_output_does_not_overwrite() {
+        let d = tmpdir("conflict_existing");
+        let src = d.join("src");
+        let out = d.join("out");
+        write(&src.join("a.txt"), b"one");
+        write(&src.join("a.md"), b"two");
+        write(&out.join("a.wav"), b"keep");
+        let plan = plan_batch(&src, &out).unwrap();
+        let report = run_batch(
+            &plan,
+            "wav",
+            &AtomicBool::new(false),
+            &|_| {},
+            |f, o, c, p| mock_ok(f, o, c, p),
+        );
+        assert_eq!(report.skipped(), 2);
+        assert_eq!(report.completed(), 0);
+        assert_eq!(std::fs::read(out.join("a.wav")).unwrap(), b"keep");
+        assert!(report
+            .files
+            .iter()
+            .all(|f| f.reason.as_deref().unwrap().contains("конфликт")));
+    }
+
+    #[test]
+    fn empty_and_all_skipped_are_no_work() {
+        let empty = BatchReport::empty();
+        assert_eq!(empty.status(), BatchStatus::NoWork);
+        assert!(empty.summary().contains("НЕЧЕГО ДЕЛАТЬ"));
+
+        let d = tmpdir("all_skipped");
+        let src = d.join("src");
+        let out = d.join("out");
+        write(&src.join("a.txt"), b"a");
+        write(&out.join("a.wav"), b"already");
+        let plan = plan_batch(&src, &out).unwrap();
+        let report = run_batch(
+            &plan,
+            "wav",
+            &AtomicBool::new(false),
+            &|_| {},
+            |f, o, c, p| mock_ok(f, o, c, p),
+        );
+        assert_eq!(report.skipped(), 1);
+        assert_eq!(report.status(), BatchStatus::NoWork);
+        assert!(report.summary().contains("НЕЧЕГО ДЕЛАТЬ"));
+    }
+
+    // ===== G3.1: физическая безопасность путей =====
+
+    #[cfg(windows)]
+    fn make_junction(target: &Path, link: &Path) -> bool {
+        std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn output_path_rejects_junction_component() {
+        let d = tmpdir("junction_out");
+        let real = d.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = d.join("link");
+        if !make_junction(&real, &link) {
+            eprintln!("SKIP output_path_rejects_junction_component: нет прав на junction");
+            return;
+        }
+        let err = output_path_for(&link.join("out"), Path::new("a.txt"), "wav").unwrap_err();
+        assert!(format!("{err:#}").contains("перенаправления"), "{err:#}");
+        let src = d.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let err = plan_batch(&src, &link).unwrap_err();
+        assert!(format!("{err:#}").contains("перенаправления"), "{err:#}");
+        assert!(
+            !link.join("out").exists(),
+            "по junction ничего не создаётся"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn source_junction_is_rejected() {
+        let d = tmpdir("junction_src");
+        let real = d.join("real");
+        let src = real.join("sub");
+        std::fs::create_dir_all(&src).unwrap();
+        write(&src.join("a.txt"), b"a");
+        let link = d.join("alias");
+        if !make_junction(&real, &link) {
+            eprintln!("SKIP source_junction_is_rejected: нет прав на junction");
+            return;
+        }
+        let err = plan_batch(&link, &d.join("out")).unwrap_err();
+        assert!(format!("{err:#}").contains("перенаправления"), "{err:#}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn physical_overlap_via_junction_is_detected() {
+        let d = tmpdir("junction_overlap");
+        let real = d.join("real");
+        let src = real.join("sub");
+        write(&src.join("a.txt"), b"a");
+        write(&src.join("out").join("old.txt"), b"old");
+        let alias = d.join("alias");
+        if !make_junction(&real, &alias) {
+            eprintln!("SKIP physical_overlap_via_junction_is_detected: нет прав на junction");
+            return;
+        }
+        // источник — через alias, выход — через реальный путь; лексически
+        // пути не связаны, физически out находится внутри source
+        let plan = plan_batch(&alias.join("sub"), &src.join("out")).unwrap();
+        let rels: Vec<String> = plan
+            .files
+            .iter()
+            .map(|f| f.relative.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(rels, vec!["a.txt"], "{rels:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn physical_equality_via_junction_is_error() {
+        let d = tmpdir("junction_equal");
+        let real = d.join("real");
+        let src = real.join("sub");
+        write(&src.join("a.txt"), b"a");
+        let alias = d.join("alias");
+        if !make_junction(&real, &alias) {
+            eprintln!("SKIP physical_equality_via_junction_is_error: нет прав на junction");
+            return;
+        }
+        let err = plan_batch(&alias.join("sub"), &src).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("физически совпадает"),
+            "{err:#}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn existing_output_symlink_is_rejected() {
+        use std::os::windows::fs::symlink_file;
+        let d = tmpdir("out_symlink");
+        let out = d.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let target = d.join("target.wav");
+        std::fs::write(&target, b"target").unwrap();
+        let link = out.join("a.wav");
+        if symlink_file(&target, &link).is_err() {
+            eprintln!("SKIP existing_output_symlink_is_rejected: нет прав на symlink");
+            return;
+        }
+        let err = output_path_for(&out, Path::new("a.txt"), "wav").unwrap_err();
+        assert!(format!("{err:#}").contains("перенаправления"), "{err:#}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"target");
     }
 }
