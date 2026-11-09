@@ -10,7 +10,7 @@
 //! - при отмене/ошибке `.partial` остаётся и его путь сообщается вызывающему;
 //! - рекурсивных удалений нет.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -71,49 +71,58 @@ impl AudioSink for WavSink {
     }
 }
 
-/// Аргументы энкодера FFmpeg — 1:1 с Python GUI `_encoder_args`:
-/// MP3: -V0..-V4 -> libmp3lame -q:a N; «192k/128k» -> -b:a; Opus: «opus 96k»
-/// -> libopus -b:a 96k (не-опус пресет для OPUS — фолбэк 96k, как в GUI).
-pub fn encoder_args(format: OutputFormat, preset: &str) -> Vec<String> {
+/// Аргументы энкодера FFmpeg — 1:1 с Python GUI `_encoder_args`, но пресет
+/// обязан соответствовать формату: MP3 — `-V0..-V9` или `NNNk`; Opus —
+/// `opus NNk`. Несовместимый пресет — явная ошибка (никакого тихого фолбэка
+/// 96k/качества по умолчанию, дефект G2).
+pub fn encoder_args(format: OutputFormat, preset: &str) -> Result<Vec<String>> {
+    let preset = preset.trim();
     match format {
-        OutputFormat::Wav => Vec::new(),
+        OutputFormat::Wav => Ok(Vec::new()),
         OutputFormat::Mp3 => {
             if let Some(q) = preset.strip_prefix("-V") {
-                let q = q.split_whitespace().next().unwrap_or("2");
-                vec![
+                let q = q.split_whitespace().next().unwrap_or("");
+                if q.is_empty() || !q.chars().all(|c| c.is_ascii_digit()) {
+                    bail!("некорректный пресет MP3: {preset:?} (ожидается -V0…-V9)");
+                }
+                Ok(vec![
                     "-codec:a".into(),
                     "libmp3lame".into(),
                     "-q:a".into(),
                     q.into(),
-                ]
-            } else if preset.ends_with('k') {
-                vec![
-                    "-codec:a".into(),
-                    "libmp3lame".into(),
-                    "-b:a".into(),
-                    preset.into(),
-                ]
+                ])
+            } else if !preset.starts_with("opus") {
+                if let Some(br) = preset.strip_suffix('k') {
+                    if br.is_empty() || !br.chars().all(|c| c.is_ascii_digit()) {
+                        bail!("некорректный пресет MP3: {preset:?} (ожидается 128k/192k)");
+                    }
+                    return Ok(vec![
+                        "-codec:a".into(),
+                        "libmp3lame".into(),
+                        "-b:a".into(),
+                        preset.into(),
+                    ]);
+                }
+                bail!("пресет {preset:?} не подходит для MP3 (ожидается -V0…-V9 или 128k/192k)");
             } else {
-                vec![
-                    "-codec:a".into(),
-                    "libmp3lame".into(),
-                    "-q:a".into(),
-                    "2".into(),
-                ]
+                bail!("пресет {preset:?} не подходит для MP3 (это пресет Opus)");
             }
         }
         OutputFormat::Opus => {
-            let bitrate = if preset.starts_with("opus") {
-                preset.split_whitespace().nth(1).unwrap_or("96k")
-            } else {
-                "96k"
-            };
-            vec![
+            let rest = preset.strip_prefix("opus").ok_or_else(|| {
+                anyhow!("пресет {preset:?} не подходит для Opus (ожидается \"opus 96k\")")
+            })?;
+            let bitrate = rest.trim();
+            let digits = bitrate.strip_suffix('k').unwrap_or("");
+            if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+                bail!("некорректный пресет Opus: {preset:?} (ожидается \"opus 96k\")");
+            }
+            Ok(vec![
                 "-codec:a".into(),
                 "libopus".into(),
                 "-b:a".into(),
                 bitrate.into(),
-            ]
+            ])
         }
     }
 }
@@ -224,7 +233,7 @@ impl FfmpegSink {
         let ext = format.extension();
         // уникальное имя за запуск: старые черновики не мешают (не удаляются)
         let partial = unique_partial_path(final_path, ext);
-        let args = Self::base_args(sample_rate, format, preset, &partial);
+        let args = Self::base_args(sample_rate, format, preset, &partial)?;
         Self::spawn(ffmpeg, &args, partial, final_path.to_path_buf())
     }
 
@@ -234,7 +243,7 @@ impl FfmpegSink {
         format: OutputFormat,
         preset: &str,
         out: &Path,
-    ) -> Vec<String> {
+    ) -> Result<Vec<String>> {
         let mut a: Vec<String> = vec![
             "-n".into(),
             "-hide_banner".into(),
@@ -249,9 +258,9 @@ impl FfmpegSink {
             "-i".into(),
             "pipe:0".into(),
         ];
-        a.extend(encoder_args(format, preset));
+        a.extend(encoder_args(format, preset)?);
         a.push(out.to_string_lossy().into_owned());
-        a
+        Ok(a)
     }
 
     /// Запуск процесса (отдельный конструктор — удобен для тестов с
@@ -578,25 +587,20 @@ mod tests {
     #[test]
     fn encoder_args_match_python_gui() {
         assert_eq!(
-            encoder_args(OutputFormat::Mp3, "-V0 (Максимальное)"),
+            encoder_args(OutputFormat::Mp3, "-V0 (Максимальное)").unwrap(),
             vec!["-codec:a", "libmp3lame", "-q:a", "0"]
         );
         assert_eq!(
-            encoder_args(OutputFormat::Mp3, "-V4 (Среднее)"),
+            encoder_args(OutputFormat::Mp3, "-V4 (Среднее)").unwrap(),
             vec!["-codec:a", "libmp3lame", "-q:a", "4"]
         );
         assert_eq!(
-            encoder_args(OutputFormat::Mp3, "192k"),
+            encoder_args(OutputFormat::Mp3, "192k").unwrap(),
             vec!["-codec:a", "libmp3lame", "-b:a", "192k"]
         );
         assert_eq!(
-            encoder_args(OutputFormat::Opus, "opus 64k"),
+            encoder_args(OutputFormat::Opus, "opus 64k").unwrap(),
             vec!["-codec:a", "libopus", "-b:a", "64k"]
-        );
-        // не-опус пресет для OPUS — фолбэк 96k как в GUI
-        assert_eq!(
-            encoder_args(OutputFormat::Opus, "-V2"),
-            vec!["-codec:a", "libopus", "-b:a", "96k"]
         );
         assert_eq!(
             FfmpegSink::base_args(
@@ -605,9 +609,25 @@ mod tests {
                 "-V2",
                 Path::new("x.mp3.partial.mp3")
             )
+            .unwrap()
             .last()
             .unwrap(),
             "x.mp3.partial.mp3"
+        );
+    }
+
+    /// Пресеты MP3 и Opus не взаимозаменяемы: несовместимый пресет —
+    /// ошибка, а не тихий фолбэк (дефект G2).
+    #[test]
+    fn encoder_rejects_incompatible_preset() {
+        assert!(encoder_args(OutputFormat::Mp3, "opus 64k").is_err());
+        assert!(encoder_args(OutputFormat::Opus, "-V2").is_err());
+        assert!(encoder_args(OutputFormat::Opus, "128k").is_err());
+        assert!(encoder_args(OutputFormat::Mp3, "abc").is_err());
+        assert!(encoder_args(OutputFormat::Opus, "opus").is_err());
+        assert_eq!(
+            encoder_args(OutputFormat::Wav, "любой").unwrap(),
+            Vec::<String>::new()
         );
     }
 
@@ -925,7 +945,7 @@ mod tests {
         let final_p = d.join("out.mp3");
         let partial = unique_partial_path(&final_p, "mp3");
         // заведомо некорректный флаг энкодера
-        let mut args = FfmpegSink::base_args(24000, OutputFormat::Mp3, "-V2", &partial);
+        let mut args = FfmpegSink::base_args(24000, OutputFormat::Mp3, "-V2", &partial).unwrap();
         args.insert(args.len() - 1, "-bogus_flag".into());
         let mut sink: Box<dyn AudioSink> =
             Box::new(FfmpegSink::spawn(&ff, &args, partial.clone(), final_p.clone()).unwrap());

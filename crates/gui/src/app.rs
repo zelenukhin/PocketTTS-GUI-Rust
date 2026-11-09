@@ -36,6 +36,11 @@ pub struct ShtormApp {
     /// Пользователь закрыл окно при живом задании: отменяем и закрываем сами,
     /// когда поток завершится (без сиротских ffmpeg).
     close_pending: bool,
+    /// Кэш проверки ffmpeg (resolve_ffmpeg запускает процесс — не каждый кадр):
+    /// ключ = явный путь из настроек, значение = текст ошибки, если не найден.
+    ffmpeg_check_key: Option<String>,
+    ffmpeg_check_err: Option<String>,
+    ffmpeg_checked_at: std::time::Instant,
 }
 
 /// Живое задание: флаг отмены, канал событий из потока, поток.
@@ -83,6 +88,9 @@ impl ShtormApp {
             job: None,
             progress: (0, 0),
             close_pending: false,
+            ffmpeg_check_key: None,
+            ffmpeg_check_err: None,
+            ffmpeg_checked_at: std::time::Instant::now(),
         }
     }
 
@@ -190,8 +198,32 @@ impl ShtormApp {
         }
     }
 
-    /// Валидация путей/параметров (без блокировок: только локальные проверки).
-    fn validate(&self) -> Vec<String> {
+    /// Валидация путей/параметров. ffmpeg проверяется общим `resolve_ffmpeg`
+    /// (явный путь → автопоиск), результат кэшируется, чтобы не запускать
+    /// процесс каждый кадр; при ошибке — перепроверка раз в 2 секунды.
+    fn validate(&mut self) -> Vec<String> {
+        let needs_ffmpeg = self.settings.format.needs_ffmpeg();
+        let mut ffmpeg_err = None;
+        if needs_ffmpeg {
+            let key = self.settings.ffmpeg_path.trim().to_string();
+            let now = std::time::Instant::now();
+            let recheck = self.ffmpeg_check_err.is_some()
+                && now.duration_since(self.ffmpeg_checked_at) >= std::time::Duration::from_secs(2);
+            if self.ffmpeg_check_key.as_deref() != Some(key.as_str()) || recheck {
+                let explicit = if key.is_empty() {
+                    None
+                } else {
+                    Some(Path::new(&key))
+                };
+                self.ffmpeg_check_err = app_core::sink::resolve_ffmpeg(explicit)
+                    .err()
+                    .map(|e| format!("{e:#}"));
+                self.ffmpeg_check_key = Some(key);
+                self.ffmpeg_checked_at = now;
+            }
+            ffmpeg_err = self.ffmpeg_check_err.clone();
+        }
+
         let mut errs = Vec::new();
         let s = &self.settings;
         if s.text_file.trim().is_empty() {
@@ -218,12 +250,17 @@ impl ShtormApp {
                 crate::job::derive_out_path(s).display()
             ));
         }
-        if s.format != OutputFormatChoice::Wav {
-            let ff = s.ffmpeg_path.trim();
-            if ff.is_empty() {
-                errs.push("для MP3/Opus укажите путь к ffmpeg".into());
-            } else if !Path::new(ff).is_file() {
-                errs.push(format!("ffmpeg не найден: {ff}"));
+        if needs_ffmpeg {
+            if let Some(e) = ffmpeg_err {
+                errs.push(e);
+            }
+            // Пресет обязан соответствовать формату: несовместимый выбор —
+            // ошибка, а не тихая подстановка другого пресета.
+            if let Err(e) = app_core::sink::encoder_args(
+                crate::job::output_format(s.format),
+                s.preset_for_format(),
+            ) {
+                errs.push(format!("пресет качества: {e:#}"));
             }
         }
         errs
@@ -578,27 +615,40 @@ impl eframe::App for ShtormApp {
                                     "Opus",
                                 );
                             });
-                        if s.format.mp3_preset_needed() {
-                            egui::ComboBox::from_id_salt("preset")
-                                .selected_text(&s.mp3_preset)
-                                .show_ui(ui, |ui| {
-                                    for p in [
-                                        "-V0 (Максимальное)",
-                                        "-V2 (Высокое)",
-                                        "-V4 (Среднее)",
-                                        "192k",
-                                        "128k",
-                                        "opus 96k",
-                                        "opus 64k",
-                                        "opus 32k",
-                                    ] {
-                                        ui.selectable_value(&mut s.mp3_preset, p.to_string(), p);
-                                    }
-                                });
+                        // Пресеты раздельные: каждый формат показывает и
+                        // меняет только свой — несовместимый выбор невозможен.
+                        match s.format {
+                            OutputFormatChoice::Mp3 => {
+                                egui::ComboBox::from_id_salt("mp3_preset")
+                                    .selected_text(&s.mp3_preset)
+                                    .show_ui(ui, |ui| {
+                                        for p in crate::settings::MP3_PRESETS {
+                                            ui.selectable_value(
+                                                &mut s.mp3_preset,
+                                                (*p).to_string(),
+                                                *p,
+                                            );
+                                        }
+                                    });
+                            }
+                            OutputFormatChoice::Opus => {
+                                egui::ComboBox::from_id_salt("opus_preset")
+                                    .selected_text(&s.opus_preset)
+                                    .show_ui(ui, |ui| {
+                                        for p in crate::settings::OPUS_PRESETS {
+                                            ui.selectable_value(
+                                                &mut s.opus_preset,
+                                                (*p).to_string(),
+                                                *p,
+                                            );
+                                        }
+                                    });
+                            }
+                            OutputFormatChoice::Wav => {}
                         }
                         ui.checkbox(&mut s.chunk_log, "Лог чанков");
                     });
-                    if s.format.mp3_preset_needed() {
+                    if s.format.needs_ffmpeg() {
                         ui.horizontal(|ui| {
                             ui.label("ffmpeg:");
                             ui.text_edit_singleline(&mut s.ffmpeg_path);

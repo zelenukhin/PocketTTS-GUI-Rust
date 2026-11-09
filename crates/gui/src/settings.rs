@@ -46,6 +46,9 @@ pub struct GuiSettings {
     // Вывод
     pub format: OutputFormatChoice,
     pub mp3_preset: String,
+    /// Пресет Opus — отдельный от MP3: при смене формата используется
+    /// соответствующий пресет, несовместимый не подставляется молча.
+    pub opus_preset: String,
     pub out_dir: String,
     pub chunk_log: bool,
     pub ffmpeg_path: String,
@@ -96,10 +99,21 @@ impl OutputFormatChoice {
             Self::Opus => "opus",
         }
     }
-    pub fn mp3_preset_needed(&self) -> bool {
+    /// Нужен ли ffmpeg (MP3/Opus) — WAV пишется напрямую.
+    pub fn needs_ffmpeg(&self) -> bool {
         !matches!(self, Self::Wav)
     }
 }
+
+/// Допустимые пресеты качества по форматам (метки как в Python GUI).
+pub const MP3_PRESETS: &[&str] = &[
+    "-V0 (Максимальное)",
+    "-V2 (Высокое)",
+    "-V4 (Среднее)",
+    "192k",
+    "128k",
+];
+pub const OPUS_PRESETS: &[&str] = &["opus 96k", "opus 64k", "opus 32k"];
 
 impl Default for GuiSettings {
     fn default() -> Self {
@@ -127,6 +141,7 @@ impl Default for GuiSettings {
             workers: None,
             format: OutputFormatChoice::Wav,
             mp3_preset: "-V2 (Высокое)".into(),
+            opus_preset: "opus 64k".into(),
             out_dir: "output".into(),
             chunk_log: false,
             ffmpeg_path: String::new(),
@@ -141,6 +156,16 @@ impl Default for GuiSettings {
 }
 
 impl GuiSettings {
+    /// Пресет, соответствующий текущему формату (WAV — пусто). При смене
+    /// формата берётся собственный пресет формата — без неявных фолбэков.
+    pub fn preset_for_format(&self) -> &str {
+        match self.format {
+            OutputFormatChoice::Wav => "",
+            OutputFormatChoice::Mp3 => &self.mp3_preset,
+            OutputFormatChoice::Opus => &self.opus_preset,
+        }
+    }
+
     /// Рекомендованное число воркеров по устройству (A4: CPU 2 / CUDA 1).
     pub fn effective_workers(&self) -> u32 {
         self.workers.unwrap_or(match self.device {
@@ -307,7 +332,13 @@ pub fn import_from_python(python_settings: &Path) -> Result<GuiSettings> {
         };
     }
     if let Some(x) = g("mp3_preset").and_then(|x| x.as_str().map(str::to_string)) {
-        s.mp3_preset = x.to_string();
+        // Python хранит один пресет: opus-метки переносим в opus_preset,
+        // остальные — в mp3_preset (явный маппинг по формату пресета).
+        if x.trim().to_ascii_lowercase().starts_with("opus") {
+            s.opus_preset = x;
+        } else {
+            s.mp3_preset = x;
+        }
     }
     if let Some(x) = g("voice_source").and_then(|x| x.as_str().map(str::to_string)) {
         s.voice_wav = x.to_string();
@@ -473,6 +504,41 @@ mod tests {
         assert_eq!(s.device, DeviceChoice::Cpu);
         // файл Python не изменён
         assert_eq!(std::fs::read_to_string(&src).unwrap(), before);
+    }
+
+    /// Пресет выбирается по формату: MP3 и Opus не делят одно поле и не
+    /// подменяют друг друга при переключении формата.
+    #[test]
+    fn preset_follows_format_without_fallback() {
+        let mut s = GuiSettings {
+            format: OutputFormatChoice::Mp3,
+            ..Default::default()
+        };
+        assert_eq!(s.preset_for_format(), "-V2 (Высокое)");
+        s.format = OutputFormatChoice::Opus;
+        assert_eq!(s.preset_for_format(), "opus 64k");
+        s.format = OutputFormatChoice::Wav;
+        assert_eq!(s.preset_for_format(), "");
+        // правка MP3-пресета не влияет на Opus и наоборот
+        s.format = OutputFormatChoice::Mp3;
+        s.mp3_preset = "128k".into();
+        s.format = OutputFormatChoice::Opus;
+        assert_eq!(s.preset_for_format(), "opus 64k");
+        s.opus_preset = "opus 32k".into();
+        s.format = OutputFormatChoice::Mp3;
+        assert_eq!(s.preset_for_format(), "128k");
+    }
+
+    /// Python хранит один пресет: opus-метка попадает в opus_preset, а
+    /// MP3-поле остаётся дефолтным (без несовместимого значения).
+    #[test]
+    fn import_python_opus_preset_maps_to_opus_field() {
+        let d = tmpdir("import_opus");
+        let src = d.join("settings_pocket_tts.json");
+        std::fs::write(&src, r#"{"mp3_preset": "opus 32k", "use_wav": false}"#).unwrap();
+        let s = import_from_python(&src).unwrap();
+        assert_eq!(s.opus_preset, "opus 32k");
+        assert_eq!(s.mp3_preset, "-V2 (Высокое)");
     }
 
     #[test]

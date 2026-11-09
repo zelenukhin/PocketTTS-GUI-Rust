@@ -103,30 +103,50 @@ pub fn resolve_model_dir(s: &GuiSettings) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// char_rules из runtime.json модели (та же логика, что CLI --char-rules:
-/// файла нет — правила не применяются; секции нет — предупреждение).
-pub fn load_char_rules(model_dir: &Path) -> Option<CharRules> {
+/// Результат чтения char_rules из runtime.json модели. Отсутствие файла —
+/// штатное состояние (правила не заданы); невалидный файл/секция — явное
+/// предупреждение для пользователя, а не молчаливое игнорирование.
+#[derive(Debug, Clone)]
+pub enum CharRulesLoad {
+    Absent,
+    Loaded(CharRules),
+    Warning(String),
+}
+
+/// char_rules из runtime.json модели (та же логика, что CLI --char-rules).
+pub fn load_char_rules(model_dir: &Path) -> CharRulesLoad {
     let p = model_dir.join("runtime.json");
-    let raw = std::fs::read_to_string(&p).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let raw = match std::fs::read_to_string(&p) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return CharRulesLoad::Absent,
+        Err(e) => {
+            return CharRulesLoad::Warning(format!(
+                "runtime.json не прочитан ({}): {e} — char_rules не применяются",
+                p.display()
+            ))
+        }
+    };
+    let v: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            return CharRulesLoad::Warning(format!(
+                "runtime.json невалиден ({}): {e} — char_rules не применяются",
+                p.display()
+            ))
+        }
+    };
     match v.get("char_rules") {
         Some(cr) => match serde_json::from_value::<CharRules>(cr.clone()) {
-            Ok(rules) => Some(rules),
-            Err(e) => {
-                eprintln!(
-                    "ВНИМАНИЕ: секция char_rules в {} не разобрана: {e}",
-                    p.display()
-                );
-                None
-            }
-        },
-        None => {
-            eprintln!(
-                "ВНИМАНИЕ: в {} нет секции char_rules — правила не применяются.",
+            Ok(rules) => CharRulesLoad::Loaded(rules),
+            Err(e) => CharRulesLoad::Warning(format!(
+                "секция char_rules в {} не разобрана: {e} — правила не применяются",
                 p.display()
-            );
-            None
-        }
+            )),
+        },
+        None => CharRulesLoad::Warning(format!(
+            "в {} нет секции char_rules — правила не применяются",
+            p.display()
+        )),
     }
 }
 
@@ -277,30 +297,84 @@ pub fn resolve_ort_dylib(s: &GuiSettings) -> Result<(PathBuf, Vec<PathBuf>)> {
 /// CPU/CUDA требует перезапуска GUI; честная ошибка вместо тихого фолбэка).
 static ORT_LOADED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
-/// Подготовить окружение и инициализировать ORT (один раз за процесс).
-/// PATH/ORТ_DYLIB_PATH меняются ТОЛЬКО в процессе GUI (система не трогается).
-pub fn setup_ort_environment(s: &GuiSettings) -> Result<()> {
-    let (dll, prepend) = resolve_ort_dylib(s)?;
-    if !prepend.is_empty() {
-        let old = std::env::var("PATH").unwrap_or_default();
-        let joined: String = prepend
-            .iter()
-            .map(|d| d.display().to_string())
-            .collect::<Vec<_>>()
-            .join(";");
-        std::env::set_var("PATH", format!("{joined};{old}"));
+/// Сравнение путей без учёта регистра на Windows и хвостовых разделителей.
+fn same_path(a: &Path, b: &Path) -> bool {
+    let norm = |p: &Path| {
+        p.to_string_lossy()
+            .trim_end_matches(['\\', '/'])
+            .to_string()
+    };
+    let (a, b) = (norm(a), norm(b));
+    if cfg!(windows) {
+        a.eq_ignore_ascii_case(&b)
+    } else {
+        a == b
     }
-    std::env::set_var("ORT_DYLIB_PATH", &dll);
-    if let Some(prev) = ORT_LOADED.get() {
-        if prev == &dll {
-            return Ok(());
-        }
-        bail!(
+}
+
+/// Нужна ли инициализация ORT. Проверка ORT_LOADED выполняется ДО любых
+/// изменений PATH/ORT_DYLIB_PATH: тот же DLL — no-op, другой — ошибка.
+fn ort_init_needed(dll: &Path, loaded: Option<&Path>) -> Result<bool> {
+    match loaded {
+        Some(prev) if same_path(prev, dll) => Ok(false),
+        Some(prev) => bail!(
             "onnxruntime уже загружен с {} — для смены CPU/CUDA перезапустите приложение",
             prev.display()
-        );
+        ),
+        None => Ok(true),
     }
+}
+
+/// Добавить каталоги в НАЧАЛО PATH без повторов (повторное задание на том же
+/// runtime не раздувает PATH CUDA-каталогами). None — PATH уже содержит всё.
+fn merge_path_prepend(old: &std::ffi::OsStr, prepend: &[PathBuf]) -> Option<std::ffi::OsString> {
+    let existing: Vec<PathBuf> = std::env::split_paths(old).collect();
+    let mut front: Vec<PathBuf> = Vec::new();
+    for d in prepend {
+        if existing.iter().any(|p| same_path(p, d)) || front.iter().any(|p| same_path(p, d)) {
+            continue;
+        }
+        front.push(d.clone());
+    }
+    if front.is_empty() {
+        return None;
+    }
+    front.extend(existing);
+    std::env::join_paths(front).ok()
+}
+
+/// Подготовить окружение и инициализировать ORT (один раз за процесс).
+/// PATH/ORT_DYLIB_PATH меняются ТОЛЬКО в процессе GUI (система не трогается).
+pub fn setup_ort_environment(s: &GuiSettings) -> Result<()> {
+    let (dll, prepend) = resolve_ort_dylib(s)?;
+    // Сначала проверяем ORT_LOADED — при повторном задании на том же runtime
+    // PATH/ORT_DYLIB_PATH не меняются вовсе.
+    if !ort_init_needed(&dll, ORT_LOADED.get().map(PathBuf::as_path))? {
+        return Ok(());
+    }
+    // снимок env для отката, если ort::init не состоится
+    let old_path = std::env::var_os("PATH");
+    let old_dylib = std::env::var_os("ORT_DYLIB_PATH");
+    if let Some(old) = &old_path {
+        if let Some(merged) = merge_path_prepend(old, &prepend) {
+            std::env::set_var("PATH", merged);
+        }
+    } else if !prepend.is_empty() {
+        if let Ok(joined) = std::env::join_paths(prepend.clone()) {
+            std::env::set_var("PATH", joined);
+        }
+    }
+    std::env::set_var("ORT_DYLIB_PATH", &dll);
     if !ort::init().with_name("shtorm-gui").commit() {
+        // init не состоялся — не оставляем процесс с чужим DLL/путём
+        match old_dylib {
+            Some(v) => std::env::set_var("ORT_DYLIB_PATH", v),
+            None => std::env::remove_var("ORT_DYLIB_PATH"),
+        }
+        match old_path {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
         bail!("ort::init() не удалось (DLL: {})", dll.display());
     }
     let _ = ORT_LOADED.set(dll);
@@ -338,41 +412,59 @@ pub fn execute_job(
         Ok(d) => d,
         Err(e) => return fail(format!("{e:#}")),
     };
-    let char_rules = load_char_rules(&model_dir);
+    let mut char_warning = None;
+    let char_rules = match load_char_rules(&model_dir) {
+        CharRulesLoad::Absent => None,
+        CharRulesLoad::Loaded(rules) => Some(rules),
+        CharRulesLoad::Warning(w) => {
+            // невалидный/неполный runtime.json не игнорируем молча —
+            // предупреждение уходит в журнал и в итоговую сводку
+            emit(JobEvent::Log(format!("ВНИМАНИЕ: {w}")));
+            char_warning = Some(w);
+            None
+        }
+    };
     if let Err(e) = setup_ort_environment(s) {
-        return fail(format!("{e:#}"));
+        return attach_warning(fail(format!("{e:#}")), &char_warning);
     }
     // папка результата может не существовать — создаём (безопасно, без удалений)
     if let Some(parent) = cfg.out_path.parent() {
         if !parent.exists() {
             if let Err(e) = std::fs::create_dir_all(parent) {
-                return fail(format!(
-                    "создать папку результата {}: {e}",
-                    parent.display()
-                ));
+                return attach_warning(
+                    fail(format!(
+                        "создать папку результата {}: {e}",
+                        parent.display()
+                    )),
+                    &char_warning,
+                );
             }
         }
     }
     if cfg.out_path.exists() {
-        return fail(format!(
-            "итоговый файл уже существует: {} — не перезаписываем (переименуйте или смените папку)",
-            cfg.out_path.display()
-        ));
+        return attach_warning(
+            fail(format!(
+                "итоговый файл уже существует: {} — не перезаписываем (переименуйте или смените папку)",
+                cfg.out_path.display()
+            )),
+            &char_warning,
+        );
     }
     let ffmpeg = if s.ffmpeg_path.trim().is_empty() {
         None
     } else {
         Some(Path::new(s.ffmpeg_path.trim()))
     };
+    let preset = s.preset_for_format();
     let sink = match make_sink(
         &cfg.out_path,
         24_000,
         output_format(s.format),
-        &s.mp3_preset,
+        preset,
         ffmpeg,
     ) {
         Ok(sink) => sink,
-        Err(e) => return fail(format!("{e:#}")),
+        Err(e) => return attach_warning(fail(format!("{e:#}")), &char_warning),
     };
     let opts = pipeline_options(s, model_dir.clone(), char_rules);
 
@@ -382,7 +474,7 @@ pub fn execute_job(
         device_label(s),
         s.effective_workers(),
         s.format.label(),
-        s.mp3_preset
+        if preset.is_empty() { "-" } else { preset }
     )));
 
     // --- синтез (прогресс → UI; отмена → Cancelled без публикации) ---
@@ -404,7 +496,16 @@ pub fn execute_job(
         Err(e) => finish_from_error(cfg, &e, elapsed),
     };
     res.progress = progress;
-    res
+    attach_warning(res, &char_warning)
+}
+
+/// Явное предупреждение (например, невалидный runtime.json) — в начало
+/// итоговой сводки, чтобы пользователь увидел его, а не только в журнале.
+fn attach_warning(mut r: JobResult, warning: &Option<String>) -> JobResult {
+    if let Some(w) = warning {
+        r.summary = format!("{w}; {}", r.summary);
+    }
+    r
 }
 
 /// Успешный возврат synthesize_stream: Completed (итог + RTF + лог чанков)
@@ -473,7 +574,7 @@ fn finish_from_outcome(
         let meta = ChunkLogMeta {
             device: device_label(&cfg.settings),
             format: cfg.settings.format.label().to_string(),
-            preset: cfg.settings.mp3_preset.clone(),
+            preset: cfg.settings.preset_for_format().to_string(),
         };
         match write_chunk_log(&path, &o, &meta) {
             Ok(()) => chunk_log_path = Some(path),
@@ -685,24 +786,80 @@ mod tests {
         assert_eq!(got, cpu_auto);
     }
 
-    /// char_rules читаются из runtime.json модели; нет секции/файла — None.
+    /// char_rules читаются из runtime.json модели; отсутствие файла — Absent,
+    /// невалидный JSON/секция — явное Warning (не молчаливое игнорирование).
     #[test]
     fn char_rules_from_runtime_json() {
         let d = tmpdir("crules");
-        assert!(load_char_rules(&d).is_none(), "нет файла — нет правил");
+        assert!(
+            matches!(load_char_rules(&d), CharRulesLoad::Absent),
+            "нет файла — штатное отсутствие правил"
+        );
         std::fs::write(d.join("runtime.json"), r#"{"other": 1}"#).unwrap();
-        assert!(load_char_rules(&d).is_none(), "нет секции — нет правил");
+        assert!(
+            matches!(load_char_rules(&d), CharRulesLoad::Warning(_)),
+            "нет секции — предупреждение"
+        );
+        std::fs::write(d.join("runtime.json"), b"{not json").unwrap();
+        let w = match load_char_rules(&d) {
+            CharRulesLoad::Warning(w) => w,
+            other => panic!("ожидалось Warning, получено {other:?}"),
+        };
+        assert!(w.contains("невалиден"), "{w}");
         std::fs::write(
             d.join("runtime.json"),
             r#"{"char_rules": {"char_map": {"ё": "е"}}}"#,
         )
         .unwrap();
-        let rules = load_char_rules(&d).expect("секция есть");
+        let rules = match load_char_rules(&d) {
+            CharRulesLoad::Loaded(r) => r,
+            other => panic!("ожидалось Loaded, получено {other:?}"),
+        };
         assert_eq!(
             rules.char_map.get("ё").and_then(|v| v.as_str()),
             Some("е"),
             "правила разобраны: {:?}",
             rules.char_map
+        );
+    }
+
+    /// Инициализация ORT: тот же runtime — no-op; другой DLL — ошибка. Тест
+    /// не загружает настоящий ORT (чистая проверка решения).
+    #[test]
+    fn ort_init_is_idempotent_and_rejects_switch() {
+        let dll = Path::new(r"C:\deps\portable\onnxruntime.dll");
+        assert!(ort_init_needed(dll, None).unwrap(), "первый запуск");
+        assert!(
+            !ort_init_needed(dll, Some(dll)).unwrap(),
+            "повторное задание на том же runtime — без переинициализации"
+        );
+        // регистр и хвостовые разделители не создают ложную «смену runtime»
+        assert!(
+            !ort_init_needed(Path::new(r"c:\DEPS\portable\onnxruntime.dll"), Some(dll)).unwrap()
+        );
+        let other = Path::new(r"C:\deps\ort-cpu\onnxruntime.dll");
+        let err = ort_init_needed(other, Some(dll)).unwrap_err();
+        assert!(format!("{err:#}").contains("перезапустите"), "{err:#}");
+    }
+
+    /// PATH не раздувается: каталоги CUDA добавляются один раз, повторное
+    /// слияние уже присутствующих путей ничего не меняет.
+    #[test]
+    fn path_prepend_is_deduped_and_idempotent() {
+        let old = std::env::join_paths([Path::new("a"), Path::new("cuda")]).unwrap();
+        let prepend = vec![PathBuf::from("cuda"), PathBuf::from("b")];
+        let merged = merge_path_prepend(&old, &prepend).expect("b добавляется");
+        let parts: Vec<String> = std::env::split_paths(&merged)
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(parts, vec!["b", "a", "cuda"], "cuda не дублируется");
+        assert!(
+            merge_path_prepend(&merged, &prepend).is_none(),
+            "повторное применение — no-op"
+        );
+        assert!(
+            merge_path_prepend(&old, &prepend[..1]).is_none(),
+            "уже присутствующий каталог не добавляется"
         );
     }
 
@@ -797,12 +954,11 @@ mod tests {
             out_dir: out_dir.display().to_string(),
             ..Default::default()
         };
-        if fmt != OutputFormatChoice::Wav {
+        if fmt.needs_ffmpeg() {
             s.ffmpeg_path = REAL_FFMPEG.into();
-            s.mp3_preset = match fmt {
-                OutputFormatChoice::Opus => "opus 64k".into(),
-                _ => "-V2 (Высокое)".into(),
-            };
+            // раздельные пресеты: каждый формат берёт свой
+            s.mp3_preset = "-V2 (Высокое)".into();
+            s.opus_preset = "opus 64k".into();
         }
         s.clamped();
         s
