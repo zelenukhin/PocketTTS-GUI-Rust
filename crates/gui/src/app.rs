@@ -33,6 +33,10 @@ pub struct ShtormApp {
     job: Option<JobHandle>,
     /// Прогресс (чанков готово / всего) последнего активного задания.
     progress: (usize, usize),
+    /// Пакетный режим: номер текущего файла / всего файлов.
+    file_progress: (usize, usize),
+    /// Текущее задание — пакетное (для отображения прогресса по файлам).
+    batch_running: bool,
     /// Пользователь закрыл окно при живом задании: отменяем и закрываем сами,
     /// когда поток завершится (без сиротских ffmpeg).
     close_pending: bool,
@@ -87,6 +91,8 @@ impl ShtormApp {
             last_saved: None,
             job: None,
             progress: (0, 0),
+            file_progress: (0, 0),
+            batch_running: false,
             close_pending: false,
             ffmpeg_check_key: None,
             ffmpeg_check_err: None,
@@ -104,7 +110,12 @@ impl ShtormApp {
         }
         let mut s = self.settings.clone();
         s.clamped();
-        let out_path = crate::job::derive_out_path(&s);
+        let batch = s.batch;
+        let out_path = if batch {
+            PathBuf::new()
+        } else {
+            crate::job::derive_out_path(&s)
+        };
         let (tx, rx) = std::sync::mpsc::channel::<JobEvent>();
         let ctx2 = ctx.clone();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -113,9 +124,14 @@ impl ShtormApp {
         let thread = std::thread::Builder::new()
             .name("shtorm-synth".into())
             .spawn(move || {
-                let cfg = crate::job::JobConfig {
-                    settings: s,
-                    text: match std::fs::read_to_string(&text_file) {
+                let result = if batch {
+                    let source = PathBuf::from(&text_file);
+                    crate::job::execute_batch(&s, &source, &cancel2, &|ev| {
+                        let _ = tx.send(ev);
+                        ctx2.request_repaint();
+                    })
+                } else {
+                    let text = match std::fs::read_to_string(&text_file) {
                         Ok(t) => t,
                         Err(e) => {
                             let r = crate::job::JobResult::failed(format!(
@@ -126,13 +142,17 @@ impl ShtormApp {
                             ctx2.request_repaint();
                             return;
                         }
-                    },
-                    out_path,
+                    };
+                    let cfg = crate::job::JobConfig {
+                        settings: s,
+                        text,
+                        out_path,
+                    };
+                    crate::job::execute_job(&cfg, &cancel2, &|ev| {
+                        let _ = tx.send(ev);
+                        ctx2.request_repaint();
+                    })
                 };
-                let result = crate::job::execute_job(&cfg, &cancel2, &|ev| {
-                    let _ = tx.send(ev);
-                    ctx2.request_repaint();
-                });
                 let _ = tx.send(JobEvent::Finished(Box::new(result)));
                 ctx2.request_repaint();
             })
@@ -143,6 +163,8 @@ impl ShtormApp {
             thread: Some(thread),
         });
         self.progress = (0, 0);
+        self.file_progress = (0, 0);
+        self.batch_running = batch;
         self.status = "задание запущено…".into();
     }
 
@@ -153,6 +175,24 @@ impl ShtormApp {
             JobEvent::Progress { done, total } => {
                 self.progress = (done, total);
                 self.status = format!("синтез: {done}/{total} чанков");
+            }
+            JobEvent::FileProgress {
+                index,
+                total,
+                done,
+                chunks_total,
+            } => {
+                self.file_progress = (index, total);
+                self.progress = (done, chunks_total);
+                self.status = format!("файл {index}/{total}: {done}/{chunks_total} чанков");
+            }
+            JobEvent::FileDone {
+                index,
+                total,
+                report,
+            } => {
+                self.status = format!("файл {index}/{total}: {}", report.status.label());
+                self.push_log(&report.line());
             }
             JobEvent::Log(line) => self.push_log(&line),
             JobEvent::Finished(res) => {
@@ -227,7 +267,15 @@ impl ShtormApp {
         let mut errs = Vec::new();
         let s = &self.settings;
         if s.text_file.trim().is_empty() {
-            errs.push("не выбран текстовый файл".into());
+            errs.push(if s.batch {
+                "не выбран исходный каталог".into()
+            } else {
+                "не выбран текстовый файл".into()
+            });
+        } else if s.batch {
+            if !Path::new(&s.text_file).is_dir() {
+                errs.push(format!("исходный каталог не найден: {}", s.text_file));
+            }
         } else if !Path::new(&s.text_file).is_file() {
             errs.push(format!("текстовый файл не найден: {}", s.text_file));
         }
@@ -244,7 +292,7 @@ impl ShtormApp {
         }
         if s.out_dir.trim().is_empty() {
             errs.push("не указана папка результата".into());
-        } else if crate::job::derive_out_path(s).exists() {
+        } else if !s.batch && crate::job::derive_out_path(s).exists() {
             errs.push(format!(
                 "итоговый файл уже существует: {} — не перезаписываем",
                 crate::job::derive_out_path(s).display()
@@ -368,8 +416,17 @@ impl eframe::App for ShtormApp {
                     );
                 }
             }
-            // прогресс активного задания: X/N чанков (+ RTF после завершения
-            // отображается в статусе/журнале)
+            // Пакетный режим: ОТДЕЛЬНО прогресс по файлам K/N и по чанкам
+            // текущего файла; одиночный — один бар по чанкам.
+            if self.batch_running && self.file_progress.1 > 0 {
+                let (fi, ft) = self.file_progress;
+                let frac = if ft > 0 { fi as f32 / ft as f32 } else { 0.0 };
+                ui.add(
+                    egui::ProgressBar::new(frac)
+                        .text(format!("файл {fi}/{ft}"))
+                        .show_percentage(),
+                );
+            }
             if self.job.is_some() || self.progress.1 > 0 {
                 let (done, total) = self.progress;
                 let frac = if total > 0 {
@@ -379,7 +436,11 @@ impl eframe::App for ShtormApp {
                 };
                 ui.add(
                     egui::ProgressBar::new(frac)
-                        .text(format!("{done}/{total} чанков"))
+                        .text(if self.batch_running {
+                            format!("чанки текущего файла: {done}/{total}")
+                        } else {
+                            format!("{done}/{total} чанков")
+                        })
                         .show_percentage(),
                 );
             }
@@ -390,18 +451,38 @@ impl eframe::App for ShtormApp {
                 .open(Some(s.source_open))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label("Текстовый файл:");
+                        ui.label("Режим:");
+                        ui.radio_value(&mut s.batch, false, "Один файл");
+                        ui.radio_value(&mut s.batch, true, "Каталог (пакетно)");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(if s.batch {
+                            "Исходный каталог:"
+                        } else {
+                            "Текстовый файл:"
+                        });
                         ui.text_edit_singleline(&mut s.text_file);
                         if ui.button("Обзор…").clicked() {
-                            if let Some(p) = rfd::FileDialog::new()
-                                .set_title("Выберите текстовый файл")
-                                .add_filter("Текст", &["txt", "md", "log"])
-                                .pick_file()
-                            {
+                            let picked = if s.batch {
+                                rfd::FileDialog::new()
+                                    .set_title("Выберите каталог с .txt/.md/.log")
+                                    .pick_folder()
+                            } else {
+                                rfd::FileDialog::new()
+                                    .set_title("Выберите текстовый файл")
+                                    .add_filter("Текст", &["txt", "md", "log"])
+                                    .pick_file()
+                            };
+                            if let Some(p) = picked {
                                 s.text_file = p.display().to_string();
                             }
                         }
                     });
+                    if s.batch {
+                        ui.weak(
+                            "Рекурсивно .txt/.md/.log без символических ссылок; выходная папка исключается.",
+                        );
+                    }
                     ui.horizontal(|ui| {
                         ui.label("WAV-голос:");
                         ui.text_edit_singleline(&mut s.voice_wav);
@@ -778,6 +859,7 @@ mod tests {
                 chunk_log_path: None,
                 rtf: Some(0.5),
                 progress: (3, 7),
+                batch: None,
             },
         )));
         assert!(app.status.starts_with("Отменено"), "{}", app.status);
@@ -800,6 +882,7 @@ mod tests {
                 chunk_log_path: None,
                 rtf: Some(0.123),
                 progress: (7, 7),
+                batch: None,
             },
         )));
         assert!(app.status.starts_with("Завершено"), "{}", app.status);
@@ -814,5 +897,37 @@ mod tests {
             "{} строк",
             app.log.lines().count()
         );
+    }
+
+    /// Пакетные события: K/N файлов и отдельно чанки текущего файла.
+    #[test]
+    fn batch_events_update_ui_state() {
+        let mut app = ShtormApp::new();
+        app.batch_running = true;
+        app.apply_event(crate::job::JobEvent::FileProgress {
+            index: 2,
+            total: 5,
+            done: 1,
+            chunks_total: 4,
+        });
+        assert_eq!(app.file_progress, (2, 5));
+        assert_eq!(app.progress, (1, 4));
+        assert!(app.status.contains("файл 2/5"), "{}", app.status);
+
+        let mut report = crate::batch::FileReport::new(
+            &crate::batch::BatchFile {
+                input: PathBuf::from("C:/src/sub/a.txt"),
+                relative: PathBuf::from("sub/a.txt"),
+            },
+            Some(PathBuf::from("C:/out/sub/a.wav")),
+        );
+        report.status = crate::batch::FileStatus::Completed;
+        app.apply_event(crate::job::JobEvent::FileDone {
+            index: 2,
+            total: 5,
+            report: Box::new(report),
+        });
+        assert!(app.status.contains("файл 2/5"), "{}", app.status);
+        assert!(app.log.contains("sub/a.txt") && app.log.contains("sub/a.wav"));
     }
 }

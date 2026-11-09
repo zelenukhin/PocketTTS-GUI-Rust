@@ -13,7 +13,10 @@ use std::path::{Path, PathBuf};
 #[serde(default)]
 pub struct GuiSettings {
     // Источник и голос
+    /// Путь к текстовому файлу (одиночный режим) или каталогу (batch).
     pub text_file: String,
+    /// true — рекурсивная пакетная обработка каталога `text_file`.
+    pub batch: bool,
     pub voice_wav: String,
     // Модель и устройство
     pub model: ModelChoice,
@@ -119,6 +122,7 @@ impl Default for GuiSettings {
     fn default() -> Self {
         Self {
             text_file: String::new(),
+            batch: false,
             voice_wav: String::new(),
             model: ModelChoice::Slow,
             model_dir: String::new(),
@@ -345,6 +349,13 @@ pub fn import_from_python(python_settings: &Path) -> Result<GuiSettings> {
     }
     if let Some(x) = g("source_path_single").and_then(|x| x.as_str().map(str::to_string)) {
         s.text_file = x.to_string();
+    }
+    // Python хранит общий source_path + processing_mode ("single"/"batch").
+    if let Some(x) = g("source_path").and_then(|x| x.as_str().map(str::to_string)) {
+        s.text_file = x.to_string();
+    }
+    if let Some(x) = g("processing_mode").and_then(|x| x.as_str().map(str::to_string)) {
+        s.batch = x.eq_ignore_ascii_case("batch");
     }
     if let Some(x) = g("output_dir_path").and_then(|x| x.as_str().map(str::to_string)) {
         s.out_dir = x.to_string();

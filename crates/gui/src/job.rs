@@ -19,6 +19,9 @@ use app_core::sink::{make_sink, OutputFormat};
 use shtorm_engine::Device;
 use text_processing::CharRules;
 
+use crate::batch::{
+    plan_batch, run_batch, BatchEvent, BatchReport, BatchStatus, FileReport, FileStatus,
+};
 use crate::settings::{DeviceChoice, GuiSettings, ModelChoice, OutputFormatChoice};
 
 /// Полный вход задания: снимок настроек (уже clamped), текст и итоговый путь.
@@ -36,6 +39,19 @@ pub enum JobEvent {
         done: usize,
         total: usize,
     },
+    /// Пакетный режим: прогресс чанков текущего файла + номер файла K/N.
+    FileProgress {
+        index: usize,
+        total: usize,
+        done: usize,
+        chunks_total: usize,
+    },
+    /// Пакетный режим: итог одного файла (для журнала/статуса).
+    FileDone {
+        index: usize,
+        total: usize,
+        report: Box<FileReport>,
+    },
     Log(String),
     /// Финальный итог (последнее событие потока задания).
     Finished(Box<JobResult>),
@@ -52,6 +68,8 @@ pub struct JobResult {
     pub chunk_log_path: Option<PathBuf>,
     pub rtf: Option<f32>,
     pub progress: (usize, usize),
+    /// Пакетный отчёт (None — одиночный режим).
+    pub batch: Option<BatchReport>,
 }
 
 impl JobResult {
@@ -66,6 +84,7 @@ impl JobResult {
             chunk_log_path: None,
             rtf: None,
             progress: (0, 0),
+            batch: None,
         }
     }
 }
@@ -392,11 +411,7 @@ fn device_label(s: &GuiSettings) -> String {
 /// Выполнить задание синтеза (рабочий поток; UI получает события через
 /// `emit`). Любые сбои — Failed с понятной сводкой; пути итога/черновика/
 /// журналов возвращаются для отображения. Никаких subprocess-вызовов CLI.
-pub fn execute_job(
-    cfg: &JobConfig,
-    cancel: &Arc<AtomicBool>,
-    emit: &dyn Fn(JobEvent),
-) -> JobResult {
+pub fn execute_job(cfg: &JobConfig, cancel: &AtomicBool, emit: &dyn Fn(JobEvent)) -> JobResult {
     let t0 = Instant::now();
     let s = &cfg.settings;
     let mut progress = (0usize, 0usize);
@@ -499,6 +514,169 @@ pub fn execute_job(
     attach_warning(res, &char_warning)
 }
 
+/// G3: пакетный прогон. Снимок файлов строится ДО первого синтеза; каждый
+/// файл идёт через `execute_job` (пул воркеров создаётся/освобождается на
+/// файл — существующий жизненный цикл). Ошибки изолированы, отмена
+/// останавливает текущий файл и не запускает следующий.
+pub fn execute_batch(
+    settings: &GuiSettings,
+    source: &Path,
+    cancel: &Arc<AtomicBool>,
+    emit: &dyn Fn(JobEvent),
+) -> JobResult {
+    let t0 = Instant::now();
+    let out_root = PathBuf::from(settings.out_dir.trim());
+    let plan = match plan_batch(source, &out_root) {
+        Ok(p) => p,
+        Err(e) => return JobResult::failed(format!("пакетный режим: {e:#}")),
+    };
+    emit(JobEvent::Log(format!(
+        "пакет: {} | найдено {} файлов | результат: {}",
+        source.display(),
+        plan.files.len(),
+        plan.out_root.display()
+    )));
+    if plan.files.is_empty() {
+        let report = BatchReport { files: Vec::new() };
+        return JobResult {
+            status: JobStatus::Completed,
+            summary: format!("{}; файлов .txt/.md/.log не найдено", report.summary()),
+            final_path: None,
+            partial_path: None,
+            diag_path: None,
+            chunk_log_path: None,
+            rtf: None,
+            progress: (0, 0),
+            batch: Some(report),
+        };
+    }
+
+    let ext = settings.format.extension_str().to_string();
+    let report = run_batch(
+        &plan,
+        &ext,
+        cancel,
+        &|ev| match ev {
+            BatchEvent::Planned { total, warnings } => {
+                emit(JobEvent::Log(format!(
+                    "пакет: план зафиксирован — {total} файлов, предупреждений: {}",
+                    warnings.len()
+                )));
+            }
+            BatchEvent::FileStarted {
+                index,
+                total,
+                input,
+                output,
+            } => {
+                emit(JobEvent::Log(format!(
+                    "[{index}/{total}] старт: {} → {}",
+                    input.display(),
+                    output.display()
+                )));
+            }
+            BatchEvent::FileProgress {
+                index,
+                total,
+                done,
+                chunks_total,
+            } => {
+                emit(JobEvent::FileProgress {
+                    index,
+                    total,
+                    done,
+                    chunks_total,
+                });
+            }
+            BatchEvent::FileFinished {
+                index,
+                total,
+                report,
+            } => {
+                emit(JobEvent::Log(format!(
+                    "[{index}/{total}] {}",
+                    report.line()
+                )));
+                emit(JobEvent::FileDone {
+                    index,
+                    total,
+                    report,
+                });
+            }
+            BatchEvent::Log(line) => emit(JobEvent::Log(line)),
+        },
+        |file, out_path, cancel, progress| {
+            let text = match std::fs::read_to_string(&file.input) {
+                Ok(t) => t,
+                Err(e) => {
+                    return FileReport::failed(
+                        file,
+                        Some(out_path.to_path_buf()),
+                        format!("прочитать {}: {e}", file.input.display()),
+                    )
+                }
+            };
+            let cfg = JobConfig {
+                settings: settings.clone(),
+                text,
+                out_path: out_path.to_path_buf(),
+            };
+            // execute_job принимает Fn, а progress — FnMut: внутренняя
+            // изменяемость через RefCell (без потери промежуточных событий).
+            let progress_cell = std::cell::RefCell::new(progress);
+            let res = execute_job(&cfg, cancel, &|ev| match ev {
+                JobEvent::Progress { done, total } => {
+                    if let Ok(mut p) = progress_cell.try_borrow_mut() {
+                        (*p)(done, total);
+                    }
+                }
+                JobEvent::Log(line) => {
+                    emit(JobEvent::Log(format!("[{}] {line}", file.input.display())));
+                }
+                _ => {}
+            });
+            let mut rep = FileReport::new(file, Some(out_path.to_path_buf()));
+            rep.chunks_done = res.progress.0;
+            rep.chunks_total = res.progress.1;
+            rep.final_path = res.final_path;
+            rep.partial_path = res.partial_path;
+            rep.diag_path = res.diag_path;
+            rep.chunk_log_path = res.chunk_log_path;
+            match res.status {
+                JobStatus::Completed => rep.status = FileStatus::Completed,
+                JobStatus::Cancelled => {
+                    rep.status = FileStatus::Cancelled;
+                    rep.reason = Some(res.summary);
+                }
+                JobStatus::Failed => {
+                    rep.status = FileStatus::Failed;
+                    rep.reason = Some(res.summary);
+                }
+            }
+            rep
+        },
+    );
+
+    let status = match report.status() {
+        BatchStatus::Completed => JobStatus::Completed,
+        BatchStatus::Cancelled => JobStatus::Cancelled,
+        BatchStatus::Failed => JobStatus::Failed,
+    };
+    let mut summary = report.summary();
+    summary.push_str(&format!("; {:.1} с", t0.elapsed().as_secs_f32()));
+    JobResult {
+        status,
+        summary,
+        final_path: None,
+        partial_path: None,
+        diag_path: None,
+        chunk_log_path: None,
+        rtf: None,
+        progress: (report.total(), report.total()),
+        batch: Some(report),
+    }
+}
+
 /// Явное предупреждение (например, невалидный runtime.json) — в начало
 /// итоговой сводки, чтобы пользователь увидел его, а не только в журнале.
 fn attach_warning(mut r: JobResult, warning: &Option<String>) -> JobResult {
@@ -548,6 +726,7 @@ fn finish_from_outcome(
             chunk_log_path: None,
             rtf,
             progress: (o.chunks_done, o.total_chunks),
+            batch: None,
         };
     }
     // Completed: RTF/паузы/денойз в сводку; лог чанков опционален (сбой
@@ -590,6 +769,7 @@ fn finish_from_outcome(
         chunk_log_path,
         rtf,
         progress: (o.chunks_done, o.total_chunks),
+        batch: None,
     }
 }
 
@@ -613,6 +793,7 @@ fn finish_from_error(cfg: &JobConfig, e: &anyhow::Error, elapsed: f32) -> JobRes
             chunk_log_path: None,
             rtf: None,
             progress: (se.chunks_done, se.total),
+            batch: None,
         };
     }
     JobResult {
@@ -624,6 +805,7 @@ fn finish_from_error(cfg: &JobConfig, e: &anyhow::Error, elapsed: f32) -> JobRes
         chunk_log_path: None,
         rtf: None,
         progress: (0, 0),
+        batch: None,
     }
 }
 
@@ -977,6 +1159,76 @@ mod tests {
         let res = execute_job(&cfg, &cancel, &|_| {});
         eprintln!("[{tag}] {} | {}", res.status.label(), res.summary);
         res
+    }
+
+    /// G3: реальный пакетный прогон на CPU FP32 (модели + ORT).
+    /// 3 валидных файла (вложенные каталоги), 1 битый (не-UTF8) и 1
+    /// существующий результат: Completed 3 / Failed 1 / Skipped 1,
+    /// структура подкаталогов сохранена, существующий файл не перезаписан.
+    #[test]
+    #[ignore = "реальный пакетный синтез: модели + ORT DLL; CPU FP32"]
+    fn real_batch_cpu() {
+        let d = tmpdir("g3_batch");
+        let src = d.join("src");
+        let out = d.join("out");
+        std::fs::create_dir_all(src.join("sub").join("deep")).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(src.join("a.txt"), "П+ервый текст.").unwrap();
+        std::fs::write(src.join("sub").join("b.txt"), "Втор+ой текст.").unwrap();
+        std::fs::write(src.join("sub").join("deep").join("c.txt"), "Тр+етий текст.").unwrap();
+        std::fs::write(src.join("d.md"), "Четв+ёртый текст.").unwrap();
+        std::fs::write(src.join("bad.txt"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
+        // существующий результат: не должен перезаписываться
+        std::fs::write(out.join("a.wav"), b"keep").unwrap();
+
+        let mut s = real_settings(OutputFormatChoice::Wav, &out);
+        s.device = DeviceChoice::Cpu;
+        s.workers = Some(2);
+        s.clamped();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let events = std::cell::RefCell::new(Vec::new());
+        let res = execute_batch(&s, &src, &cancel, &|ev| events.borrow_mut().push(ev));
+        eprintln!("[g3_batch] {} | {}", res.status.label(), res.summary);
+        for line in res.summary.lines() {
+            eprintln!("  {line}");
+        }
+
+        assert_eq!(res.status, JobStatus::Completed, "{}", res.summary);
+        let report = res.batch.expect("пакетный отчёт");
+        assert_eq!(report.total(), 5, "{}", report.summary());
+        assert_eq!(report.completed(), 3, "{}", report.summary());
+        assert_eq!(report.failed(), 1, "{}", report.summary());
+        assert_eq!(report.skipped(), 1, "{}", report.summary());
+
+        // структура подкаталогов сохранена
+        assert!(out.join("sub").join("b.wav").is_file());
+        assert!(out.join("sub").join("deep").join("c.wav").is_file());
+        assert!(out.join("d.wav").is_file());
+        // существующий результат не тронут, битый файл без итога
+        assert_eq!(std::fs::read(out.join("a.wav")).unwrap(), b"keep");
+        assert!(!out.join("bad.wav").exists());
+        let bad = report
+            .files
+            .iter()
+            .find(|f| f.input.ends_with("bad.txt"))
+            .expect("битый файл в отчёте");
+        assert_eq!(bad.status, FileStatus::Failed);
+        assert!(
+            bad.reason.as_deref().unwrap().contains("прочитать"),
+            "{:?}",
+            bad.reason
+        );
+
+        // прогресс по файлам и чанкам шёл через события
+        let events = events.into_inner();
+        let file_starts = events
+            .iter()
+            .filter(|e| matches!(e, JobEvent::FileProgress { .. }))
+            .count();
+        assert!(file_starts >= 3, "прогресс чанков по файлам: {file_starts}");
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, JobEvent::FileDone { .. })));
     }
 
     /// Матрица одного устройства: WAV, MP3/Opus, отмена после первого чанка,

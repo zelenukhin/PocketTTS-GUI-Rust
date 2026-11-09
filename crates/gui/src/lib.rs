@@ -2,5 +2,6 @@
 //! (юнит-тесты без окна; bin — только запуск eframe).
 
 pub mod app;
+pub mod batch;
 pub mod job;
 pub mod settings;
