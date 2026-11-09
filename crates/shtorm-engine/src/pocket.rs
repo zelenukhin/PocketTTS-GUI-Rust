@@ -383,6 +383,47 @@ fn piece_of(b: &[u8]) -> Result<(String, f32, u64)> {
 
 // ---- stateful graphs ------------------------------------------------------------------------
 
+// ---- CUDA-P1: инструментирование фаз generate() (только диагностика) --------
+//
+// SHTORM_PHASE_TIMING=1 — копить наносекунды по фазам кадра и печатать
+// однострочную сводку на say_chunk в stderr. Выключено (None) — нулевая цена:
+// пара проверок Option на чанк. Семантика генерации не меняется.
+
+/// Накопитель времён одного вызова say_chunk (и его кадров).
+#[derive(Default)]
+pub(crate) struct PhaseTimers {
+    pub prep_ns: u64, // prepare+bpe+text-сессия (embeddings)
+    pub voice_ns: u64,
+    pub reset_ns: u64,    // reset обоих States
+    pub prefix_ns: u64,   // 2 префиксных прогона main (голос, текст)
+    pub input_ns: u64,    // сборка входных тензоров кадра (from_array/clone)
+    pub main_run_ns: u64, // session.run main (кадры+префикс отдельно)
+    pub main_ext_ns: u64, // извлечение cond/eos + состояния main
+    pub noise_ns: u64,
+    pub flow_run_ns: u64,
+    pub flow_ext_ns: u64,
+    pub dec_run_ns: u64,
+    pub dec_ext_ns: u64,
+    pub frames: u64,
+    pub decode_calls: u64,
+}
+
+impl PhaseTimers {
+    /// Свободная аккумуляция: поля PhaseTimers занимаются раздельно.
+    #[inline]
+    fn accrue(bucket: &mut u64, t: std::time::Instant) {
+        *bucket += t.elapsed().as_nanos() as u64;
+    }
+}
+
+fn phase_timing_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("SHTORM_PHASE_TIMING")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("on"))
+    })
+}
+
 /// The `state_*` inputs of a graph and the `out_state_*` outputs that replace them.
 struct States {
     names: Vec<String>,
@@ -447,10 +488,12 @@ impl States {
 
     /// Runs [session] with [inputs] plus the states; the new states are kept, the other
     /// outputs (in graph order) returned as float vectors.
+    /// CUDA-P1: `tim` — накопитель (время session.run, время извлечения выводов).
     fn run(
         &mut self,
         session: &mut Session,
         inputs: Vec<(String, DynValue)>,
+        tim: Option<(&mut u64, &mut u64)>,
     ) -> Result<Vec<Vec<f32>>> {
         let mut feed: Vec<(Cow<str>, SessionInputValue)> = inputs
             .into_iter()
@@ -464,7 +507,10 @@ impl States {
             .iter()
             .map(|o| o.name().to_string())
             .collect();
+        let t = std::time::Instant::now();
         let mut outputs = session.run(feed)?;
+        let run_elapsed = t.elapsed();
+        let t = std::time::Instant::now();
         let mut plain = Vec::new();
         let mut states = Vec::with_capacity(self.names.len());
         for name in &out_names {
@@ -484,6 +530,11 @@ impl States {
             self.names.len()
         );
         self.values = states;
+        let ext_elapsed = t.elapsed();
+        if let Some((run_ns, ext_ns)) = tim {
+            *run_ns += run_elapsed.as_nanos() as u64;
+            *ext_ns += ext_elapsed.as_nanos() as u64;
+        }
         Ok(plain)
     }
 }
@@ -818,6 +869,12 @@ impl Pocket {
         if let Some(base) = self.seed {
             self.rng = rand::rngs::StdRng::seed_from_u64(base.wrapping_add(chunk_index));
         }
+        let mut tim = if phase_timing_on() {
+            Some(PhaseTimers::default())
+        } else {
+            None
+        };
+        let t_prep = std::time::Instant::now();
         let (prepared, words) = Self::prepare_text(text);
         let eos_extra = self.resolve_eos_extra(words);
         let ids = self.bpe.encode(&prepared);
@@ -827,7 +884,14 @@ impl Pocket {
             let out = self.text.run(ort::inputs!{ "token_ids" => Tensor::from_array(Array::from_shape_vec((1, n), ids)?)? })?;
             out["embeddings"].try_extract_tensor::<f32>()?.1.to_vec()
         };
+        if let Some(t) = &mut tim {
+            PhaseTimers::accrue(&mut t.prep_ns, t_prep);
+        }
+        let t_v = std::time::Instant::now();
         let cond_voice = self.voice(voice)?;
+        if let Some(t) = &mut tim {
+            PhaseTimers::accrue(&mut t.voice_ns, t_v);
+        }
         // at most what the text could need (upstream: 3 tokens a second + 2 s), 12.5 frames a second
         let max_frames = (((n as f32 / 3.0) + 2.0) * 12.5).ceil() as usize;
         let limit = speech_limit_frames(&prepared).min(max_frames);
@@ -844,7 +908,7 @@ impl Pocket {
             } else {
                 max_frames
             };
-            let (l, ended) = self.generate(&cond_voice, &emb, n, cap, eos_extra)?;
+            let (l, ended) = self.generate(&cond_voice, &emb, n, cap, eos_extra, &mut tim)?;
             latents = l;
             if ended || !self.anti_repeat {
                 break;
@@ -858,22 +922,61 @@ impl Pocket {
             }
         }
         // the decoder, 15 frames at a time (as the streaming runtime does)
+        let t_dec = std::time::Instant::now();
         self.decoder_states.reset()?;
         let frames = latents.len() / 32;
         let mut audio = Vec::with_capacity(frames * 1920);
         for start in (0..frames).step_by(15) {
             let k = (frames - start).min(15);
             let chunk = latents[start * 32..(start + k) * 32].to_vec();
-            let out = self.decoder_states.run(
-                &mut self.decoder,
-                vec![("latent".into(), f32_tensor(vec![1, k, 32], chunk)?)],
-            )?;
+            let mut run_ns = 0u64;
+            let mut ext_ns = 0u64;
+            let out = if tim.is_some() {
+                self.decoder_states.run(
+                    &mut self.decoder,
+                    vec![("latent".into(), f32_tensor(vec![1, k, 32], chunk)?)],
+                    Some((&mut run_ns, &mut ext_ns)),
+                )?
+            } else {
+                self.decoder_states.run(
+                    &mut self.decoder,
+                    vec![("latent".into(), f32_tensor(vec![1, k, 32], chunk)?)],
+                    None,
+                )?
+            };
             audio.extend_from_slice(&out[0]);
+            if let Some(t) = &mut tim {
+                t.dec_run_ns += run_ns;
+                t.dec_ext_ns += ext_ns;
+                t.decode_calls += 1;
+            }
+        }
+        if let Some(t) = &tim {
+            let dec_total = t_dec.elapsed().as_nanos() as u64;
+            eprintln!(
+                "phase | chunk {chunk_index}: frames {} dec_calls {} | prep {:.1} voice {:.1} reset {:.1} prefix {:.1} input {:.1} main_run {:.1} main_ext {:.1} noise {:.1} flow_run {:.1} flow_ext {:.1} dec_run {:.1} dec_ext {:.1} dec_total {:.1} ms",
+                t.frames,
+                t.decode_calls,
+                t.prep_ns as f64 / 1e6,
+                t.voice_ns as f64 / 1e6,
+                t.reset_ns as f64 / 1e6,
+                t.prefix_ns as f64 / 1e6,
+                t.input_ns as f64 / 1e6,
+                t.main_run_ns as f64 / 1e6,
+                t.main_ext_ns as f64 / 1e6,
+                t.noise_ns as f64 / 1e6,
+                t.flow_run_ns as f64 / 1e6,
+                t.flow_ext_ns as f64 / 1e6,
+                t.dec_run_ns as f64 / 1e6,
+                t.dec_ext_ns as f64 / 1e6,
+                dec_total as f64 / 1e6,
+            );
         }
         Ok(audio)
     }
 
     /// The latent frames of one try, at most [cap]; true if the model ended the speech itself.
+    /// CUDA-P1: `tim` — опциональный накопитель фаз (см. [PhaseTimers]).
     fn generate(
         &mut self,
         voice: &Array3<f32>,
@@ -881,11 +984,17 @@ impl Pocket {
         n: usize,
         cap: usize,
         eos_extra: usize,
+        tim: &mut Option<PhaseTimers>,
     ) -> Result<(Vec<f32>, bool)> {
+        let t_reset = std::time::Instant::now();
         self.main_states.reset()?;
+        if let Some(t) = tim {
+            PhaseTimers::accrue(&mut t.reset_ns, t_reset);
+        }
         let empty_seq = || f32_tensor(vec![1, 0, 32], Vec::new());
         // voice, then text, into the transformer's memory
         let vf = voice.shape()[1];
+        let t_prefix = std::time::Instant::now();
         self.main_states.run(
             &mut self.main,
             vec![
@@ -895,6 +1004,8 @@ impl Pocket {
                     f32_tensor(vec![1, vf, 1024], voice.iter().copied().collect())?,
                 ),
             ],
+            tim.as_mut()
+                .map(|t| (&mut t.main_run_ns, &mut t.main_ext_ns)),
         )?;
         self.main_states.run(
             &mut self.main,
@@ -905,29 +1016,43 @@ impl Pocket {
                     f32_tensor(vec![1, n, 1024], emb.to_vec())?,
                 ),
             ],
+            tim.as_mut()
+                .map(|t| (&mut t.main_run_ns, &mut t.main_ext_ns)),
         )?;
+        if let Some(t) = tim {
+            PhaseTimers::accrue(&mut t.prefix_ns, t_prefix);
+        }
 
         let normal = Normal::new(0.0f32, self.temperature.max(0.0).sqrt()).unwrap();
         let mut prev = vec![f32::NAN; 32]; // the first frame starts from "nothing"
         let mut latents: Vec<f32> = Vec::with_capacity(cap * 32);
         let mut gate = EosGate::new();
         for _ in 0..cap {
+            let t_input = std::time::Instant::now();
+            let seq = f32_tensor(vec![1, 1, 32], prev.clone())?;
+            let emb_empty = f32_tensor(vec![1, 0, 1024], Vec::new())?;
+            if let Some(t) = tim {
+                PhaseTimers::accrue(&mut t.input_ns, t_input);
+            }
             let out = self.main_states.run(
                 &mut self.main,
                 vec![
-                    ("sequence".into(), f32_tensor(vec![1, 1, 32], prev.clone())?),
-                    (
-                        "text_embeddings".into(),
-                        f32_tensor(vec![1, 0, 1024], Vec::new())?,
-                    ),
+                    ("sequence".into(), seq),
+                    ("text_embeddings".into(), emb_empty),
                 ],
+                tim.as_mut()
+                    .map(|t| (&mut t.main_run_ns, &mut t.main_ext_ns)),
             )?;
+            if let Some(t) = tim {
+                t.frames += 1;
+            }
             let (cond, eos_logit) = (&out[0], out[1][0]);
             if !gate.tick(eos_logit > self.eos_threshold, eos_extra) {
                 break;
             }
             // from noise to the frame's latent: the flow head's steps s → t over 0 → 1
             // (as upstream's decoding and PocketTTS.cpp: x += dir · (t − s))
+            let t_noise = std::time::Instant::now();
             let mut x: Vec<f32> = (0..32)
                 .map(|_| {
                     if self.temperature > 0.0 {
@@ -937,16 +1062,32 @@ impl Pocket {
                     }
                 })
                 .collect();
+            if let Some(t) = tim {
+                PhaseTimers::accrue(&mut t.noise_ns, t_noise);
+            }
             let steps = self.decode_steps.clamp(1, 8);
             for j in 0..steps {
                 let (s, t) = (j as f32 / steps as f32, (j + 1) as f32 / steps as f32);
+                let t_in = std::time::Instant::now();
+                let c = Tensor::from_array(Array::from_shape_vec(1024, cond.clone())?)?;
+                let st = Tensor::from_array(Array::from_shape_vec((1, 1), vec![s])?)?;
+                let tt = Tensor::from_array(Array::from_shape_vec((1, 1), vec![t])?)?;
+                let xx = Tensor::from_array(Array::from_shape_vec((1, 32), x.clone())?)?;
+                if let Some(tm) = tim {
+                    PhaseTimers::accrue(&mut tm.input_ns, t_in);
+                }
+                let t_run = std::time::Instant::now();
                 let flow = self.flow.run(ort::inputs! {
-                    "c" => Tensor::from_array(Array::from_shape_vec(1024, cond.clone())?)?,
-                    "s" => Tensor::from_array(Array::from_shape_vec((1, 1), vec![s])?)?,
-                    "t" => Tensor::from_array(Array::from_shape_vec((1, 1), vec![t])?)?,
-                    "x" => Tensor::from_array(Array::from_shape_vec((1, 32), x.clone())?)?
+                    "c" => c, "s" => st, "t" => tt, "x" => xx
                 })?;
+                if let Some(tm) = tim {
+                    PhaseTimers::accrue(&mut tm.flow_run_ns, t_run);
+                }
+                let t_ext = std::time::Instant::now();
                 let dir = flow["flow_dir"].try_extract_tensor::<f32>()?.1.to_vec();
+                if let Some(tm) = tim {
+                    PhaseTimers::accrue(&mut tm.flow_ext_ns, t_ext);
+                }
                 for (a, d) in x.iter_mut().zip(&dir) {
                     *a += d * (t - s);
                 }
