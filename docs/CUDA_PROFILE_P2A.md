@@ -311,3 +311,119 @@ PATH="deps/portable:$PATH" SHTORM_P2A_DEVICE=cuda \
   синтетические фикстуры и их генератор.
 - Сырые данные: `out/p2a/` (runs/, summary_p2a.json, traces_old|new,
   graph_meta_cuda.txt, bench*.sh, analyze.py, copies.py, monitor.ps1).
+
+## 13. CUDA-P2A.1 — стабилизация и включение по умолчанию (2026-11-09)
+
+Базовый HEAD перед этапом — `9133450` (docs-коммит P2A). Бэкап:
+`\DISKSTATION\Ableton 2\Temp2\ShtormTTS-Windows-full-9133450-20261109-232858.zip`,
+SHA256 `8709B433800205DFF49E06E4C19A0533C0F2A1BEC667A8E837C2A40DB5A1F09A`,
+144/144 blob совпали с HEAD. Python-проект и системные настройки не менялись.
+
+### 13.1. Аудит владения и времени жизни (`ort` 2.0.0-rc.11 + ORT 1.23.2)
+
+Изучены `src/io_binding.rs`, `src/session/mod.rs`, `src/session/output.rs`,
+`src/value/mod.rs`, `src/util/map.rs` crate `ort` и `IOBinding.cc`,
+`inference_session.cc`, `onnxruntime_c_api.h` ORT 1.23.2
+(`out/p2a/ort_src/`). Результат:
+
+- **Владение сессией**: `IoBinding` хранит `_session: Arc<SharedSessionInner>`;
+  `SharedSessionInner::drop` вызывает `ReleaseSession`. Даже если
+  `Pocket::main` (поле `Session`) уничтожается раньше `main_io` (порядок
+  объявления полей), ORT-сессия живёт до освобождения обоих binding'ов.
+  Порядок полей не менялся.
+- **Входы**: `bind_input` сохраняет `Arc<ValueInner>` в `held_inputs`
+  (MiniMap с заменой по имени). Источники H2D-копий живы до перепривязки;
+  данные копируются в момент bind (`CopyOneInputAcrossDevices`), CPU→CUDA —
+  реальная копия, CUDA→CUDA — алиас без копии.
+- **Выходы**: `GetBoundOutputValues` возвращает независимо выделенные
+  refcounted `OrtValue`; `run_binding` оборачивает каждый в `DynValue` с
+  `drop=true` и `Arc` сессии, массив освобождается аллокатором ORT.
+  `SessionOutputs::remove` возвращает `DynValue::clone_of` (Arc-клон), так
+  что хранение состояний между прогонами корректно; двойного освобождения
+  нет (нет ручных указателей, в `IoStates` нет `unsafe`).
+- **Синхронизация**: после каждого `RunWithBinding` вызывается
+  `synchronize_outputs()` (`SyncProviders` → `cudaStreamSynchronize`) до
+  чтения CPU-выходов и перепривязки состояний. Асинхронные H2D-копии
+  входов упорядочены тем же stream'ом; источники удерживаются binding'ом.
+- **Ping-pong**: run k пишет в буферы binding k%2, читает состояния
+  прошлого прогона из binding (k−1)%2 — записи в читаемый буфер нет.
+- **Ошибки**: `IoStates::run` при любой ошибке (run_binding, sync,
+  извлечение/проверка типа-формы) очищает `states`; следующий прогон
+  начинается с нулей. Привязки входа переписываются каждым прогоном, поэтому
+  «грязный» binding не используется. Отмена задания завершает текущий чанк,
+  затем уничтожает воркеров и `Pocket`; ORT при разрушении CUDA EP
+  дожидается stream'а.
+- Вывод: use-after-free/double-free не обнаружено; изменения порядка полей
+  и `unsafe` не потребовались.
+
+### 13.2. Переключатель и включение по умолчанию
+
+`SHTORM_CUDA_IO_BINDING` (читается при `Pocket::load`):
+
+| Значение | CPU | CUDA |
+|---|---|---|
+| не задана (`Auto`) | прежний путь (не изменён) | **I/O Binding (по умолчанию)** |
+| `1` / `on` / `true` | явная ошибка «requires a CUDA device» | I/O Binding |
+| `0` / `off` / `false` | прежний путь | принудительно старый путь (логируется) |
+| иное | ошибка разбора (опечатка не меняет путь) | ошибка разбора |
+
+Скрытого fallback на CPU при ошибках GPU нет: ошибки инициализации/форм —
+явные. GUI-автоматика CUDA по-прежнему 1 воркер (`effective_workers`).
+
+### 13.3. CUDA-тесты жизненного цикла (новые, `#[ignore]`)
+
+`cargo test --release -p shtorm-engine --lib <имя> -- --ignored --nocapture`
+с `SHTORM_TEST_CUDA=1`, `SHTORM_DIR=…ru-v2-slow`, `PATH`/`ORT_DYLIB_PATH` из
+`deps/portable`:
+
+- `cuda_io_binding_parity_across_chunks_and_retry` — три последовательных
+  чанка одним `Pocket`: старый и новый пути побитово равны (3.58 с legacy
+  против 1.02 с binding); anti-repeat retry при `eos_threshold=100`
+  (EOS не срабатывает, обе попытки выполняются): 232 320 сэмплов у обоих
+  путей, без повтора — 163 200 сэмплов (вторая попытка действительно была).
+- `cuda_repeated_load_say_drop_releases_vram` — 4 цикла
+  load→say→drop: пик 2552–2571 МБ, после drop 646–652 МБ (base 539 МБ),
+  роста от цикла к циклу нет.
+- `cuda_two_concurrent_pockets_match_single` — два `Pocket` в двух потоках
+  дают побитово те же результаты, что один последовательный.
+
+### 13.4. Реальные регрессии
+
+- **13 чанков / 64.01 с речи**, seed 42, temp 0.3, steps 1, EOS −4/5/3,
+  FP32/TF32=0, ru-v2-slow (`out/p2a1/runs/`):
+
+  | Режим | W | Wall, с | Генерация, с | RTF | main, мс/кадр | GPU avg/max | VRAM пик, МБ |
+  |---|---:|---:|---:|---:|---:|---|---:|
+  | по умолчанию (binding) | 1 | 9.32 | 9.05 | 0.129 | 5.65 | 37.7/48 | 2688 |
+  | по умолчанию (binding) | 2 | 8.91 | 8.62 | 0.123 | 10.04 | 41.8/48 | 4738 |
+  | legacy (`=0`) | 1 | 33.31 | 33.06 | 0.472 | 34.5 | 37.2/46 | 2689 |
+
+  Чистые прогоны без монитора: binding 1w 8.79–8.89 с (RTF 0.126–0.127),
+  2w 8.53–8.56 с (0.122); legacy 1w 32.35 с (0.462). Показатели соответствуют
+  P2A (8.15 с / RTF 0.116 у чистого синтеза; разница — включённая в CLI
+  сводку загрузка моделей и системный шум), регрессии нет.
+- **WAV SHA256**: все 8 прогонов матрицы (clean/mon × auto/legacy × 1/2w) —
+  `5ca845c093ab73b5b101e2eda460da79b520f2ca818db8862878685d3fbd83ff`,
+  побитово равен эталону CUDA-P1/P2A.
+- **VRAM после завершения**: 539 МБ (baseline стенда) после всех прогонов.
+- **fast/slow smoke** (короткий текст, CUDA): `ru-v2-fast`
+  `7a794f8f…` и `ru-v2-slow` `d516b3f7…` — auto == legacy побитово для
+  каждой модели.
+- **GUI CUDA-матрица** (`real_matrix_device`, binding по умолчанию): WAV и
+  Opus Completed; отмена после первого готового чанка — Cancelled, итог не
+  опубликован, `.partial` и диагностический журнал есть; повторный запуск
+  после отмены — Completed. Отмена приходит, пока воркер уже генерирует
+  следующий чанк (пул не прерывает кадр посередине).
+- **CPU-матрица**: WAV/MP3 Completed, отмена/повтор, GUI↔CLI паритет
+  374444 байта — поведение прежнее (CPU-путь не изменён).
+- **Диагностика**: `graph_meta` с `SHTORM_GRAPH_META` создаёт файл
+  эксклюзивно (`create_new`); повторный запуск с тем же путём завершается
+  ошибкой «файл существует» (os error 80), существующий файл не изменён.
+
+### 13.5. Решение
+
+CUDA I/O Binding включён обычным путём для `Device::Cuda`; старый путь
+доступен обратимым диагностическим переключателем
+`SHTORM_CUDA_IO_BINDING=0`. CPU-путь не менялся. CUDA=1 остаётся
+рекомендованным автоматическим режимом GUI (2 воркера дают ~4% wall при
++2 ГБ VRAM). P2B не начинался.

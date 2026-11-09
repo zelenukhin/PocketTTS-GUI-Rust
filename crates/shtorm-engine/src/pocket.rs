@@ -592,8 +592,11 @@ pub struct Pocket {
     flow: Session,
     decoder: Session,
     main_states: States,
-    /// CUDA-P2A: экспериментальные GPU-резидентные состояния main через
-    /// I/O Binding (только Device::Cuda + SHTORM_CUDA_IO_BINDING=1; иначе None).
+    /// CUDA-P2A: GPU-резидентные состояния main через I/O Binding — обычный
+    /// путь для `Device::Cuda` (отключается `SHTORM_CUDA_IO_BINDING=0`).
+    /// Поле уничтожается после `main` (порядок объявления), но это
+    /// безопасно: `IoBinding` держит `Arc<SharedSessionInner>` и
+    /// refcounted `OrtValue` состояний (аудит P2A.1).
     main_io: Option<crate::io_states::IoStates>,
     decoder_states: States,
     bpe: Bpe,
@@ -680,26 +683,42 @@ impl Pocket {
         );
         let main_states = States::of(&main)?;
         let decoder_states = States::of(&decoder)?;
-        // CUDA-P2A: экспериментальный путь включается ТОЛЬКО диагностическим
-        // флагом и только на CUDA. Неподдерживаемая комбинация/ошибка
-        // инициализации — явная ошибка, без тихого перехода на CPU.
-        let io_binding = crate::io_states::cuda_io_binding_enabled();
-        if io_binding && !opts.device.is_cuda() {
-            anyhow::bail!(
+        // CUDA-P2A.1: I/O Binding — обычный путь для CUDA. Диагностический
+        // переключатель SHTORM_CUDA_IO_BINDING=0|off|false принудительно
+        // возвращает старый путь; явное включение на CPU — ошибка (CPU-путь
+        // не меняется, тихого fallback нет).
+        let io_choice = crate::io_states::io_binding_choice()
+            .context("CUDA-P2A: разбор SHTORM_CUDA_IO_BINDING")?;
+        let cuda = opts.device.is_cuda();
+        let io_binding = match (io_choice, cuda) {
+            (crate::io_states::IoBindingChoice::Off, _) => false,
+            (crate::io_states::IoBindingChoice::Auto, cuda) => cuda,
+            (crate::io_states::IoBindingChoice::On, true) => true,
+            (crate::io_states::IoBindingChoice::On, false) => anyhow::bail!(
                 "SHTORM_CUDA_IO_BINDING=1 requires a CUDA device; \
-                 the experimental path has no CPU variant"
-            );
-        }
-        let main_io = match &opts.device {
-            Device::Cuda { device_id, .. } if io_binding => Some(
+                 the I/O binding path has no CPU variant"
+            ),
+        };
+        let main_io = if io_binding {
+            let Device::Cuda { device_id, .. } = &opts.device else {
+                unreachable!("io binding is enabled only for CUDA")
+            };
+            Some(
                 crate::io_states::IoStates::new(
                     &main,
                     &crate::io_states::cuda_state_memory(*device_id)?,
                     &crate::io_states::cpu_output_memory()?,
                 )
                 .context("CUDA-P2A: initialize I/O binding for flow_lm_main")?,
-            ),
-            _ => None,
+            )
+        } else {
+            if cuda && io_choice == crate::io_states::IoBindingChoice::Off {
+                log::info!(
+                    "CUDA-P2A: I/O binding disabled by SHTORM_CUDA_IO_BINDING; \
+                     using the legacy CUDA path"
+                );
+            }
+            None
         };
         let bpe = Bpe::load(&dir.join("tokenizer.model"))?;
         let rng = match opts.seed {
@@ -1456,6 +1475,12 @@ mod tests {
 #[cfg(test)]
 mod real_model {
     use super::*;
+    use std::sync::Mutex;
+
+    /// CUDA-тесты P2A.1 меняют процессную переменную SHTORM_CUDA_IO_BINDING;
+    /// остальные real_model-тесты сериализуются тем же мьютексом, чтобы даже
+    /// широкий `--ignored` прогон не наблюдал чужой режим.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn dir() -> Option<PathBuf> {
         let d = std::env::var("SHTORM_DIR").ok()?;
@@ -1463,10 +1488,275 @@ mod real_model {
         p.join("flow_lm_main.onnx").exists().then_some(p)
     }
 
+    fn cuda_dir() -> Option<PathBuf> {
+        if std::env::var("SHTORM_TEST_CUDA").as_deref() != Ok("1") {
+            return None;
+        }
+        dir()
+    }
+
+    fn voice(dir: &Path) -> String {
+        std::env::var("VOICE").unwrap_or_else(|_| format!("{}/alba.wav", dir.display()))
+    }
+
+    /// Восстанавливает переменную окружения при выходе из области (включая
+    /// панику): общий режим процесса не должен утекать в другие тесты.
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, old }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let old = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn cuda_load(dir: &Path, threads: usize) -> Pocket {
+        Pocket::load(
+            dir,
+            &LoadOptions {
+                device: Device::cuda(0),
+                threads,
+                seed: Some(42),
+                profile_dir: None,
+            },
+        )
+        .expect("CUDA Pocket::load")
+    }
+
+    fn words(audio: &[f32]) -> Vec<u32> {
+        audio.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// Суммарная занятая VRAM (МБ). Per-process used_memory на WDDM отдаёт
+    /// `[N/A]`, поэтому мерим суммарно, как монитор CUDA-P2A; процесс без
+    /// сессий не добавляет памяти, а загрузка моделей даёт устойчивую дельту
+    /// ~1.4 ГиБ — этого достаточно для проверки освобождения.
+    fn vram_used_mb() -> Option<u64> {
+        let out = std::process::Command::new("nvidia-smi")
+            .args(["--query-gpu=memory.used", "--format=csv,noheader,nounits"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        text.lines().next()?.trim().parse::<u64>().ok()
+    }
+
+    /// P2A.1: несколько последовательных чанков одним Pocket, принудительный
+    /// anti-repeat retry и побитовое равенство старого/нового CUDA-путей.
+    /// SHTORM_TEST_CUDA=1 SHTORM_DIR=… ORT_DYLIB_PATH=… PATH=…deps/portable… \
+    ///   cargo test --release -p shtorm-engine --lib \
+    ///   cuda_io_binding_parity_across_chunks_and_retry -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn cuda_io_binding_parity_across_chunks_and_retry() {
+        let Some(d) = cuda_dir() else { return };
+        let _lock = ENV_LOCK.lock().unwrap();
+        let voice = voice(&d);
+        let texts = [
+            "Стре\u{301}лки часо\u{301}в показывали по\u{301}лночь.",
+            "Ну? Хорошо\u{301}.",
+            "Мо\u{301}жет быть, да.",
+        ];
+
+        let timed = |label: &str, f: &mut dyn FnMut() -> Vec<Vec<f32>>| {
+            let t = std::time::Instant::now();
+            let got = f();
+            eprintln!(
+                "[{label}] {} чанков, {:.2} с, {:.0} сэмплов",
+                got.len(),
+                t.elapsed().as_secs_f32(),
+                got.iter().map(|a| a.len()).sum::<usize>() as f32 / POCKET_RATE as f32
+            );
+            got
+        };
+
+        // 1) Три чанка подряд одним Pocket: старый путь vs I/O Binding.
+        let legacy = {
+            let _g = EnvGuard::set("SHTORM_CUDA_IO_BINDING", "0");
+            let mut p = cuda_load(&d, 4);
+            timed("legacy/chunks", &mut || {
+                texts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| p.say_chunk(t, &voice, i as u64).expect("legacy say"))
+                    .collect()
+            })
+        };
+        let binding = {
+            let _g = EnvGuard::set("SHTORM_CUDA_IO_BINDING", "1");
+            let mut p = cuda_load(&d, 4);
+            timed("binding/chunks", &mut || {
+                texts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| p.say_chunk(t, &voice, i as u64).expect("binding say"))
+                    .collect()
+            })
+        };
+        assert_eq!(legacy.len(), binding.len());
+        for (i, (a, b)) in legacy.iter().zip(&binding).enumerate() {
+            assert_eq!(
+                words(a),
+                words(b),
+                "чанк {i}: старый и новый CUDA-пути разошлись"
+            );
+        }
+
+        // 2) Anti-repeat retry: порог 100 никогда не пересекается — после
+        // первой попытки generate() делает reset() и говорит заново.
+        let retry_text =
+            "Четв\u{301}ёртая попытка проверяет сброс состоя\u{301}ний между повторами.";
+        let one_run = |flag: Option<&str>, anti_repeat: bool| {
+            let _g = match flag {
+                Some(v) => EnvGuard::set("SHTORM_CUDA_IO_BINDING", v),
+                None => EnvGuard::unset("SHTORM_CUDA_IO_BINDING"),
+            };
+            let mut p = cuda_load(&d, 4);
+            p.eos_threshold = 100.0; // EOS не срабатывает — обе попытки выполняются
+            p.anti_repeat = anti_repeat;
+            p.say_chunk(retry_text, &voice, 9).expect("retry say")
+        };
+        let legacy_retry = one_run(Some("0"), true);
+        let binding_retry = one_run(Some("1"), true);
+        let single_attempt = one_run(Some("0"), false);
+        eprintln!(
+            "[retry] legacy {} сэмплов, binding {} сэмплов, без повтора {} сэмплов",
+            legacy_retry.len(),
+            binding_retry.len(),
+            single_attempt.len()
+        );
+        assert_eq!(
+            words(&legacy_retry),
+            words(&binding_retry),
+            "anti-repeat retry: старый и новый пути разошлись"
+        );
+        assert!(
+            legacy_retry.len() > single_attempt.len(),
+            "вторая попытка не сработала: {} <= {}",
+            legacy_retry.len(),
+            single_attempt.len()
+        );
+    }
+
+    /// P2A.1: многократное создание/синтез/уничтожение Pocket на CUDA не
+    /// накапливает VRAM. SHTORM_TEST_CUDA=1 SHTORM_DIR=… ORT_DYLIB_PATH=… \
+    ///   PATH=…deps/portable… cargo test --release -p shtorm-engine --lib \
+    ///   cuda_repeated_load_say_drop_releases_vram -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn cuda_repeated_load_say_drop_releases_vram() {
+        let Some(d) = cuda_dir() else { return };
+        let _lock = ENV_LOCK.lock().unwrap();
+        let voice = voice(&d);
+        let Some(base) = vram_used_mb() else {
+            eprintln!("[vram] nvidia-smi недоступен — проверка пропущена");
+            return;
+        };
+
+        let mut settled = Vec::new();
+        for cycle in 0..4 {
+            let mut p = cuda_load(&d, 4);
+            let audio = p
+                .say_chunk("Ну? Хорошо\u{301}.", &voice, cycle)
+                .expect("say");
+            assert!(!audio.is_empty());
+            let peak = vram_used_mb().expect("nvidia-smi во время сессии");
+            assert!(
+                peak >= base + 600,
+                "цикл {cycle}: модели не появились в VRAM ({peak} МБ против base {base} МБ)"
+            );
+
+            drop(p);
+            let mut after = peak;
+            for _ in 0..40 {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                after = vram_used_mb().expect("nvidia-smi после drop");
+                if after <= base + 128 {
+                    break;
+                }
+            }
+            eprintln!("[vram] цикл {cycle}: base {base} МБ, пик {peak} МБ, после drop {after} МБ");
+            assert!(
+                after <= base + 256,
+                "цикл {cycle}: VRAM не освобождена после drop: {after} МБ (base {base} МБ)"
+            );
+            settled.push(after);
+        }
+        assert!(
+            settled[3] <= settled[0] + 128,
+            "VRAM растёт от цикла к циклу: {settled:?}"
+        );
+    }
+
+    /// P2A.1: два CUDA-воркера (два Pocket одновременно) дают те же биты,
+    /// что и последовательный синтез одним экземпляром.
+    /// SHTORM_TEST_CUDA=1 SHTORM_DIR=… ORT_DYLIB_PATH=… PATH=…deps/portable… \
+    ///   cargo test --release -p shtorm-engine --lib \
+    ///   cuda_two_concurrent_pockets_match_single -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn cuda_two_concurrent_pockets_match_single() {
+        let Some(d) = cuda_dir() else { return };
+        let _lock = ENV_LOCK.lock().unwrap();
+        let voice = voice(&d);
+        let texts = ["Ну? Хорошо\u{301}.", "Мо\u{301}жет быть, да."];
+
+        let sequential = {
+            let mut p = cuda_load(&d, 4);
+            texts
+                .iter()
+                .enumerate()
+                .map(|(i, t)| p.say_chunk(t, &voice, i as u64).expect("sequential"))
+                .collect::<Vec<_>>()
+        };
+
+        let mut a = cuda_load(&d, 4);
+        let mut b = cuda_load(&d, 4);
+        let va = voice.clone();
+        let vb = voice.clone();
+        let h1 = std::thread::spawn(move || a.say_chunk(texts[0], &va, 0).expect("worker 0"));
+        let h2 = std::thread::spawn(move || b.say_chunk(texts[1], &vb, 1).expect("worker 1"));
+        let concurrent = vec![h1.join().unwrap(), h2.join().unwrap()];
+
+        for (i, (seq, conc)) in sequential.iter().zip(&concurrent).enumerate() {
+            assert_eq!(
+                words(seq),
+                words(conc),
+                "чанк {i}: два одновременных CUDA-воркера дали другой результат"
+            );
+        }
+        eprintln!(
+            "[concurrent] 2 воркера == 1 воркер, {} сэмплов",
+            concurrent.iter().map(|a| a.len()).sum::<usize>()
+        );
+    }
+
     /// SHTORM_DIR=… ORT_DYLIB_PATH=… cargo test -p shtorm-engine --lib speaks -- --ignored --nocapture
     #[test]
     #[ignore]
     fn speaks() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let Some(d) = dir() else { return };
         let mut p = Pocket::load(
             &d,
@@ -1495,6 +1785,7 @@ mod real_model {
     #[test]
     #[ignore]
     fn deterministic() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let Some(d) = dir() else { return };
         let voice = std::env::var("VOICE").unwrap_or_else(|_| format!("{}/alba.wav", d.display()));
         let text = "Стре\u{301}лки часо\u{301}в показывали по\u{301}лночь.";

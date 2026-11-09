@@ -18,10 +18,20 @@
 //! - маленькие выходы (`conditioning`, `eos_logit`) привязаны к CPU-памяти —
 //!   единственные покадровые D2H-передачи (~4.1 КиБ).
 //!
-//! Путь включается только диагностическим флагом `SHTORM_CUDA_IO_BINDING=1`
-//! (`Device::Cuda`); ошибки инициализации/форм — явные, без тихого отката.
+//! CUDA-P2A.1: путь — обычный режим для `Device::Cuda` (по умолчанию).
+//! Диагностический переключатель `SHTORM_CUDA_IO_BINDING=0|off|false`
+//! принудительно возвращает старый CUDA-путь для сравнения/поиска ошибок;
+//! `1|on|true` — явно включает (на CPU это ошибка); не задан — включается
+//! только на CUDA. Ошибки инициализации/форм — явные, без тихого отката.
 //! Семантика генерации не меняется: те же входы, те же веса, тот же порядок
 //! прогонов — ожидается побитовый паритет с обычным путём.
+//!
+//! Владение (аудит P2A.1, `ort` 2.0.0-rc.11): `IoBinding` хранит
+//! `Arc<SharedSessionInner>` (сессия живёт до освобождения binding'а) и
+//! `Arc<ValueInner>` всех привязанных входов (источники копий живы до
+//! перепривязки); `GetBoundOutputValues` возвращает собственные refcounted
+//! `OrtValue`, освобождаемые в `Drop`. Порядок полей `Pocket` поэтому
+//! безопасен, несмотря на то что `main` объявлен раньше `main_io`.
 
 use anyhow::{bail, Context, Result};
 use ndarray::{Array, IxDyn};
@@ -31,10 +41,37 @@ use ort::session::Session;
 use ort::tensor::TensorElementType;
 use ort::value::{DynTensorValueType, DynValue, Tensor, ValueType};
 
-/// Диагностический флаг CUDA-P2A. Читается при загрузке движка (один раз на
-/// экземпляр); по умолчанию выключен — работает проверенный путь.
-pub(crate) fn cuda_io_binding_enabled() -> bool {
-    std::env::var("SHTORM_CUDA_IO_BINDING").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("on"))
+/// Режим CUDA I/O Binding (P2A.1). Читается при загрузке движка; по
+/// умолчанию (переменная не задана) включён только для CUDA.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IoBindingChoice {
+    /// Переменная не задана: CUDA — I/O Binding, CPU — прежний путь.
+    Auto,
+    /// Явно включено; на CPU — ошибка (у пути нет CPU-варианта).
+    On,
+    /// Принудительно старый CUDA-путь (обратимый диагностический переключатель).
+    Off,
+}
+
+/// Разбор `SHTORM_CUDA_IO_BINDING`: не задана → Auto; `1|on|true` → On;
+/// `0|off|false` → Off; иное — явная ошибка (опечатка не должна молча
+/// менять путь исполнения).
+pub(crate) fn io_binding_choice() -> Result<IoBindingChoice> {
+    match std::env::var("SHTORM_CUDA_IO_BINDING") {
+        Ok(raw) => parse_io_binding_choice(&raw),
+        Err(_) => Ok(IoBindingChoice::Auto),
+    }
+}
+
+fn parse_io_binding_choice(raw: &str) -> Result<IoBindingChoice> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "on" | "true" => Ok(IoBindingChoice::On),
+        "0" | "off" | "false" => Ok(IoBindingChoice::Off),
+        other => bail!(
+            "SHTORM_CUDA_IO_BINDING: ожидается 1|on|true (включить) или \
+             0|off|false (старый CUDA-путь), получено '{other}'"
+        ),
+    }
 }
 
 /// Пара «вход state_* → выход out_state_*» с ожидаемыми типом и формой входа.
@@ -246,7 +283,27 @@ impl IoStates {
     /// не-stateful входы (для main: sequence/text_embeddings). Возвращает
     /// не-stateful выходы в порядке графа; новые состояния остаются на GPU.
     /// `tim` — накопитель (время run_binding, время извлечения/проверок).
+    ///
+    /// Ошибка (run_binding, sync, извлечение/проверка выхода) отбрасывает
+    /// состояния: следующий прогон начнётся с нулей, а не со смеси старых и
+    /// новых буферов. Привязки входа при этом всё равно переписываются
+    /// каждым прогоном — «грязный» binding не используется повторно.
     pub(crate) fn run(
+        &mut self,
+        session: &mut Session,
+        inputs: Vec<(String, DynValue)>,
+        tim: Option<(&mut u64, &mut u64)>,
+    ) -> Result<Vec<Vec<f32>>> {
+        match self.run_once(session, inputs, tim) {
+            Ok(plain) => Ok(plain),
+            Err(e) => {
+                self.states.clear();
+                Err(e)
+            }
+        }
+    }
+
+    fn run_once(
         &mut self,
         session: &mut Session,
         inputs: Vec<(String, DynValue)>,
@@ -456,6 +513,29 @@ mod tests {
 
     fn use_cuda() -> bool {
         std::env::var("SHTORM_P2A_DEVICE").is_ok_and(|v| v.eq_ignore_ascii_case("cuda"))
+    }
+
+    /// Переключатель P2A.1: явные значения включения/выключения и отказ на
+    /// опечатке; отсутствие переменной (Auto) проверяется в `Pocket::load`.
+    #[test]
+    fn parses_io_binding_switch() {
+        assert_eq!(parse_io_binding_choice("1").unwrap(), IoBindingChoice::On);
+        assert_eq!(parse_io_binding_choice("ON").unwrap(), IoBindingChoice::On);
+        assert_eq!(
+            parse_io_binding_choice(" true ").unwrap(),
+            IoBindingChoice::On
+        );
+        assert_eq!(parse_io_binding_choice("0").unwrap(), IoBindingChoice::Off);
+        assert_eq!(
+            parse_io_binding_choice("off").unwrap(),
+            IoBindingChoice::Off
+        );
+        assert_eq!(
+            parse_io_binding_choice("False").unwrap(),
+            IoBindingChoice::Off
+        );
+        let err = parse_io_binding_choice("yes").unwrap_err().to_string();
+        assert!(err.contains("SHTORM_CUDA_IO_BINDING"), "{err}");
     }
 
     fn make_session(path: &Path, cuda: bool) -> Result<Session> {

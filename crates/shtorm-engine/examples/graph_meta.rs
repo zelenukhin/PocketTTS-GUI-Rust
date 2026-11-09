@@ -46,7 +46,20 @@ fn main() -> Result<()> {
             if let Some(parent) = p.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
-            Box::new(std::fs::File::create(p)?)
+            // Диагностика не перезаписывает существующие файлы: только
+            // эксклюзивное создание по уникальному пути (SAFETY_AUDIT).
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(p)
+                .with_context(|| {
+                    format!(
+                        "SHTORM_GRAPH_META: {} уже существует (перезапись запрещена) \
+                         или не может быть создан; задайте уникальный путь",
+                        p.display()
+                    )
+                })?;
+            Box::new(file)
         }
         Err(_) => Box::new(std::io::stdout()),
     };
