@@ -11,7 +11,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use app_core::pipeline::{
-    synthesize_stream, PipelineOptions, RunStatus, StreamError, StreamOutcome,
+    synthesize_stream, write_diag_log, DiagMeta, PipelineOptions, RunStatus, StreamError,
+    StreamOutcome,
 };
 use app_core::sink::{make_sink, OutputFormat};
 use shtorm_engine::Device;
@@ -182,12 +183,28 @@ fn run() -> Result<ExitCode> {
 
     // Отмена: Ctrl+C ставит флаг; воркеры дорабатывают текущий чанк, sink
     // останавливается, итоговый файл не публикуется (RunStatus::Cancelled).
+    // Результат установки обработчика не игнорируем: повторная установка
+    // (тесты) — предупреждение, продолжаем работать через API-флаг.
     let cancel = Arc::new(AtomicBool::new(false));
     {
         let c = Arc::clone(&cancel);
-        let _ = ctrlc::set_handler(move || {
+        if let Err(e) = ctrlc::set_handler(move || {
             c.store(true, Ordering::SeqCst);
-        });
+        }) {
+            eprintln!("ВНИМАНИЕ: обработчик Ctrl+C не установлен ({e}); отмена через API/Stop остаётся доступной");
+        }
+    }
+    // Тестовый хук детерминированной отмены (SHTORM_TEST_CANCEL_AFTER_MS):
+    // сам выставляет тот же флаг через N мс — сквозная проверка пути отмены
+    // без посылки сигналов извне.
+    if let Ok(ms) = std::env::var("SHTORM_TEST_CANCEL_AFTER_MS") {
+        if let Ok(ms) = ms.parse::<u64>() {
+            let c = Arc::clone(&cancel);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                c.store(true, Ordering::SeqCst);
+            });
+        }
     }
 
     let sink = make_sink(
@@ -217,7 +234,7 @@ fn run() -> Result<ExitCode> {
                     &args.out,
                     "Failed",
                     &format!("{}\nпричина: ошибка выполнения задания", se.message),
-                    Some(se),
+                    &DiagMeta::from_error(se),
                 );
                 eprintln!("ДИАГНОСТИКА: {se}");
                 if let Some(p) = &diag {
@@ -234,6 +251,7 @@ fn run() -> Result<ExitCode> {
         } else {
             "отменено"
         };
+        // метаданные — из StreamOutcome (прогресс/seed/черновик), не None
         let diag = write_diag_log(
             &args.out,
             "Cancelled",
@@ -241,7 +259,7 @@ fn run() -> Result<ExitCode> {
                 "{reason}; черновик сохранён: {}",
                 outcome.partial_path.display()
             ),
-            None,
+            &DiagMeta::from_outcome(&outcome),
         );
         println!(
             "ОТМЕНЕНО: обработано {}/{} чанков; итоговый файл {} НЕ создан; черновик: {}",
@@ -305,59 +323,6 @@ pub fn log_path_for(out: &Path) -> PathBuf {
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
     out.with_file_name(format!("{stem}_log.txt"))
-}
-
-/// Уникальный диагностический журнал отмены/ошибки (эксклюзивное имя, без
-/// удалений). Возвращает путь или None с предупреждением — журнал не должен
-/// маскировать основной статус.
-fn write_diag_log(
-    out: &Path,
-    status: &str,
-    details: &str,
-    err: Option<&StreamError>,
-) -> Option<PathBuf> {
-    use std::io::Write;
-    let stem = out
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let path = out.with_file_name(format!(
-        "{stem}.{nanos}.{}.diagnostic_log.txt",
-        std::process::id()
-    ));
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-    {
-        Ok(mut w) => {
-            let _ = writeln!(w, "Диагностический журнал задания (A5.1)");
-            let _ = writeln!(w, "Статус: {status}");
-            let _ = writeln!(w, "Детали: {details}");
-            if let Some(e) = err {
-                let _ = writeln!(
-                    w,
-                    "Прогресс: {}/{} чанков; base_seed {}; черновик: {}",
-                    e.chunks_done,
-                    e.total,
-                    e.base_seed,
-                    e.partial.display()
-                );
-            }
-            Some(path)
-        }
-        Err(e) => {
-            eprintln!(
-                "примечание: не удалось создать диагностический журнал {}: {e}",
-                path.display()
-            );
-            None
-        }
-    }
 }
 
 fn write_chunk_log(path: &Path, o: &StreamOutcome, args: &Args) -> Result<()> {

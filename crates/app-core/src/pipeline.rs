@@ -373,6 +373,103 @@ impl std::fmt::Display for StreamError {
 }
 impl std::error::Error for StreamError {}
 
+/// Обёртка ошибки пула в StreamError (выделено для регрессионного теста
+/// мок-сбоя без ONNX).
+pub fn stream_error_from_run(
+    e: anyhow::Error,
+    chunks_done: usize,
+    total: usize,
+    base_seed: u64,
+    partial: PathBuf,
+) -> StreamError {
+    StreamError {
+        message: format!("{e:#}"),
+        partial,
+        chunks_done,
+        total,
+        base_seed,
+    }
+}
+
+/// Метаданные диагностического журнала (из StreamError ИЛИ StreamOutcome).
+#[derive(Debug, Clone)]
+pub struct DiagMeta {
+    pub chunks_done: usize,
+    pub total: usize,
+    pub base_seed: u64,
+    pub partial: Option<PathBuf>,
+}
+
+impl DiagMeta {
+    pub fn from_error(e: &StreamError) -> Self {
+        Self {
+            chunks_done: e.chunks_done,
+            total: e.total,
+            base_seed: e.base_seed,
+            partial: Some(e.partial.clone()),
+        }
+    }
+    pub fn from_outcome(o: &StreamOutcome) -> Self {
+        Self {
+            chunks_done: o.chunks_done,
+            total: o.total_chunks,
+            base_seed: o.base_seed,
+            partial: Some(o.partial_path.clone()),
+        }
+    }
+}
+
+/// Диагностический журнал отмены/ошибки: эксклюзивное уникальное имя
+/// (`{stem}.{нс}.{pid}.diagnostic_log.txt`, create_new, без удалений).
+/// Сбой создания не маскирует основной статус (None + предупреждение).
+pub fn write_diag_log(
+    out: &std::path::Path,
+    status: &str,
+    details: &str,
+    meta: &DiagMeta,
+) -> Option<PathBuf> {
+    use std::io::Write;
+    let stem = out
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = out.with_file_name(format!(
+        "{stem}.{nanos}.{}.diagnostic_log.txt",
+        std::process::id()
+    ));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut w) => {
+            let _ = writeln!(w, "Диагностический журнал задания");
+            let _ = writeln!(w, "Статус: {status}");
+            let _ = writeln!(w, "Детали: {details}");
+            let _ = writeln!(
+                w,
+                "Прогресс: {}/{} чанков; base_seed {}",
+                meta.chunks_done, meta.total, meta.base_seed
+            );
+            if let Some(p) = &meta.partial {
+                let _ = writeln!(w, "Черновик: {}", p.display());
+            }
+            Some(path)
+        }
+        Err(e) => {
+            eprintln!(
+                "примечание: не удалось создать диагностический журнал {}: {e}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
 /// Строка журнала по одному чанку (метаданные, не аудио).
 #[derive(Debug, Clone)]
 pub struct ChunkLogRow {
@@ -576,4 +673,93 @@ where
         denoise_report: summary.denoise,
         chunks: rows,
     })
+}
+
+#[cfg(test)]
+mod stream_error_tests {
+    use super::*;
+    use crate::pool::{run_job, ChunkWorker, PoolConfig, SeedPolicy, Task};
+    use std::sync::atomic::AtomicBool;
+
+    struct FailingOnThird;
+
+    impl ChunkWorker for FailingOnThird {
+        fn process(&mut self, task: &Task) -> anyhow::Result<crate::pool::ChunkAudio> {
+            if task.index == 2 {
+                anyhow::bail!("синтетический сбой чанка 3");
+            }
+            Ok(crate::pool::ChunkAudio {
+                speech: vec![task.index as f32],
+                pause_s: task.pause_s,
+                denoise: crate::pool::DenoiseChunkStatus::Off,
+            })
+        }
+    }
+
+    /// Мок-воркер падает на 3-м чанке: StreamError несёт реальный прогресс,
+    /// диагностический журнал содержит ошибку/прогресс/seed/черновик,
+    /// готовый файл отсутствует.
+    #[test]
+    fn mock_failure_produces_diag_log_with_metadata() {
+        let d = std::env::temp_dir().join(format!(
+            "shtorm_diag_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|t| t.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        let final_p = d.join("book.wav");
+        let partial = d.join("book.partial.wav");
+
+        let tasks: Vec<Task> = (0..5)
+            .map(|i| Task {
+                index: i,
+                model_text: format!("т{i}"),
+                pause_s: if i == 4 { None } else { Some(0.1) },
+            })
+            .collect();
+        let cancel = AtomicBool::new(false);
+        let mut done = 0usize;
+        let err = run_job(
+            &PoolConfig {
+                workers: 1,
+                queue_cap: 2,
+            },
+            tasks,
+            |_, _| Ok(FailingOnThird),
+            |_, _, _| {
+                done += 1;
+                Ok(())
+            },
+            &cancel,
+            SeedPolicy::Fixed(42),
+        )
+        .unwrap_err();
+
+        let se = stream_error_from_run(err, done, 5, 42, partial.clone());
+        assert!(se.message.contains("синтетический сбой"), "{}", se.message);
+        assert_eq!(se.total, 5);
+        assert_eq!(se.base_seed, 42);
+        // прогресс реальный: 2 чанка выдано до сбоя на 3-м
+        assert_eq!(se.chunks_done, 2, "done_ref на момент сбоя");
+
+        // диагностический журнал: эксклюзивное имя, все метаданные
+        let diag = write_diag_log(
+            &final_p,
+            "Failed",
+            &format!("{}\nпричина: ошибка выполнения задания", se.message),
+            &DiagMeta::from_error(&se),
+        )
+        .expect("diag log создаётся");
+        let text = std::fs::read_to_string(&diag).unwrap();
+        assert!(text.contains("Failed"));
+        assert!(text.contains("синтетический сбой"));
+        assert!(text.contains("2/5 чанков"), "{text}");
+        assert!(text.contains("base_seed 42"));
+        assert!(text.contains("book.partial.wav"));
+        // готовый файл отсутствует
+        assert!(!final_p.exists());
+    }
 }

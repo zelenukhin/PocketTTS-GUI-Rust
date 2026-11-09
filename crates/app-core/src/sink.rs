@@ -13,7 +13,8 @@
 use anyhow::{bail, Context, Result};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 
 use audio_processing::stream::{publish_no_replace, unique_partial_path, StreamingWav};
 
@@ -157,16 +158,50 @@ pub fn resolve_ffmpeg(explicit: Option<&Path>) -> Result<PathBuf> {
 /// FFmpeg-синк: PCM s16le (mono, sample_rate) -> stdin -> файл.
 pub struct FfmpegSink {
     child: Child,
-    stdin: Option<ChildStdin>,
+    /// Канал писателя: PCM уходит в отдельный поток, владеющий stdin.
+    /// write_all зависшего ffmpeg больше не блокирует поток задания:
+    /// переполнение канала = «ffmpeg не читает stdin» (ошибка, отмена).
+    writer_tx: Option<crossbeam_channel::Sender<Vec<u8>>>,
+    writer_handle: Option<std::thread::JoinHandle<()>>,
     stderr_thread: Option<std::thread::JoinHandle<String>>,
     partial: PathBuf,
     final_path: PathBuf,
     buf: Vec<u8>,
-    bytes_fed: u64,
+    bytes_fed: Arc<std::sync::atomic::AtomicU64>,
     /// Процесс уже дожат/собран (finalize или abort) — Drop не повторяет.
     finished: bool,
     /// Хвост stderr (диагностика; заполняется при abort/finalize).
     pub stderr_text: Option<String>,
+    /// Первая ошибка писателя stdin (BrokenPipe и т.п.).
+    write_error: Option<Arc<std::sync::Mutex<Option<String>>>>,
+    /// Лимит ожидания штатного завершения (тесты уменьшают).
+    wait_timeout: std::time::Duration,
+}
+
+/// Ожидание дочернего процесса с дедлайном; при истечении — kill ТОЛЬКО
+/// своего процесса + wait. Возвращает статус, если процесс завершился сам.
+fn wait_with_timeout(
+    child: &mut std::process::Child,
+    timeout: std::time::Duration,
+) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => return Some(st),
+            Ok(None) => {
+                if std::time::Instant::now() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(_) => {
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
 }
 
 /// Сколько байт ХВОСТА stderr держим для диагностики (читаем всегда до EOF —
@@ -251,6 +286,28 @@ impl FfmpegSink {
             .with_context(|| format!("запуск ffmpeg: {}", program.display()))?;
         let stdin = child.stdin.take().expect("stdin piped");
         let stderr = child.stderr.take().expect("stderr piped");
+        // писатель: владеет stdin; ошибки сохраняет и закрывает stdin
+        let (tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(4);
+        let fed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let write_error = Arc::new(std::sync::Mutex::new(None::<String>));
+        let werr = Arc::clone(&write_error);
+        let writer_handle = std::thread::spawn(move || {
+            let mut stdin = stdin;
+            for buf in rx {
+                fed.fetch_add(buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                if let Err(e) = stdin.write_all(&buf) {
+                    let kind = if e.kind() == std::io::ErrorKind::BrokenPipe {
+                        "ffmpeg закрыл stdin (BrokenPipe)"
+                    } else {
+                        "ошибка записи PCM в ffmpeg"
+                    };
+                    *werr.lock().unwrap() = Some(format!("{kind}: {e}"));
+                    break; // stdin дропнется здесь -> EOF для ffmpeg
+                }
+            }
+            // rx закрыт (finalize/abort/drop) или ошибка: закрыть stdin
+            drop(stdin);
+        });
         let stderr_thread = std::thread::spawn(move || {
             use std::io::Read;
             // Читаем ДО EOF (иначе pipe переполняется и ffmpeg блокируется),
@@ -281,18 +338,29 @@ impl FfmpegSink {
         });
         Ok(Self {
             child,
-            stdin: Some(stdin),
+            writer_tx: Some(tx),
+            writer_handle: Some(writer_handle),
+            write_error: Some(write_error),
             stderr_thread: Some(stderr_thread),
             partial,
             final_path,
             buf: Vec::new(),
-            bytes_fed: 0,
+            bytes_fed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             finished: false,
             stderr_text: None,
+            wait_timeout: std::time::Duration::from_secs(30),
         })
     }
 
     fn feed(&mut self, samples: &[f32]) -> Result<()> {
+        if let Some(err) = self
+            .write_error
+            .as_ref()
+            .and_then(|m| m.lock().unwrap().clone())
+        {
+            let tail = self.collect_stderr();
+            bail!("{err}: {tail}");
+        }
         self.buf.clear();
         self.buf.reserve(samples.len() * 2);
         for &s in samples {
@@ -300,28 +368,41 @@ impl FfmpegSink {
             self.buf
                 .extend_from_slice(&((v * 32767.0) as i16).to_le_bytes());
         }
-        let stdin = self.stdin.as_mut().expect("stdin открыт до finalize");
-        match stdin.write_all(&self.buf) {
-            Ok(()) => {
-                self.bytes_fed += self.buf.len() as u64;
-                Ok(())
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+        // отправка писателю с таймаутом: полный канал дольше секунды =
+        // ffmpeg перестал читать stdin (завис) — диагностируемая ошибка,
+        // а не вечная блокировка потока задания
+        let tx = self.writer_tx.as_ref().expect("писатель жив до finalize");
+        match tx.send_timeout(
+            std::mem::take(&mut self.buf),
+            std::time::Duration::from_secs(1),
+        ) {
+            Ok(()) => Ok(()),
+            Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => {
                 let err = self.collect_stderr();
                 bail!(
-                    "ffmpeg закрыл stdin раньше времени (BrokenPipe после {} байт): {}",
-                    self.bytes_fed,
+                    "ffmpeg не читает stdin дольше 1 с (подано {} байт): {}",
+                    self.bytes_fed.load(std::sync::atomic::Ordering::Relaxed),
                     err.trim()
                 )
             }
-            Err(e) => Err(e).context("запись PCM в ffmpeg"),
+            Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
+                let err = self.collect_stderr();
+                bail!(
+                    "писатель завершён (ffmpeg закрыл stdin; подано {} байт): {}",
+                    self.bytes_fed.load(std::sync::atomic::Ordering::Relaxed),
+                    err.trim()
+                )
+            }
         }
     }
 
     fn collect_stderr(&mut self) -> String {
-        // закрываем stdin и ждём процесс, чтобы прочитать хвост stderr
-        drop(self.stdin.take());
-        let status = self.child.wait().ok();
+        // ждём процесс (с лимитом!), чтобы прочитать хвост stderr
+        // (stdin закрытием управляет писатель/finalize/abort)
+        let status = wait_with_timeout(
+            &mut self.child,
+            self.wait_timeout.min(std::time::Duration::from_secs(5)),
+        );
         let text = self
             .stderr_thread
             .take()
@@ -332,6 +413,11 @@ impl FfmpegSink {
 }
 
 impl FfmpegSink {
+    /// Тестовый доступ: уменьшить лимит ожидания завершения.
+    pub fn set_wait_timeout(&mut self, t: std::time::Duration) {
+        self.wait_timeout = t;
+    }
+
     /// Прервать кодирование: закрыть stdin, дать ffmpeg штатно завершиться
     /// (ограничение ~5 с), при необходимости убить ТОЛЬКО свой дочерний
     /// процесс; всегда wait() и join stderr-потока. Черновик остаётся.
@@ -339,24 +425,16 @@ impl FfmpegSink {
         if self.finished {
             return Ok(());
         }
-        drop(self.stdin.take());
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) => {
-                    if std::time::Instant::now() > deadline {
-                        let _ = self.child.kill();
-                        let _ = self.child.wait();
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                Err(_) => {
-                    let _ = self.child.wait();
-                    break;
-                }
-            }
+        drop(self.writer_tx.take()); // писатель видит закрытие и закрывает stdin
+                                     // СНАЧАЛА дожать/убить дочерний процесс: закрытие его пайпов
+                                     // разблокирует писателя, застрявшего в write_all на полной трубе.
+                                     // (join до kill = дедлок — найдено child-тестом зависания.)
+        let _ = wait_with_timeout(
+            &mut self.child,
+            self.wait_timeout.min(std::time::Duration::from_secs(5)),
+        );
+        if let Some(h) = self.writer_handle.take() {
+            let _ = h.join();
         }
         // собрать поток stderr (после закрытия pipe он завершится)
         if let Some(t) = self.stderr_thread.take() {
@@ -383,30 +461,51 @@ impl AudioSink for FfmpegSink {
         self.feed(pcm)?;
         if let Some(p) = pause_s {
             let n = (p.max(0.0) * 24_000.0) as usize * 2; // байт тишины (s16)
-                                                          // блоками, без больших временных векторов
-            static ZERO: [u8; 8192] = [0u8; 8192];
+                                                          // блоками через писателя, без больших временных векторов
+            let zero = vec![0u8; n.min(8192)];
             let mut left = n;
             while left > 0 {
-                let k = left.min(ZERO.len());
-                let stdin = self.stdin.as_mut().expect("stdin открыт");
-                if let Err(e) = stdin.write_all(&ZERO[..k]) {
-                    if e.kind() == std::io::ErrorKind::BrokenPipe {
+                let k = left.min(zero.len());
+                let tx = self.writer_tx.as_ref().expect("писатель жив");
+                match tx.send_timeout(zero[..k].to_vec(), std::time::Duration::from_secs(1)) {
+                    Ok(()) => {}
+                    Err(_) => {
                         let err = self.collect_stderr();
-                        bail!("ffmpeg закрыл stdin при записи паузы: {}", err.trim());
+                        bail!("ffmpeg не читает stdin при записи паузы: {}", err.trim());
                     }
-                    return Err(e).context("запись паузы в ffmpeg");
                 }
                 left -= k;
             }
-            self.bytes_fed += n as u64;
         }
         Ok(())
     }
 
     fn finalize(mut self: Box<Self>) -> Result<PathBuf> {
-        // корректно закрыть stdin и дождаться энкодера
-        drop(self.stdin.take());
-        let status = self.child.wait().context("ожидание ffmpeg")?;
+        // корректно закрыть stdin (через писателя) и дождаться энкодера.
+        // Порядок как в abort: сначала дожать процесс (kill при висе
+        // закрывает пайпы и разблокирует писателя), потом join писателя.
+        drop(self.writer_tx.take());
+        let status = wait_with_timeout(&mut self.child, self.wait_timeout);
+        if let Some(h) = self.writer_handle.take() {
+            let _ = h.join();
+        }
+        // ошибка писателя (например, BrokenPipe) финализацию не спасёт
+        if let Some(err) = self
+            .write_error
+            .as_ref()
+            .and_then(|m| m.lock().unwrap().clone())
+        {
+            let _ = wait_with_timeout(&mut self.child, self.wait_timeout);
+            self.stderr_text = Some(
+                self.stderr_thread
+                    .take()
+                    .and_then(|t| t.join().ok())
+                    .unwrap_or_default(),
+            );
+            self.finished = true;
+            bail!("{err} — черновик сохранён: {}", self.partial.display());
+        }
+        let status = wait_with_timeout(&mut self.child, self.wait_timeout);
         let stderr = self
             .stderr_thread
             .take()
@@ -414,6 +513,14 @@ impl AudioSink for FfmpegSink {
             .unwrap_or_default();
         self.stderr_text = Some(stderr.clone());
         self.finished = true;
+        let status = match status {
+            Some(st) => st,
+            None => bail!(
+                "ffmpeg не завершился за {:?} после закрытия stdin — процесс остановлен; черновик сохранён: {}",
+                self.wait_timeout,
+                self.partial.display()
+            ),
+        };
         if !status.success() {
             bail!(
                 "ffmpeg завершился с ошибкой (код {:?}): {} — черновик сохранён: {}",
@@ -530,6 +637,167 @@ mod tests {
 ",
         );
         let _ = err.flush();
+    }
+
+    /// Производитель зависания: НЕ читает stdin и спит долго.
+    #[test]
+    fn stdin_stall_producer() {
+        if std::env::var("SHTORM_SINK_STALL_PRODUCER").is_err() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(300));
+    }
+
+    /// Сценарий зависшего stdin: write_chunk обязан вернуться с ошибкой
+    /// («не читает stdin»), а не блокироваться; abort завершает своего child.
+    #[test]
+    fn stdin_stall_child_entry() {
+        if std::env::var("SHTORM_SINK_STALL_CHILD").is_err() {
+            return;
+        }
+        let exe = std::env::current_exe().expect("current_exe");
+        let d = unique_dir("stall");
+        let final_p = d.join("out.mp3");
+        let partial = unique_partial_path(&final_p, "mp3");
+        let args: Vec<String> = vec![
+            "--exact".into(),
+            "sink::tests::stdin_stall_producer".into(),
+            "--test-threads=1".into(),
+        ];
+        let mut sink = FfmpegSink::spawn_with_env(
+            &exe,
+            &args,
+            &[("SHTORM_SINK_STALL_PRODUCER", "1")],
+            partial.clone(),
+            final_p.clone(),
+        )
+        .expect("spawn");
+        sink.set_wait_timeout(std::time::Duration::from_millis(300));
+        let t0 = std::time::Instant::now();
+        // несколько кусков: писатель заблокируется в write_all на полной
+        // трубе, канал (ёмкость 4) заполнится и send_timeout выдаст ошибку
+        let big = vec![0.01f32; 24_000 * 10];
+        let mut err = None;
+        for _ in 0..8 {
+            match sink.write_chunk(0, &big, None) {
+                Ok(()) => continue,
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        let err = err.expect("зависший stdin обязан дать ошибку, а не блокировку");
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(10),
+            "ошибка наступила быстро ({:?})",
+            t0.elapsed()
+        );
+        let err = format!("{err:#?}");
+        let err = err.replace(
+            "
+", " ",
+        );
+        assert!(err.contains("не читает stdin"), "{err}");
+        // abort убивает ТОЛЬКО своего ребёнка и возвращается
+        let t1 = std::time::Instant::now();
+        sink.abort().expect("abort");
+        assert!(t1.elapsed() < std::time::Duration::from_secs(5));
+        assert!(!final_p.exists());
+        println!("CHILD_STALL_OK");
+    }
+
+    /// finalize при висящем энкодере (не читает stdin): писатель блокирован
+    /// в write_all, finalize обязан завершиться по лимиту ожидания — kill
+    /// своего процесса разблокирует писателя, явная ошибка, черновик сохранён.
+    #[test]
+    fn finalize_hang_child_entry() {
+        if std::env::var("SHTORM_SINK_HANG_CHILD").is_err() {
+            return;
+        }
+        let exe = std::env::current_exe().expect("current_exe");
+        let d = unique_dir("hang");
+        let final_p = d.join("out.mp3");
+        let partial = unique_partial_path(&final_p, "mp3");
+        let args: Vec<String> = vec![
+            "--exact".into(),
+            "sink::tests::stdin_stall_producer".into(),
+            "--test-threads=1".into(),
+        ];
+        let mut sink = FfmpegSink::spawn_with_env(
+            &exe,
+            &args,
+            &[("SHTORM_SINK_STALL_PRODUCER", "1")],
+            partial.clone(),
+            final_p.clone(),
+        )
+        .expect("spawn");
+        sink.set_wait_timeout(std::time::Duration::from_millis(500));
+        // один большой кусок: писатель уходит в write_all и блокируется
+        // (продюсер stdin не читает), канал при этом свободен — write_chunk Ok
+        let big = vec![0.01f32; 24_000 * 10];
+        sink.write_chunk(0, &big, None)
+            .expect("одна отправка проходит");
+        let t0 = std::time::Instant::now();
+        let err = Box::new(sink).finalize().unwrap_err();
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(10),
+            "finalize с таймаутом не виснет ({:?})",
+            t0.elapsed()
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("не завершился")
+                || msg.contains("BrokenPipe")
+                || msg.contains("закрыл stdin"),
+            "{msg}"
+        );
+        assert!(!final_p.exists(), "итог не публикуется");
+        println!("CHILD_HANG_OK");
+    }
+
+    /// Внешний таймаут вокруг обоих сценариев зависания.
+    #[test]
+    fn hang_scenarios_no_deadlock_with_timeout() {
+        for (child, marker) in [
+            (
+                "sink::tests::stdin_stall_child_entry",
+                "SHTORM_SINK_STALL_CHILD",
+            ),
+            (
+                "sink::tests::finalize_hang_child_entry",
+                "SHTORM_SINK_HANG_CHILD",
+            ),
+        ] {
+            if std::env::var(marker).is_ok() {
+                return;
+            }
+            let exe = std::env::current_exe().expect("current_exe");
+            let mut c = std::process::Command::new(exe)
+                .args(["--exact", child, "--test-threads=1"])
+                .env(marker, "1")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                match c.try_wait().expect("try_wait") {
+                    Some(st) => {
+                        assert!(st.success(), "{child} упал: {st:?}");
+                        break;
+                    }
+                    None => {
+                        if std::time::Instant::now() > deadline {
+                            let _ = c.kill();
+                            let _ = c.wait();
+                            panic!("{child} завис — убит по таймауту 60с");
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                }
+            }
+        }
     }
 
     /// Сценарий флуда: FfmpegSink читает stderr ДО EOF — продюсер не должен
@@ -655,7 +923,7 @@ mod tests {
             Box::new(FfmpegSink::spawn(&ff, &args, partial.clone(), final_p.clone()).unwrap());
         // ffmpeg падает сразу; запись упрётся в BrokenPipe или finalize в код != 0
         let _ = sink.write_chunk(0, &[0.1f32; 4800], None);
-        let err = sink.finalize().unwrap_err();
+        let err = Box::new(sink).finalize().unwrap_err();
         assert!(format!("{err:#}").contains("ffmpeg"), "{err:#}");
         assert!(!final_p.exists(), "итог не публикуется при ошибке ffmpeg");
     }
