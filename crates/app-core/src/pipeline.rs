@@ -719,13 +719,21 @@ where
         })
         .sum();
 
-    let status = if summary.cancelled {
+    let mut status = if summary.cancelled {
         RunStatus::Cancelled
     } else if summary.chunks_done == total {
         RunStatus::Completed
     } else {
         RunStatus::Failed
     };
+
+    // G5: закрываем гонку «воркеры завершились → пользователь нажал Стоп →
+    // публикация». Отмена, пришедшая до финализации sink, не публикует и не
+    // заменяет готовый файл: статус понижается до Cancelled, черновик
+    // остаётся, старый результат не тронут.
+    if status == RunStatus::Completed && cancel.load(std::sync::atomic::Ordering::SeqCst) {
+        status = RunStatus::Cancelled;
+    }
 
     let (path, final_partial) = match status {
         RunStatus::Completed => {

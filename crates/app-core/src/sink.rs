@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 
-use audio_processing::stream::{publish_no_replace, unique_partial_path, StreamingWav};
+use audio_processing::stream::{
+    publish_no_replace, publish_replace, unique_partial_path, StreamingWav,
+};
 
 /// Потоковый приёмник готовых чанков (строго по порядку).
 pub trait AudioSink {
@@ -53,8 +55,17 @@ pub struct WavSink {
 
 impl WavSink {
     pub fn create(final_path: &Path, sample_rate: u32) -> Result<Self> {
+        Self::create_with_overwrite(final_path, sample_rate, false)
+    }
+
+    /// G5: `overwrite=true` разрешает замену готового файла при finalize.
+    pub fn create_with_overwrite(
+        final_path: &Path,
+        sample_rate: u32,
+        overwrite: bool,
+    ) -> Result<Self> {
         Ok(Self {
-            inner: StreamingWav::create(final_path, sample_rate)?,
+            inner: StreamingWav::create_with_overwrite(final_path, sample_rate, overwrite)?,
         })
     }
 }
@@ -187,6 +198,8 @@ pub struct FfmpegSink {
     write_error: Option<Arc<std::sync::Mutex<Option<String>>>>,
     /// Лимит ожидания штатного завершения (тесты уменьшают).
     wait_timeout: std::time::Duration,
+    /// G5: разрешена замена существующего готового файла при finalize.
+    overwrite: bool,
 }
 
 /// Ожидание дочернего процесса с дедлайном; при истечении — kill ТОЛЬКО
@@ -227,16 +240,51 @@ impl FfmpegSink {
         preset: &str,
         ffmpeg: &Path,
     ) -> Result<Self> {
-        anyhow::ensure!(
-            !final_path.exists(),
-            "итоговый файл уже существует: {} — не перезаписываем",
-            final_path.display()
-        );
+        Self::create_with_overwrite(final_path, sample_rate, format, preset, ffmpeg, false)
+    }
+
+    /// G5: `overwrite=true` разрешает замену готового файла при finalize.
+    /// Готовый файл не трогается до успешного кодирования и замены.
+    pub fn create_with_overwrite(
+        final_path: &Path,
+        sample_rate: u32,
+        format: OutputFormat,
+        preset: &str,
+        ffmpeg: &Path,
+        overwrite: bool,
+    ) -> Result<Self> {
+        if overwrite {
+            if let Ok(md) = std::fs::symlink_metadata(final_path) {
+                anyhow::ensure!(
+                    !md.is_dir(),
+                    "итоговый путь указывает на каталог, замена невозможна: {}",
+                    final_path.display()
+                );
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+                    anyhow::ensure!(
+                        md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+                        "итоговый путь — ссылка/точка перенаправления (reparse point): {}",
+                        final_path.display()
+                    );
+                }
+            }
+        } else {
+            anyhow::ensure!(
+                !final_path.exists(),
+                "итоговый файл уже существует: {} — не перезаписываем",
+                final_path.display()
+            );
+        }
         let ext = format.extension();
         // уникальное имя за запуск: старые черновики не мешают (не удаляются)
         let partial = unique_partial_path(final_path, ext);
         let args = Self::base_args(sample_rate, format, preset, &partial)?;
-        Self::spawn(ffmpeg, &args, partial, final_path.to_path_buf())
+        let mut sink = Self::spawn(ffmpeg, &args, partial, final_path.to_path_buf())?;
+        sink.overwrite = overwrite;
+        Ok(sink)
     }
 
     /// Полный набор аргументов (`-n`: никогда не перезаписывать).
@@ -364,6 +412,7 @@ impl FfmpegSink {
             finished: false,
             stderr_text: None,
             wait_timeout: std::time::Duration::from_secs(30),
+            overwrite: false,
         })
     }
 
@@ -548,9 +597,15 @@ impl AudioSink for FfmpegSink {
                 self.partial.display()
             );
         }
-        // публикация только после успешного кодирования: MoveFileW без
-        // замены; при занятом имени — отказ, черновик остаётся
-        publish_no_replace(&self.partial, &self.final_path)?;
+        // публикация только после успешного кодирования. По умолчанию —
+        // MoveFileW без замены (занятое имя → отказ, черновик остаётся).
+        // G5 overwrite: атомарная замена MoveFileExW; старый файл не удалён
+        // заранее и остаётся при любой ошибке замены.
+        if self.overwrite {
+            publish_replace(&self.partial, &self.final_path)?;
+        } else {
+            publish_no_replace(&self.partial, &self.final_path)?;
+        }
         Ok(self.final_path.clone())
     }
 
@@ -559,7 +614,7 @@ impl AudioSink for FfmpegSink {
     }
 }
 
-/// Создать синк по формату.
+/// Создать синк по формату (без замены существующего итога).
 pub fn make_sink(
     final_path: &Path,
     sample_rate: u32,
@@ -567,16 +622,35 @@ pub fn make_sink(
     preset: &str,
     ffmpeg: Option<&Path>,
 ) -> Result<Box<dyn AudioSink>> {
+    make_sink_with_overwrite(final_path, sample_rate, format, preset, ffmpeg, false)
+}
+
+/// G5: создать синк с явной политикой замены готового файла. При
+/// `overwrite=true` старый файл остаётся на месте до успешного finalize;
+/// замена — атомарная (MoveFileExW REPLACE|WRITE_THROUGH).
+pub fn make_sink_with_overwrite(
+    final_path: &Path,
+    sample_rate: u32,
+    format: OutputFormat,
+    preset: &str,
+    ffmpeg: Option<&Path>,
+    overwrite: bool,
+) -> Result<Box<dyn AudioSink>> {
     match format {
-        OutputFormat::Wav => Ok(Box::new(WavSink::create(final_path, sample_rate)?)),
+        OutputFormat::Wav => Ok(Box::new(WavSink::create_with_overwrite(
+            final_path,
+            sample_rate,
+            overwrite,
+        )?)),
         OutputFormat::Mp3 | OutputFormat::Opus => {
             let prog = resolve_ffmpeg(ffmpeg)?;
-            Ok(Box::new(FfmpegSink::create(
+            Ok(Box::new(FfmpegSink::create_with_overwrite(
                 final_path,
                 sample_rate,
                 format,
                 preset,
                 &prog,
+                overwrite,
             )?))
         }
     }

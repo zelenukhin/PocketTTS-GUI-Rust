@@ -5,7 +5,11 @@
 //! - выходная папка исключается из обхода, если лежит внутри исходной;
 //! - относительная структура подкаталогов сохраняется в папке результата;
 //! - выходные пути проверяются на выход за пределы каталога назначения;
-//! - существующие результаты не перезаписываются (Skipped);
+//! - существующие результаты по умолчанию пропускаются (Skipped); G5
+//!   `overwrite=true` разрешает замену — синтез идёт, а sink заменяет
+//!   готовый файл только после успешного завершения;
+//! - конфликты имён между РАЗНЫМИ входами остаются запрещены даже при
+//!   overwrite (chapter.txt + chapter.md не перезаписывают друг друга);
 //! - ошибка одного файла не прерывает остальные (изоляция), отмена — прерывает.
 //!
 //! Модуль не знает про ONNX: синтез одного файла инжектируется замыканием,
@@ -670,6 +674,7 @@ fn conflict_path_with_ext(stem_path: &Path, ext: &str) -> PathBuf {
 pub fn run_batch<F>(
     plan: &BatchPlan,
     extension: &str,
+    overwrite: bool,
     cancel: &AtomicBool,
     emit: &dyn Fn(BatchEvent),
     mut synth: F,
@@ -769,11 +774,11 @@ where
             input: file.input.clone(),
             output: out.clone(),
         });
-        if out.exists() {
+        if out.exists() && !overwrite {
             let r = FileReport::skipped(
                 file,
                 Some(out),
-                "результат уже существует — не перезаписываем",
+                "результат уже существует — перезапись выключена",
             );
             emit(BatchEvent::FileFinished {
                 index: idx + 1,
@@ -951,7 +956,7 @@ mod tests {
         let plan = plan_batch(&src, &out).unwrap();
         let cancel = AtomicBool::new(false);
         let mut called = 0usize;
-        let report = run_batch(&plan, "wav", &cancel, &|_| {}, |file, o, c, p| {
+        let report = run_batch(&plan, "wav", false, &cancel, &|_| {}, |file, o, c, p| {
             called += 1;
             mock_ok(file, o, c, p)
         });
@@ -963,6 +968,30 @@ mod tests {
     }
 
     #[test]
+    fn overwrite_true_resynthesizes_existing_result() {
+        let d = tmpdir("exists_overwrite");
+        let src = d.join("src");
+        write(&src.join("a.txt"), b"a");
+        write(&src.join("b.txt"), b"b");
+        let out = d.join("out");
+        write(&out.join("a.wav"), b"already");
+        let plan = plan_batch(&src, &out).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut called = 0usize;
+        let report = run_batch(&plan, "wav", true, &cancel, &|_| {}, |file, o, c, p| {
+            called += 1;
+            mock_ok(file, o, c, p)
+        });
+        assert_eq!(
+            called, 2,
+            "при overwrite=true существующий результат синтезируется"
+        );
+        assert_eq!(report.skipped(), 0);
+        assert_eq!(report.completed(), 2);
+        assert_eq!(std::fs::read(out.join("a.wav")).unwrap(), b"mock-audio");
+    }
+
+    #[test]
     fn one_failure_does_not_stop_others() {
         let d = tmpdir("isolation");
         let src = d.join("src");
@@ -971,7 +1000,7 @@ mod tests {
         write(&src.join("c.txt"), b"c");
         let plan = plan_batch(&src, &d.join("out")).unwrap();
         let cancel = AtomicBool::new(false);
-        let report = run_batch(&plan, "wav", &cancel, &|_| {}, |file, o, c, p| {
+        let report = run_batch(&plan, "wav", false, &cancel, &|_| {}, |file, o, c, p| {
             if file.input.ends_with("bad.txt") {
                 FileReport::failed(file, Some(o.to_path_buf()), "мок-сбой")
             } else {
@@ -1006,7 +1035,7 @@ mod tests {
         write(&src.join("c.txt"), b"c");
         let plan = plan_batch(&src, &d.join("out")).unwrap();
         let cancel = AtomicBool::new(false);
-        let report = run_batch(&plan, "wav", &cancel, &|_| {}, |file, o, c, p| {
+        let report = run_batch(&plan, "wav", false, &cancel, &|_| {}, |file, o, c, p| {
             // отмена во время первого файла: он Cancelled, остальные Skipped
             c.store(true, Ordering::SeqCst);
             let mut r = FileReport::new(file, Some(o.to_path_buf()));
@@ -1037,7 +1066,7 @@ mod tests {
 
         // первый прогон: a готов, затем отмена перед b
         let cancel1 = AtomicBool::new(false);
-        let r1 = run_batch(&plan, "wav", &cancel1, &|_| {}, |file, o, c, p| {
+        let r1 = run_batch(&plan, "wav", false, &cancel1, &|_| {}, |file, o, c, p| {
             if file.input.ends_with("a.txt") {
                 let r = mock_ok(file, o, c, p);
                 c.store(true, Ordering::SeqCst);
@@ -1056,7 +1085,7 @@ mod tests {
 
         // повторный прогон: a пропущен (результат есть), b доделан
         let cancel2 = AtomicBool::new(false);
-        let r2 = run_batch(&plan, "wav", &cancel2, &|_| {}, mock_ok);
+        let r2 = run_batch(&plan, "wav", false, &cancel2, &|_| {}, mock_ok);
         assert_eq!(r2.skipped(), 1);
         assert_eq!(r2.completed(), 1);
         assert!(out.join("b.wav").is_file());
@@ -1109,7 +1138,7 @@ mod tests {
         let plan = plan_batch(&src, &d.join("out")).unwrap();
         let cancel = AtomicBool::new(true);
         let mut called = 0usize;
-        let report = run_batch(&plan, "wav", &cancel, &|_| {}, |file, o, c, p| {
+        let report = run_batch(&plan, "wav", false, &cancel, &|_| {}, |file, o, c, p| {
             called += 1;
             mock_ok(file, o, c, p)
         });
@@ -1134,7 +1163,7 @@ mod tests {
         let plan = plan_batch(&src, &d.join("out")).unwrap();
         let cancel = AtomicBool::new(false);
         let mut calls = Vec::new();
-        let report = run_batch(&plan, "wav", &cancel, &|_| {}, |file, o, c, p| {
+        let report = run_batch(&plan, "wav", false, &cancel, &|_| {}, |file, o, c, p| {
             calls.push(file.relative.clone());
             let r = mock_ok(file, o, c, p);
             // «Стоп» после первого успешного файла
@@ -1156,7 +1185,7 @@ mod tests {
         write(&src.join("b.txt"), b"b");
         let plan = plan_batch(&src, &d.join("out")).unwrap();
         let cancel = AtomicBool::new(false);
-        let report = run_batch(&plan, "wav", &cancel, &|_| {}, |file, o, c, _p| {
+        let report = run_batch(&plan, "wav", false, &cancel, &|_| {}, |file, o, c, _p| {
             // «Стоп» пришёл одновременно с ошибкой файла
             c.store(true, Ordering::SeqCst);
             FileReport::failed(file, Some(o.to_path_buf()), "мок-сбой")
@@ -1176,7 +1205,7 @@ mod tests {
         let plan = plan_batch(&src, &d.join("out")).unwrap();
         let cancel = AtomicBool::new(false);
         let mut calls = 0usize;
-        let report = run_batch(&plan, "wav", &cancel, &|_| {}, |file, o, c, p| {
+        let report = run_batch(&plan, "wav", false, &cancel, &|_| {}, |file, o, c, p| {
             calls += 1;
             // отмена устанавливается ПОСЛЕ завершения файла, до проверки
             // следующего — следующий не должен стартовать
@@ -1208,7 +1237,7 @@ mod tests {
 
         let cancel = AtomicBool::new(false);
         let mut called = 0usize;
-        let report = run_batch(&plan, "wav", &cancel, &|_| {}, |file, o, c, p| {
+        let report = run_batch(&plan, "wav", false, &cancel, &|_| {}, |file, o, c, p| {
             called += 1;
             mock_ok(file, o, c, p)
         });
@@ -1236,6 +1265,7 @@ mod tests {
         let report = run_batch(
             &plan,
             "wav",
+            false,
             &AtomicBool::new(false),
             &|_| {},
             |f, o, c, p| mock_ok(f, o, c, p),
@@ -1256,6 +1286,7 @@ mod tests {
         let report = run_batch(
             &plan,
             "wav",
+            false,
             &AtomicBool::new(false),
             &|_| {},
             |f, o, c, p| mock_ok(f, o, c, p),
@@ -1284,6 +1315,7 @@ mod tests {
         let report = run_batch(
             &plan,
             "wav",
+            false,
             &AtomicBool::new(false),
             &|_| {},
             |f, o, c, p| mock_ok(f, o, c, p),

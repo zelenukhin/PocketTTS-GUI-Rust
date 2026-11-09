@@ -4,9 +4,17 @@
 //! (без создания больших временных векторов). Итоговый файл публикуется
 //! только после успешной финализации: черновик лежит в
 //! `{stem}.{время}.{pid}.partial.{ext}` рядом с итогом (уникальное имя за
-//! запуск, никогда не перезаписывается), публикация — Win32 `MoveFileW`
-//! БЕЗ MOVEFILE_REPLACE_EXISTING: при занятом имени назначения вызов
-//! атомарно отказывает (файл-приёмник не изменяется), черновик остаётся.
+//! запуск, никогда не перезаписывается).
+//!
+//! Политика публикации:
+//! - по умолчанию — Win32 `MoveFileW` БЕЗ MOVEFILE_REPLACE_EXISTING: при
+//!   занятом имени вызов атомарно отказывает, файл-приёмник не изменяется,
+//!   черновик остаётся;
+//! - G5 `overwrite=true` — `MoveFileExW(REPLACE_EXISTING|WRITE_THROUGH)`:
+//!   замена выполняется только после полной успешной финализации sink.
+//!   Старый файл НЕ удаляется заранее; при ошибке замены он остаётся
+//!   доступным, а `.partial` сохраняется для диагностики.
+//!
 //! После успешного переноса `.partial` больше нет (перемещён, не удалён).
 //! При отмене/ошибке `.partial` остаётся и путь сообщается вызывающему;
 //! пользовательские файлы неприкосновенны (create_new, без рекурсивных
@@ -31,13 +39,25 @@ pub struct StreamingWav {
     data_bytes: u64,
     samples_written: u64,
     max_data_bytes: u64,
+    /// G5: разрешена замена существующего готового файла при finalize.
+    overwrite: bool,
 }
 
 impl StreamingWav {
     /// Создать: итога быть не должно; черновик `{stem}.partial.wav` — тоже
-    /// (create_new). `max_data_bytes` — тестируемый предел RIFF.
+    /// (create_new).
     pub fn create(final_path: &Path, sample_rate: u32) -> Result<Self> {
-        Self::create_with_limit(final_path, sample_rate, RIFF_MAX_DATA_BYTES)
+        Self::create_with_mode(final_path, sample_rate, false, RIFF_MAX_DATA_BYTES)
+    }
+
+    /// G5: создать с явной политикой замены. При `overwrite=true` готовый
+    /// файл может существовать; он НЕ трогается до успешного finalize.
+    pub fn create_with_overwrite(
+        final_path: &Path,
+        sample_rate: u32,
+        overwrite: bool,
+    ) -> Result<Self> {
+        Self::create_with_mode(final_path, sample_rate, overwrite, RIFF_MAX_DATA_BYTES)
     }
 
     pub fn create_with_limit(
@@ -45,11 +65,53 @@ impl StreamingWav {
         sample_rate: u32,
         max_data_bytes: u64,
     ) -> Result<Self> {
-        anyhow::ensure!(
-            !final_path.exists(),
-            "итоговый WAV уже существует: {} — не перезаписываем",
-            final_path.display()
-        );
+        Self::create_with_mode(final_path, sample_rate, false, max_data_bytes)
+    }
+
+    /// Общий конструктор: `overwrite` разрешает существующий итог только
+    /// для аудиофайла назначения; каталог/ссылка в качестве итога отвергаются.
+    pub fn create_with_mode(
+        final_path: &Path,
+        sample_rate: u32,
+        overwrite: bool,
+        max_data_bytes: u64,
+    ) -> Result<Self> {
+        if overwrite {
+            // Не заменяем каталоги и reparse-точки: это не «готовый
+            // аудиофайл», и замена могла бы уйти за пределы выбранного пути.
+            if let Ok(md) = std::fs::symlink_metadata(final_path) {
+                if md.is_dir() {
+                    bail!(
+                        "итоговый путь указывает на каталог, замена невозможна: {}",
+                        final_path.display()
+                    );
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+                    if md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                        bail!(
+                            "итоговый путь — ссылка/точка перенаправления (reparse point): {} — укажите физический файл",
+                            final_path.display()
+                        );
+                    }
+                }
+                #[cfg(not(windows))]
+                if md.file_type().is_symlink() {
+                    bail!(
+                        "итоговый путь — символическая ссылка: {} — укажите физический файл",
+                        final_path.display()
+                    );
+                }
+            }
+        } else {
+            anyhow::ensure!(
+                !final_path.exists(),
+                "итоговый WAV уже существует: {} — не перезаписываем",
+                final_path.display()
+            );
+        }
         // уникальное имя за запуск: старые черновики не мешают повторному
         // запуску (и не удаляются автоматически)
         let partial_path = unique_partial_path(final_path, "wav");
@@ -74,6 +136,7 @@ impl StreamingWav {
             data_bytes: 0,
             samples_written: 0,
             max_data_bytes,
+            overwrite,
         })
     }
 
@@ -111,13 +174,19 @@ impl StreamingWav {
         Ok(())
     }
 
-    /// Финализация: заголовок, закрытие, публикация итога без замены
-    /// (Win32 MoveFileW; при занятом имени — отказ, черновик остаётся).
+    /// Финализация: заголовок, закрытие, публикация итога. По умолчанию —
+    /// без замены (MoveFileW; при занятом имени отказ, черновик остаётся).
+    /// При `overwrite=true` — атомарная замена MoveFileExW после успешной
+    /// записи; старый файл до этого момента не удаляется.
     pub fn finalize(mut self) -> Result<PathBuf> {
         let mut w = self.writer.take().expect("writer ещё открыт");
         w.flush()?;
         w.finalize()?;
-        publish_no_replace(&self.partial_path, &self.final_path)?;
+        if self.overwrite {
+            publish_replace(&self.partial_path, &self.final_path)?;
+        } else {
+            publish_no_replace(&self.partial_path, &self.final_path)?;
+        }
         Ok(self.final_path)
     }
 
@@ -194,6 +263,50 @@ pub fn publish_no_replace(from: &Path, to: &Path) -> anyhow::Result<()> {
     })?;
     let _ = std::fs::remove_file(from);
     Ok(())
+}
+
+/// G5: публикация с заменой существующего готового файла. Вызывается ТОЛЬКО
+/// после успешной финализации sink (Completed). На Windows — `MoveFileExW`
+/// с `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`: замена атомарна
+/// на NTFS; при ошибке (занятый файл, права, антивирус) назначение остаётся
+/// прежним, а черновик — на месте. Схема «удалить старый → переименовать»
+/// намеренно НЕ используется.
+#[cfg(windows)]
+pub fn publish_replace(from: &Path, to: &Path) -> anyhow::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    let wide = |p: &Path| -> Vec<u16> {
+        p.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    };
+    let (w_from, w_to) = (wide(from), wide(to));
+    let ok = unsafe {
+        MoveFileExW(
+            w_from.as_ptr(),
+            w_to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        let e = std::io::Error::last_os_error();
+        anyhow::bail!(
+            "MoveFileExW(REPLACE) {} -> {} отказал: {e}; старый файл не изменён, черновик сохранён",
+            from.display(),
+            to.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn publish_replace(from: &Path, to: &Path) -> anyhow::Result<()> {
+    // rename на Unix атомарно заменяет существующий файл.
+    std::fs::rename(from, to)
+        .with_context(|| format!("заменить {} -> {}", from.display(), to.display()))
 }
 
 #[cfg(test)]
@@ -331,6 +444,74 @@ mod tests {
         publish_no_replace(&src, &dst2).unwrap();
         assert_eq!(std::fs::read(&dst2).unwrap(), b"draft");
         assert!(!src.exists(), "MoveFileW переносит (не копирует)");
+    }
+
+    /// G5: overwrite=true заменяет готовый файл только при успешном finalize.
+    #[test]
+    fn overwrite_true_replaces_old_final_after_successful_finalize() {
+        let d = unique_dir("ow_replace");
+        let final_p = d.join("book.wav");
+        std::fs::write(&final_p, b"old audio").unwrap();
+        let mut w = StreamingWav::create_with_overwrite(&final_p, 24000, true).unwrap();
+        w.write_chunk(&[0.5f32; 100], None).unwrap();
+        let partial = w.partial_path().to_path_buf();
+        let published = w.finalize().unwrap();
+        assert_eq!(published, final_p);
+        assert_ne!(std::fs::read(&final_p).unwrap(), b"old audio");
+        assert!(!partial.exists(), "partial перемещён при замене");
+        let (_, pcm) = read_wav(&final_p);
+        assert_eq!(pcm.len(), 100);
+    }
+
+    /// G5: при аборте без finalize старый готовый файл остаётся нетронутым,
+    /// черновик сохраняется.
+    #[test]
+    fn overwrite_abort_keeps_old_file_and_partial() {
+        let d = unique_dir("ow_abort");
+        let final_p = d.join("book.wav");
+        std::fs::write(&final_p, b"old audio").unwrap();
+        let mut w = StreamingWav::create_with_overwrite(&final_p, 24000, true).unwrap();
+        w.write_chunk(&[0.5f32; 100], None).unwrap();
+        let partial = w.partial_path().to_path_buf();
+        drop(w);
+        assert_eq!(std::fs::read(&final_p).unwrap(), b"old audio");
+        assert!(partial.exists(), "черновик сохранён для диагностики");
+    }
+
+    /// G5: каталог на месте итога — не «готовый аудиофайл»; замена отвергается.
+    #[test]
+    fn overwrite_refuses_directory_target() {
+        let d = unique_dir("ow_dir");
+        let dir = d.join("book.wav");
+        std::fs::create_dir(&dir).unwrap();
+        let err = StreamingWav::create_with_overwrite(&dir, 24000, true);
+        assert!(err.is_err());
+        assert!(dir.is_dir());
+    }
+
+    /// G5: публикация с заменой — успешная замена и сохранность обоих файлов
+    /// при ошибке (схема «удалить старый → переименовать» не используется).
+    #[test]
+    fn publish_replace_replaces_on_success_and_keeps_old_on_failure() {
+        let d = unique_dir("pub_replace");
+        let src = d.join("draft.bin");
+        let dst = d.join("final.bin");
+        std::fs::write(&src, b"new").unwrap();
+        std::fs::write(&dst, b"old").unwrap();
+        publish_replace(&src, &dst).unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), b"new");
+        assert!(!src.exists(), "MoveFileExW переносит, а не копирует");
+        // ошибка замены: назначение — родитель-файл, move невозможен;
+        // старый файл и черновик остаются на месте
+        let src2 = d.join("draft2.bin");
+        std::fs::write(&src2, b"draft2").unwrap();
+        let blocker = d.join("blocker.bin");
+        std::fs::write(&blocker, b"blocker").unwrap();
+        let bad_dst = blocker.join("child.bin");
+        let err = publish_replace(&src2, &bad_dst);
+        assert!(err.is_err());
+        assert_eq!(std::fs::read(&src2).unwrap(), b"draft2");
+        assert_eq!(std::fs::read(&blocker).unwrap(), b"blocker");
     }
 
     #[test]

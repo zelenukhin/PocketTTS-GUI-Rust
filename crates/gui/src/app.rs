@@ -63,6 +63,8 @@ pub struct ShtormApp {
     ffmpeg_check_key: Option<String>,
     ffmpeg_check_err: Option<String>,
     ffmpeg_checked_at: std::time::Instant,
+    /// G5: последняя применённая тема (переключатель без лишних set_visuals).
+    theme_applied: bool,
 }
 
 /// Живое задание: флаг отмены, канал событий из потока, поток.
@@ -102,6 +104,7 @@ impl ShtormApp {
                 format!("настройки не загружены ({e:#}); значения по умолчанию"),
             ),
         };
+        let theme_applied = settings.theme_dark;
         Self {
             settings,
             log: String::new(),
@@ -115,6 +118,7 @@ impl ShtormApp {
             ffmpeg_check_key: None,
             ffmpeg_check_err: None,
             ffmpeg_checked_at: std::time::Instant::now(),
+            theme_applied,
         }
     }
 
@@ -328,11 +332,17 @@ impl ShtormApp {
         }
         if s.out_dir.trim().is_empty() {
             errs.push("не указана папка результата".into());
-        } else if !s.batch && crate::job::derive_out_path(s).exists() {
-            errs.push(format!(
-                "итоговый файл уже существует: {} — не перезаписываем",
-                crate::job::derive_out_path(s).display()
-            ));
+        }
+        // G5: существующий результат — не ошибка валидации. При выключенной
+        // перезаписи задание само сообщит «Пропущено: файл уже существует»;
+        // при включённой — заменит файл только после успешного синтеза.
+        // Пути вывода проверяются на reparse point и защищённые файлы здесь,
+        // чтобы пользователь увидел проблему до запуска.
+        if !s.batch && !s.out_dir.trim().is_empty() {
+            let out = crate::job::derive_out_path(s);
+            if let Err(e) = crate::job::ensure_output_path_safe(s, &out) {
+                errs.push(format!("{e:#}"));
+            }
         }
         if needs_ffmpeg {
             if let Some(e) = ffmpeg_err {
@@ -353,6 +363,15 @@ impl ShtormApp {
 
 impl eframe::App for ShtormApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // G5: тема применяется только при изменении настройки, не каждый кадр.
+        if self.theme_applied != self.settings.theme_dark {
+            ctx.set_visuals(if self.settings.theme_dark {
+                egui::Visuals::dark()
+            } else {
+                egui::Visuals::light()
+            });
+            self.theme_applied = self.settings.theme_dark;
+        }
         // события фонового задания (прогресс/логи/итог) — каждый кадр
         self.poll_job();
 
@@ -428,21 +447,8 @@ impl eframe::App for ShtormApp {
                         Err(e) => self.status = format!("ошибка сохранения: {e:#}"),
                     }
                 }
-                if ui.button("Импорт из Python-GUI (только чтение)").clicked() {
-                    if let Some(p) = rfd::FileDialog::new()
-                        .set_title("Выберите settings_pocket_tts.json")
-                        .add_filter("JSON", &["json"])
-                        .pick_file()
-                    {
-                        match crate::settings::import_from_python(&p) {
-                            Ok(s) => {
-                                self.settings = s;
-                                self.status = format!("импортировано (read-only): {}", p.display());
-                            }
-                            Err(e) => self.status = format!("импорт не удался: {e:#}"),
-                        }
-                    }
-                }
+                // G5: переключение темы сохраняется вместе с настройками.
+                ui.checkbox(&mut self.settings.theme_dark, "Тёмная тема");
             });
             if !errors.is_empty() {
                 for e in &errors {
@@ -681,22 +687,14 @@ impl eframe::App for ShtormApp {
                             });
                             ui.horizontal(|ui| {
                                 ui.label("Порог:");
-                                let selected = match s.eos_threshold {
-                                    crate::settings::EosThresholdSetting::Auto => {
-                                        "Авто".to_string()
-                                    }
-                                    crate::settings::EosThresholdSetting::Fixed(v) => {
-                                        format!("{v}")
-                                    }
-                                };
+                                // G5: «Авто» в списке больше нет — выбранное
+                                // значение всегда число. Устаревший Auto из
+                                // старого конфига показываем как −4.0 и при
+                                // любом выборе заменяем числом.
+                                let selected = format!("{}", s.eos_threshold.value());
                                 egui::ComboBox::from_id_salt("eos_threshold")
                                     .selected_text(selected)
                                     .show_ui(ui, |ui| {
-                                        ui.selectable_value(
-                                            &mut s.eos_threshold,
-                                            crate::settings::EosThresholdSetting::Auto,
-                                            "Авто",
-                                        );
                                         for v in crate::settings::EOS_THRESHOLD_CHOICES {
                                             ui.selectable_value(
                                                 &mut s.eos_threshold,
@@ -707,9 +705,9 @@ impl eframe::App for ShtormApp {
                                     })
                                     .response
                                     .on_hover_text(
-                                        "Логит EOS выше порога — конец речи. «Авто» = встроенное \
-                                         фиксированное −4.0 движка teratts-android (не читается \
-                                         из runtime.json). Значение передаётся движку как есть.",
+                                        "Логит EOS выше порога — конец речи. Значение \
+                                         передаётся движку как есть; −4.0 — встроенное \
+                                         значение teratts-android (не читается из runtime.json).",
                                     );
                             });
                             ui.horizontal(|ui| {
@@ -888,6 +886,21 @@ impl eframe::App for ShtormApp {
                             }
                         }
                     });
+                    // G5: замена готового аудиофайла — только явное согласие.
+                    // Старый файл не удаляется до успешного синтеза; замена
+                    // выполняется атомарно после финализации sink.
+                    ui.checkbox(
+                        &mut s.overwrite_existing,
+                        "Перезаписывать существующие файлы",
+                    )
+                    .on_hover_text(
+                        "Выключено (по умолчанию): существующий результат \
+                         пропускается без изменений. Включено: новый аудиофайл \
+                         пишется в уникальный .partial и заменяет готовый только \
+                         после успешного завершения синтеза; при ошибке/отмене \
+                         старый файл остаётся. Защита входных файлов, моделей и \
+                         настроек не ослабляется.",
+                    );
                 });
             header_clicked(&resp, &mut s.out_open);
             ui.add_space(6.0);
@@ -904,8 +917,20 @@ impl eframe::App for ShtormApp {
                     );
                 });
             ui.horizontal(|ui| {
+                // G5: журнал удобно скопировать в буфер обмена целиком.
+                if ui.button("Копировать журнал").clicked() {
+                    if self.log.is_empty() {
+                        self.status = "журнал пуст — копировать нечего".into();
+                    } else {
+                        ui.ctx().copy_text(self.log.clone());
+                        self.status = "журнал скопирован в буфер обмена".into();
+                    }
+                }
                 if ui.button("Очистить журнал").clicked() {
+                    // очищается только отображаемая копия; файлы журналов
+                    // (диагностика/лог чанков) на диске не удаляются
                     self.log.clear();
+                    self.status = "журнал очищен (файлы на диске не тронуты)".into();
                 }
                 if let Some(p) = &self.last_saved {
                     ui.weak(format!("последнее сохранение: {}", p.display()));

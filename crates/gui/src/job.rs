@@ -15,7 +15,7 @@ use app_core::pipeline::{
     log_path_for, synthesize_stream, write_chunk_log, write_diag_log, ChunkLogMeta, DiagMeta,
     PipelineOptions, RunStatus, StreamError,
 };
-use app_core::sink::{make_sink, OutputFormat};
+use app_core::sink::{make_sink_with_overwrite, OutputFormat};
 use shtorm_engine::Device;
 use text_processing::CharRules;
 
@@ -91,6 +91,22 @@ impl JobResult {
             batch: None,
         }
     }
+
+    /// G5: существующий результат при выключенной перезаписи — не ошибка,
+    /// а информационный пропуск (файл остаётся побитово неизменным).
+    pub fn skipped(summary: String) -> Self {
+        Self {
+            status: JobStatus::Skipped,
+            summary,
+            final_path: None,
+            partial_path: None,
+            diag_path: None,
+            chunk_log_path: None,
+            rtf: None,
+            progress: (0, 0),
+            batch: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +118,8 @@ pub enum JobStatus {
     Failed,
     /// Пакет: синтезировать было нечего (пустой план или все файлы пропущены).
     NoWork,
+    /// G5: результат уже существует, перезапись выключена — файл пропущен.
+    Skipped,
 }
 
 impl JobStatus {
@@ -112,6 +130,7 @@ impl JobStatus {
             JobStatus::Cancelled => "Отменено",
             JobStatus::Failed => "Ошибка",
             JobStatus::NoWork => "Нет работы",
+            JobStatus::Skipped => "Пропущено",
         }
     }
 }
@@ -242,6 +261,41 @@ pub fn derive_out_path(s: &GuiSettings) -> PathBuf {
     resources::resolve_user_path(&s.out_dir).join(format!("{stem}.{}", s.format.extension_str()))
 }
 
+/// G5: защита пути результата. Замена разрешена только для готового
+/// аудиофайла назначения; путь не должен проходить через symlink/junction,
+/// выходить из каталога вывода или совпадать с исходным текстом/голосом/
+/// каталогом модели. Проверки физические (canonicalize существующего
+/// префикса), поэтому альтернативные имена не обходят ограничения.
+pub fn ensure_output_path_safe(s: &GuiSettings, out_path: &Path) -> Result<()> {
+    let out_root = resources::resolve_user_path(&s.out_dir);
+    crate::batch::ensure_no_reparse_components(out_path)?;
+    anyhow::ensure!(
+        crate::batch::physically_under(out_path, &out_root),
+        "выходной путь вне каталога результата: {}",
+        out_path.display()
+    );
+    let text_path = resources::resolve_user_path(&s.text_file);
+    anyhow::ensure!(
+        !crate::batch::physically_same(out_path, &text_path),
+        "выходной путь совпадает с исходным текстом: {}",
+        out_path.display()
+    );
+    let voice_path = resources::resolve_user_path(&s.voice_wav);
+    anyhow::ensure!(
+        !crate::batch::physically_same(out_path, &voice_path),
+        "выходной путь совпадает с WAV-голосом: {}",
+        out_path.display()
+    );
+    if let Ok(model_dir) = resolve_model_dir(s) {
+        anyhow::ensure!(
+            !crate::batch::physically_under(out_path, &model_dir),
+            "выходной путь внутри каталога модели: {}",
+            out_path.display()
+        );
+    }
+    Ok(())
+}
+
 /// Уже инициализированная DLL (ORT грузится в процесс один раз — смена
 /// CPU/CUDA требует перезапуска GUI; честная ошибка вместо тихого фолбэка).
 static ORT_LOADED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
@@ -324,7 +378,17 @@ pub fn setup_ort_environment(s: &GuiSettings) -> Result<()> {
             Some(v) => std::env::set_var("PATH", v),
             None => std::env::remove_var("PATH"),
         }
-        bail!("ort::init() не удалось (DLL: {})", dll.display());
+        // G5: подсказка по устройству — частая причина сбоя загрузки ORT.
+        let hint = match s.device {
+            DeviceChoice::Cuda => {
+                "проверьте драйвер NVIDIA и наличие CUDA/cuDNN DLL рядом с onnxruntime.dll; \
+                 при нехватке VRAM уменьшите воркеров или выберите CPU"
+            }
+            DeviceChoice::Cpu => {
+                "проверьте VC++ runtime (vcruntime140.dll и соседние) и целостность onnxruntime.dll"
+            }
+        };
+        bail!("ort::init() не удалось (DLL: {}); {hint}", dll.display());
     }
     let _ = ORT_LOADED.set(dll);
     Ok(())
@@ -387,14 +451,29 @@ pub fn execute_job(cfg: &JobConfig, cancel: &AtomicBool, emit: &dyn Fn(JobEvent)
             }
         }
     }
+    // G5: защита путей — до любых проверок существования/замены. Тот же
+    // физический контроль, что в пакетном режиме G3.1: reparse-точки,
+    // выход за каталог результата, совпадение с входом/голосом/моделью.
+    if let Err(e) = ensure_output_path_safe(s, &cfg.out_path) {
+        return attach_warning(fail(format!("{e:#}")), &char_warning);
+    }
+    let overwrite = s.overwrite_existing;
     if cfg.out_path.exists() {
-        return attach_warning(
-            fail(format!(
-                "итоговый файл уже существует: {} — не перезаписываем (переименуйте или смените папку)",
-                cfg.out_path.display()
-            )),
-            &char_warning,
-        );
+        if !overwrite {
+            // Не ошибка и не модальное окно: файл просто пропускается и
+            // остаётся побайтово неизменным.
+            return attach_warning(
+                JobResult::skipped(format!(
+                    "Пропущено: файл уже существует: {} (перезапись выключена)",
+                    cfg.out_path.display()
+                )),
+                &char_warning,
+            );
+        }
+        emit(JobEvent::Log(format!(
+            "перезапись разрешена: {} — старый файл будет заменён только после успешного синтеза",
+            cfg.out_path.display()
+        )));
     }
     let ffmpeg_path = if s.ffmpeg_path.trim().is_empty() {
         None
@@ -403,12 +482,13 @@ pub fn execute_job(cfg: &JobConfig, cancel: &AtomicBool, emit: &dyn Fn(JobEvent)
         Some(resources::resolve_user_path(&s.ffmpeg_path))
     };
     let preset = s.preset_for_format();
-    let sink = match make_sink(
+    let sink = match make_sink_with_overwrite(
         &cfg.out_path,
         24_000,
         output_format(s.format),
         preset,
         ffmpeg_path.as_deref(),
+        overwrite,
     ) {
         Ok(sink) => sink,
         Err(e) => return attach_warning(fail(format!("{e:#}")), &char_warning),
@@ -439,7 +519,7 @@ pub fn execute_job(cfg: &JobConfig, cancel: &AtomicBool, emit: &dyn Fn(JobEvent)
     let elapsed = t0.elapsed().as_secs_f32();
 
     let mut res = match result {
-        Ok(outcome) => finish_from_outcome(cfg, outcome, elapsed, cancel),
+        Ok(outcome) => finish_from_outcome(cfg, outcome, elapsed, cancel, overwrite),
         Err(e) => finish_from_error(cfg, &e, elapsed),
     };
     res.progress = progress;
@@ -498,9 +578,11 @@ pub fn execute_batch(
     }
 
     let ext = settings.format.extension_str().to_string();
+    let overwrite = settings.overwrite_existing;
     let report = run_batch(
         &plan,
         &ext,
+        overwrite,
         cancel,
         &|ev| match ev {
             BatchEvent::Planned { total, warnings } => {
@@ -589,7 +671,12 @@ pub fn execute_batch(
             rep.diag_path = res.diag_path;
             rep.chunk_log_path = res.chunk_log_path;
             match res.status {
-                JobStatus::Completed => rep.status = FileStatus::Completed,
+                JobStatus::Completed => {
+                    rep.status = FileStatus::Completed;
+                    if overwrite {
+                        rep.reason = Some("Файл обновлён".into());
+                    }
+                }
                 JobStatus::Cancelled => {
                     rep.status = FileStatus::Cancelled;
                     rep.reason = Some(res.summary);
@@ -604,7 +691,7 @@ pub fn execute_batch(
                     rep.status = FileStatus::Failed;
                     rep.reason = Some(format!("частичный результат: {}", res.summary));
                 }
-                JobStatus::NoWork => {
+                JobStatus::NoWork | JobStatus::Skipped => {
                     rep.status = FileStatus::Skipped;
                     rep.reason = Some(res.summary);
                 }
@@ -651,6 +738,7 @@ fn finish_from_outcome(
     o: app_core::pipeline::StreamOutcome,
     elapsed: f32,
     cancel: &AtomicBool,
+    overwrite: bool,
 ) -> JobResult {
     let total_s = (o.speech_samples + o.pause_samples) as f64 / o.sample_rate as f64;
     let rtf = if total_s > 1e-9 {
@@ -690,8 +778,13 @@ fn finish_from_outcome(
     // Completed: RTF/паузы/денойз в сводку; лог чанков опционален (сбой
     // журнала не маскирует успешное аудио)
     let speech_s = o.speech_samples as f64 / o.sample_rate as f64;
+    let prefix = if overwrite {
+        "ФАЙЛ ОБНОВЛЁН"
+    } else {
+        "ГОТОВО"
+    };
     let mut summary = format!(
-        "ГОТОВО: {} ({:.2} с: речь {:.2} с + паузы {:.2} с; чанков {}; RTF {:.3})",
+        "{prefix}: {} ({:.2} с: речь {:.2} с + паузы {:.2} с; чанков {}; RTF {:.3})",
         cfg.out_path.display(),
         total_s,
         speech_s,
@@ -1089,7 +1182,8 @@ mod tests {
         assert!(res.diag_path.is_none());
         assert!(!cfg.out_path.exists());
 
-        // существующий итог — отказ, содержимое не трогаем
+        // G5: существующий итог при выключенной перезаписи — не ошибка, а
+        // пропуск; содержимое файла остаётся побайтово неизменным.
         let base = tmpdir("preort2");
         fake_model(&base, "ru-v2-slow");
         s.onnx_base = base.display().to_string();
@@ -1104,7 +1198,7 @@ mod tests {
             &cancel,
             &|_| {},
         );
-        assert_eq!(res.status, JobStatus::Failed);
+        assert_eq!(res.status, JobStatus::Skipped);
         assert!(res.summary.contains("уже существует"), "{}", res.summary);
         assert_eq!(std::fs::read(&cfg.out_path).unwrap(), b"keep");
     }
@@ -1315,6 +1409,71 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, JobEvent::FileDone { .. })));
+    }
+
+    /// G5: реальная перезапись WAV. Старый файл заменяется только после
+    /// успешного синтеза; при отмене старый файл остаётся, `.partial` — для
+    /// диагностики. Запуск: `cargo test -p shtorm-gui --release --lib
+    /// real_overwrite_wav -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "реальный синтез: модели + ORT DLL; CPU"]
+    fn real_overwrite_wav() {
+        // 1) успешная замена: «старый» файл становится настоящим WAV
+        let d = tmpdir("g5_overwrite_ok");
+        let mut s = real_settings(OutputFormatChoice::Wav, &d);
+        s.overwrite_existing = true;
+        let out = derive_out_path(&s);
+        std::fs::write(&out, b"old").unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let res = execute_job(
+            &JobConfig {
+                settings: s.clone(),
+                text: REAL_TEXT.into(),
+                out_path: out.clone(),
+            },
+            &cancel,
+            &|_| {},
+        );
+        eprintln!("[g5_overwrite_ok] {} | {}", res.status.label(), res.summary);
+        assert_eq!(res.status, JobStatus::Completed, "{}", res.summary);
+        let bytes = std::fs::read(&out).unwrap();
+        assert!(bytes.len() > 44, "WAV записан");
+        assert!(bytes.starts_with(b"RIFF"), "старый файл заменён WAV");
+        assert!(
+            !std::fs::read_dir(&d)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .any(|e| e.file_name().to_string_lossy().contains(".partial")),
+            "после успешной замены .partial не остался"
+        );
+
+        // 2) отмена до публикации: старый файл не тронут, .partial остался
+        let d2 = tmpdir("g5_overwrite_cancel");
+        let mut s2 = real_settings(OutputFormatChoice::Wav, &d2);
+        s2.overwrite_existing = true;
+        let out2 = derive_out_path(&s2);
+        std::fs::write(&out2, b"old").unwrap();
+        let cancel2 = Arc::new(AtomicBool::new(true));
+        let res2 = execute_job(
+            &JobConfig {
+                settings: s2,
+                text: REAL_TEXT.into(),
+                out_path: out2.clone(),
+            },
+            &cancel2,
+            &|_| {},
+        );
+        eprintln!(
+            "[g5_overwrite_cancel] {} | {}",
+            res2.status.label(),
+            res2.summary
+        );
+        assert_eq!(res2.status, JobStatus::Cancelled, "{}", res2.summary);
+        assert_eq!(std::fs::read(&out2).unwrap(), b"old", "старый файл цел");
+        assert!(
+            res2.partial_path.as_ref().is_some_and(|p| p.is_file()),
+            "черновик сохранён для диагностики"
+        );
     }
 
     /// Матрица одного устройства: WAV, MP3/Opus, отмена после первого чанка,

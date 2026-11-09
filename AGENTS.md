@@ -35,7 +35,9 @@ GUI для Pocket-TTS на Rust. Оперативное состояние — *
   golden 20 кейсов).
 - `crates/audio-processing` — `lib.rs` (write_wav16 create_new),
   `stream.rs` (`StreamingWav`: потоковый WAV, уникальный `.partial`,
-  `publish_no_replace` = MoveFileW без замены, RIFF-лимит).
+  `publish_no_replace` = MoveFileW без замены по умолчанию, G5
+  `publish_replace` = MoveFileExW REPLACE|WRITE_THROUGH только при явном
+  `overwrite=true`, RIFF-лимит).
 - `crates/app-core` — оркестрация: `pipeline.rs` (`synthesize_stream`,
   RunStatus/StreamError/DiagMeta/write_diag_log, `write_chunk_log`/
   `log_path_for` — общий журнал чанков CLI и GUI), `pool.rs` (N воркеров,
@@ -48,8 +50,9 @@ GUI для Pocket-TTS на Rust. Оперативное состояние — *
   ep_probe,synthesize}.rs` (CLI — тестовый инструмент; GUI не должен их
   запускать, а звать app-core напрямую).
 - `crates/gui` — eframe/egui 0.31: `settings.rs` (GuiSettings, round-trip
-  unknown keys, атомарная запись tmp create_new + MoveFileExW, импорт
-  Python read-only), `app.rs` (форма, валидация, прогресс/Стоп/статусы,
+  unknown keys, атомарная запись tmp create_new + MoveFileExW; G5 — без
+  импорта Python-настроек, EOS по умолчанию `Fixed(-4.0)`, флаг
+  `overwrite_existing`), `app.rs` (форма, валидация, прогресс/Стоп/статусы,
   управляемые свёртки `.open(Some(field))`, закрытие окна с отменой
   задания), `job.rs` (G2: резолв модели fast/slow, ORT env + init один
   раз на процесс, конвертация GuiSettings→PipelineOptions с паритетом
@@ -78,12 +81,21 @@ GUI для Pocket-TTS на Rust. Оперативное состояние — *
   не возвращать их.
 - Не проводить негативные файловые тесты на реальных пользовательских
   каталогах (дом, корень проекта, диск) — только уникальные песочницы %TEMP%.
-- **Не перезаписывать существующие выходные файлы**: аудио — `create_new` +
-  уникальный `.partial` (`{stem}.{нс}.{pid}.{счётчик}.partial.{ext}`) +
-  публикация `MoveFileW` БЕЗ замены (`publish_no_replace`); ffmpeg `-n`.
-- Единственная разрешённая замена файла — собственный конфиг GUI
+- **Существующие выходные файлы по умолчанию не перезаписываются**: аудио —
+  `create_new` + уникальный `.partial` (`{stem}.{нс}.{pid}.{счётчик}
+  .partial.{ext}`) + публикация `MoveFileW` БЕЗ замены
+  (`publish_no_replace`); ffmpeg `-n`.
+- **G5 — единственное исключение для аудио**: при явном
+  `overwrite_existing=true` (GUI-чекбокс) разрешена замена готового файла
+  назначения. Старый файл НЕ удаляется заранее; замена — атомарная
+  `MoveFileExW REPLACE_EXISTING|WRITE_THROUGH` только после успешной
+  финализации sink. При ошибке/отмене старый файл остаётся, `.partial`
+  сохраняется для диагностики. Каталоги, reparse-точки и пути вне каталога
+  результата отвергаются. Входные тексты, WAV-голос, модели и настройки
+  замене не подлежат.
+- Другая разрешённая замена — собственный конфиг GUI
   `shtorm_gui_settings.json` (atomic: unique tmp + `MoveFileExW
-  REPLACE_EXISTING|WRITE_THROUGH`); не расширять это на другие файлы.
+  REPLACE_EXISTING|WRITE_THROUGH`).
 - Не изменять: Python-проект `C:\PocketTTS-GUI`, системные настройки/PATH/
   CUDA/профиль Windows/SSH/GPG/глобальные инструменты, модели Shtorm.
 - Перед значительными изменениями: `git status` чист + верифицированный

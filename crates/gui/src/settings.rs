@@ -1,8 +1,8 @@
-//! Настройки GUI (G1): собственный JSON (`shtorm_gui_settings.json` рядом с
-//! exe), round-trip с сохранением неизвестных ключей, безопасная атомарная
+//! Настройки GUI (G1/G5): собственный JSON (`shtorm_gui_settings.json` рядом
+//! с exe), round-trip с сохранением неизвестных ключей, безопасная атомарная
 //! запись (unique tmp + MoveFileExW REPLACE — старый файл не разрушается при
-//! сбое сериализации). Импорт из `settings_pocket_tts.json` Python-GUI —
-//! только чтение (файл не изменяется), маппинг известных полей.
+//! сбое сериализации). Импорт из Python-GUI удалён в G5: приложение читает
+//! только собственный конфиг.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -11,18 +11,20 @@ use std::path::{Path, PathBuf};
 
 use shtorm_engine::EosTail;
 
-/// Порог EOS в настройках GUI (G4.1). «Авто» — встроенное фиксированное
-/// значение −4.0 движка teratts-android: НЕ читает runtime.json модели
-/// и не создаёт отдельного автоматического алгоритма. Число передаётся
-/// движку непосредственно.
+/// Порог EOS в настройках GUI (G4.1/G5). В интерфейсе G5 выбранное значение —
+/// всегда число; `Auto` оставлен только как совместимый алиас старых конфигов
+/// (`"auto"` читается как `Fixed(-4.0)`, новый JSON пишет число).
+/// Порог — встроенное значение −4.0 движка teratts-android: НЕ читает
+/// runtime.json модели и не создаёт отдельного автоматического алгоритма.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum EosThresholdSetting {
+    /// Устаревший алиас «Авто»; в GUI больше не показывается.
     Auto,
     Fixed(f32),
 }
 
 impl EosThresholdSetting {
-    /// Значение «Авто» — константа порога teratts-android.
+    /// Историческое значение «Авто» — константа порога teratts-android.
     pub const AUTO_VALUE: f32 = -4.0;
 
     pub fn value(self) -> f32 {
@@ -33,7 +35,7 @@ impl EosThresholdSetting {
     }
 }
 
-/// Варианты порога EOS (как в Python GUI; «Авто» == −4.0).
+/// Варианты порога EOS (числовые; «Авто» в списке G5 отсутствует).
 pub const EOS_THRESHOLD_CHOICES: &[f32] = &[
     -6.0, -5.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0,
 ];
@@ -48,7 +50,9 @@ mod eos_threshold_serde {
 
     pub fn serialize<S: Serializer>(t: &EosThresholdSetting, s: S) -> Result<S::Ok, S::Error> {
         match t {
-            EosThresholdSetting::Auto => s.serialize_str("auto"),
+            // G5: даже устаревший алиас пишется числом — в новых конфигах
+            // строки "auto" больше не появляются.
+            EosThresholdSetting::Auto => s.serialize_f32(EosThresholdSetting::AUTO_VALUE),
             EosThresholdSetting::Fixed(v) => s.serialize_f32(*v),
         }
     }
@@ -64,7 +68,8 @@ mod eos_threshold_serde {
             // старые конфиги хранят число (в т.ч. −4.0) — это Fixed
             Repr::F32(v) => Ok(EosThresholdSetting::Fixed(v)),
             Repr::Str(s) => match s.trim().to_ascii_lowercase().as_str() {
-                "auto" => Ok(EosThresholdSetting::Auto),
+                // G5: старое "auto" мигрирует в число −4.0 (без варианта Auto)
+                "auto" => Ok(EosThresholdSetting::Fixed(EosThresholdSetting::AUTO_VALUE)),
                 other => {
                     // потерянные старые строковые метки («-4» и т.п.) — число
                     other
@@ -165,6 +170,12 @@ pub struct GuiSettings {
     pub out_dir: String,
     pub chunk_log: bool,
     pub ffmpeg_path: String,
+    /// G5: разрешить замену готового аудиофайла назначения. По умолчанию
+    /// выключено. Замена выполняется только после успешного синтеза
+    /// (sink пишет `.partial`, публикация — MoveFileExW REPLACE).
+    pub overwrite_existing: bool,
+    /// G5: тёмное оформление окна (по умолчанию да; светлое — по выбору).
+    pub theme_dark: bool,
     // UI (фактические состояния свёрток; синхронизируются с egui-памятью)
     pub source_open: bool,
     pub model_open: bool,
@@ -246,9 +257,11 @@ impl Default for GuiSettings {
             threads: 4,
             temperature: 0.3,
             decode_steps: 1,
-            // G4.1: дефолты воспроизводят teratts-android — «Авто» (== −4.0)
-            // и явные Fixed(5)/Fixed(3). Python-пересчёт 6/4 не переносится.
-            eos_threshold: EosThresholdSetting::Auto,
+            // G5: порог по умолчанию — явное число −4.0 (значение
+            // teratts-android); «Авто» в интерфейсе больше нет.
+            // Хвосты — явные Fixed(5)/Fixed(3). Python-пересчёт 6/4 не
+            // переносится.
+            eos_threshold: EosThresholdSetting::Fixed(-4.0),
             eos_tail_short: EosTail::Fixed(5),
             eos_tail_long: EosTail::Fixed(3),
             seed: 42,
@@ -265,6 +278,10 @@ impl Default for GuiSettings {
             out_dir: "output".into(),
             chunk_log: false,
             ffmpeg_path: String::new(),
+            // защита существующих аудиокниг по умолчанию: без явного согласия
+            // пользователя готовые файлы не заменяются
+            overwrite_existing: false,
+            theme_dark: true,
             source_open: true,
             model_open: true,
             gen_open: true,
@@ -298,7 +315,8 @@ impl GuiSettings {
     pub fn clamped(&mut self) {
         self.temperature = self.temperature.clamp(0.05, 1.5);
         self.decode_steps = self.decode_steps.clamp(1, 8);
-        // порог: зажимается только числовая часть, «Авто» сохраняется
+        // порог: зажимается числовая часть; устаревший Auto не трогаем
+        // (в GUI он не создаётся, load "auto" сразу даёт Fixed(-4.0))
         if let EosThresholdSetting::Fixed(v) = self.eos_threshold {
             self.eos_threshold = EosThresholdSetting::Fixed(v.clamp(-20.0, 20.0));
         }
@@ -405,91 +423,6 @@ fn atomic_replace(from: &Path, to: &Path) -> Result<()> {
 fn atomic_replace(from: &Path, to: &Path) -> Result<()> {
     std::fs::rename(from, to)
         .with_context(|| format!("rename {} -> {}", from.display(), to.display()))
-}
-
-/// Импорт из Python `settings_pocket_tts.json` — ТОЛЬКО ЧТЕНИЕ (файл не
-/// изменяется). Маппинг известных полей; неизвестные игнорируются.
-pub fn import_from_python(python_settings: &Path) -> Result<GuiSettings> {
-    let raw = std::fs::read_to_string(python_settings)
-        .with_context(|| format!("прочитать {}", python_settings.display()))?;
-    let v: serde_json::Value = serde_json::from_str(&raw)
-        .with_context(|| format!("разобрать {}", python_settings.display()))?;
-    let g = |k: &str| v.get(k).cloned();
-    let mut s = GuiSettings::default();
-    if let Some(x) = g("temperature").and_then(|x| x.as_f64()) {
-        s.temperature = x as f32;
-    }
-    if let Some(x) = g("sampler_decode_steps").and_then(|x| x.as_u64()) {
-        s.decode_steps = x as u32;
-    }
-    if let Some(x) = g("seed").and_then(|x| x.as_i64()) {
-        s.seed = x;
-    }
-    if let Some(x) = g("brightness_db").and_then(|x| x.as_f64()) {
-        s.brightness_db = x as f32;
-    }
-    if let Some(x) = g("denoise").and_then(|x| x.as_bool()) {
-        s.denoise = x;
-    }
-    if let Some(x) = g("anti_repeat_teratts").and_then(|x| x.as_bool()) {
-        s.anti_repeat = x;
-    }
-    if let Some(x) = g("pause_scale").and_then(|x| x.as_f64()) {
-        s.pause_scale = x as f32;
-    }
-    if let Some(x) = g("paragraph_pause_s").and_then(|x| x.as_f64()) {
-        s.paragraph_pause_s = x as f32;
-    }
-    if let Some(x) = g("max_tokens").and_then(|x| x.as_u64()) {
-        s.max_tokens = x as u32;
-    }
-    if let Some(x) = g("device").and_then(|x| x.as_str().map(str::to_string)) {
-        s.device = if x.eq_ignore_ascii_case("cuda") {
-            DeviceChoice::Cuda
-        } else {
-            DeviceChoice::Cpu
-        };
-    }
-    if let Some(x) = g("num_model_instances").and_then(|x| x.as_u64()) {
-        s.workers = Some(x as u32);
-    }
-    if let Some(x) = g("use_wav").and_then(|x| x.as_bool()) {
-        s.format = if x {
-            OutputFormatChoice::Wav
-        } else {
-            OutputFormatChoice::Mp3
-        };
-    }
-    if let Some(x) = g("mp3_preset").and_then(|x| x.as_str().map(str::to_string)) {
-        // Python хранит один пресет: opus-метки переносим в opus_preset,
-        // остальные — в mp3_preset (явный маппинг по формату пресета).
-        if x.trim().to_ascii_lowercase().starts_with("opus") {
-            s.opus_preset = x;
-        } else {
-            s.mp3_preset = x;
-        }
-    }
-    if let Some(x) = g("voice_source").and_then(|x| x.as_str().map(str::to_string)) {
-        s.voice_wav = x.to_string();
-    }
-    if let Some(x) = g("source_path_single").and_then(|x| x.as_str().map(str::to_string)) {
-        s.text_file = x.to_string();
-    }
-    // Python хранит общий source_path + processing_mode ("single"/"batch").
-    if let Some(x) = g("source_path").and_then(|x| x.as_str().map(str::to_string)) {
-        s.text_file = x.to_string();
-    }
-    if let Some(x) = g("processing_mode").and_then(|x| x.as_str().map(str::to_string)) {
-        s.batch = x.eq_ignore_ascii_case("batch");
-    }
-    if let Some(x) = g("output_dir_path").and_then(|x| x.as_str().map(str::to_string)) {
-        s.out_dir = x.to_string();
-    }
-    if let Some(x) = g("chunk_log").and_then(|x| x.as_bool()) {
-        s.chunk_log = x;
-    }
-    s.clamped();
-    Ok(s)
 }
 
 #[cfg(test)]
@@ -611,37 +544,6 @@ mod tests {
         assert!(leftovers.is_empty(), "tmp убраны после успеха");
     }
 
-    #[test]
-    fn import_python_read_only_maps_known_fields() {
-        let d = tmpdir("import");
-        let src = d.join("settings_pocket_tts.json");
-        std::fs::write(
-            &src,
-            r#"{
-                "temperature": 0.3, "sampler_decode_steps": 1,
-                "eos_teratts": true, "anti_repeat_teratts": true,
-                "denoise": false, "brightness_db": 8, "seed": 42,
-                "device": "Auto", "num_model_instances": 3,
-                "mp3_preset": "-V2", "use_wav": false,
-                "voice_source": "C:/v.wav", "source_path_single": "C:/t.txt",
-                "output_dir_path": "C:/out", "chunk_log": false,
-                "unknown_future": 1
-            }"#,
-        )
-        .unwrap();
-        let before = std::fs::read_to_string(&src).unwrap();
-        let s = import_from_python(&src).unwrap();
-        assert_eq!(s.temperature, 0.3);
-        assert_eq!(s.workers, Some(3));
-        assert_eq!(s.format, OutputFormatChoice::Mp3);
-        assert_eq!(s.mp3_preset, "-V2");
-        assert_eq!(s.voice_wav, "C:/v.wav");
-        // Auto -> CPU (безопасный дефолт)
-        assert_eq!(s.device, DeviceChoice::Cpu);
-        // файл Python не изменён
-        assert_eq!(std::fs::read_to_string(&src).unwrap(), before);
-    }
-
     /// Пресет выбирается по формату: MP3 и Opus не делят одно поле и не
     /// подменяют друг друга при переключении формата.
     #[test]
@@ -665,18 +567,6 @@ mod tests {
         assert_eq!(s.preset_for_format(), "128k");
     }
 
-    /// Python хранит один пресет: opus-метка попадает в opus_preset, а
-    /// MP3-поле остаётся дефолтным (без несовместимого значения).
-    #[test]
-    fn import_python_opus_preset_maps_to_opus_field() {
-        let d = tmpdir("import_opus");
-        let src = d.join("settings_pocket_tts.json");
-        std::fs::write(&src, r#"{"mp3_preset": "opus 32k", "use_wav": false}"#).unwrap();
-        let s = import_from_python(&src).unwrap();
-        assert_eq!(s.opus_preset, "opus 32k");
-        assert_eq!(s.mp3_preset, "-V2 (Высокое)");
-    }
-
     #[test]
     fn effective_workers_by_device_and_manual_override() {
         let s = GuiSettings {
@@ -698,13 +588,12 @@ mod tests {
 
     // ============ G4.1: настройки EOS ============
 
-    /// Дефолты новой конфигурации — значения teratts-android: «Авто» (== −4.0)
-    /// и явные Fixed(5)/Fixed(3) (не None!). «Авто» — фиксированное −4.0,
-    /// а не чтение модели.
+    /// Дефолты новой конфигурации — значения teratts-android: явное число
+    /// Fixed(-4.0) (без варианта «Авто») и Fixed(5)/Fixed(3) (не None!).
     #[test]
     fn eos_defaults_are_teratts_android_values() {
         let s = GuiSettings::default();
-        assert_eq!(s.eos_threshold, EosThresholdSetting::Auto);
+        assert_eq!(s.eos_threshold, EosThresholdSetting::Fixed(-4.0));
         assert_eq!(s.eos_threshold.value(), -4.0);
         assert_eq!(s.eos_tail_short, EosTail::Fixed(5));
         assert_eq!(s.eos_tail_long, EosTail::Fixed(3));
@@ -728,30 +617,41 @@ mod tests {
             load_settings(&p).unwrap().eos_threshold,
             EosThresholdSetting::Fixed(-4.0)
         );
+        // G5: старое строковое "auto" мигрирует в число −4.0, а не в Auto
+        std::fs::write(&p, r#"{"eos_threshold": "auto"}"#).unwrap();
+        let s = load_settings(&p).unwrap();
+        assert_eq!(s.eos_threshold, EosThresholdSetting::Fixed(-4.0));
+        // при следующем сохранении значение записывается числом
+        save_settings(&s, &p).unwrap();
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(!raw.contains("\"auto\""), "{raw}");
+        assert!(raw.contains("\"eos_threshold\": -4.0"), "{raw}");
         // невалидный хвост (за диапазоном) — честная ошибка разбора
         std::fs::write(&p, r#"{"eos_tail_short": 99}"#).unwrap();
         assert!(load_settings(&p).is_err());
     }
 
-    /// Round-trip новых значений: «auto»/«none»/0/10 сохраняются как есть
-    /// (None ≠ 0 в JSON: "none" против числа), unknown-ключи не теряются.
+    /// Round-trip новых значений: числовой порог −4.0, «none»/0/10
+    /// сохраняются как есть (None ≠ 0 в JSON: "none" против числа),
+    /// unknown-ключи не теряются. Строка "auto" в новых конфигах не пишется.
     #[test]
     fn eos_settings_round_trip_distinct_states() {
         let d = tmpdir("eos_rt");
         let p = d.join("s.json");
         let s = GuiSettings {
-            eos_threshold: EosThresholdSetting::Auto,
+            eos_threshold: EosThresholdSetting::Fixed(-4.0),
             eos_tail_short: EosTail::Default,
             eos_tail_long: EosTail::Fixed(0),
             ..Default::default()
         };
         save_settings(&s, &p).unwrap();
         let raw = std::fs::read_to_string(&p).unwrap();
-        assert!(raw.contains("\"auto\""), "{raw}");
+        assert!(!raw.contains("\"auto\""), "{raw}");
+        assert!(raw.contains("\"eos_threshold\": -4.0"), "{raw}");
         assert!(raw.contains("\"none\""), "None — строка, не число: {raw}");
         assert!(raw.contains("\"eos_tail_long\": 0"), "{raw}");
         let s2 = load_settings(&p).unwrap();
-        assert_eq!(s2.eos_threshold, EosThresholdSetting::Auto);
+        assert_eq!(s2.eos_threshold, EosThresholdSetting::Fixed(-4.0));
         assert_eq!(s2.eos_tail_short, EosTail::Default);
         assert_eq!(s2.eos_tail_long, EosTail::Fixed(0));
         assert_ne!(s2.eos_tail_short, s2.eos_tail_long, "None ≠ Fixed(0)");
@@ -769,8 +669,48 @@ mod tests {
         assert_eq!(s3.eos_tail_long, EosTail::Fixed(1));
     }
 
-    /// clamped() не разрушает состояния: «Авто» и None остаются собой,
-    /// Fixed зажимается в допустимый диапазон.
+    /// G5: overwrite_existing по умолчанию выключен; ключ переживает
+    /// round-trip, а старый конфиг без ключа читается как false.
+    #[test]
+    fn overwrite_existing_default_off_and_round_trip() {
+        assert!(!GuiSettings::default().overwrite_existing);
+        let d = tmpdir("overwrite");
+        let p = d.join("s.json");
+        let s = GuiSettings {
+            overwrite_existing: true,
+            ..Default::default()
+        };
+        save_settings(&s, &p).unwrap();
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(raw.contains("\"overwrite_existing\": true"), "{raw}");
+        assert!(load_settings(&p).unwrap().overwrite_existing);
+        std::fs::write(&p, r#"{"temperature": 0.4}"#).unwrap();
+        assert!(
+            !load_settings(&p).unwrap().overwrite_existing,
+            "старый конфиг без ключа — защита включена"
+        );
+    }
+
+    #[test]
+    fn theme_default_dark_and_round_trip() {
+        assert!(GuiSettings::default().theme_dark);
+        let d = tmpdir("theme");
+        let p = d.join("s.json");
+        let s = GuiSettings {
+            theme_dark: false,
+            ..Default::default()
+        };
+        save_settings(&s, &p).unwrap();
+        assert!(!load_settings(&p).unwrap().theme_dark);
+        std::fs::write(&p, r#"{"temperature": 0.4}"#).unwrap();
+        assert!(
+            load_settings(&p).unwrap().theme_dark,
+            "старый конфиг без ключа — тёмная тема"
+        );
+    }
+
+    /// clamped() не разрушает состояния: устаревший «Авто» и None остаются
+    /// собой, Fixed зажимается в допустимый диапазон.
     #[test]
     fn eos_clamped_preserves_auto_and_none() {
         let mut s = GuiSettings {
