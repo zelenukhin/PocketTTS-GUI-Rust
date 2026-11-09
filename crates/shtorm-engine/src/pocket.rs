@@ -419,8 +419,7 @@ impl PhaseTimers {
 fn phase_timing_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("SHTORM_PHASE_TIMING")
-            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("on"))
+        std::env::var("SHTORM_PHASE_TIMING").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("on"))
     })
 }
 
@@ -593,6 +592,9 @@ pub struct Pocket {
     flow: Session,
     decoder: Session,
     main_states: States,
+    /// CUDA-P2A: экспериментальные GPU-резидентные состояния main через
+    /// I/O Binding (только Device::Cuda + SHTORM_CUDA_IO_BINDING=1; иначе None).
+    main_io: Option<crate::io_states::IoStates>,
     decoder_states: States,
     bpe: Bpe,
     voices: HashMap<String, (std::time::SystemTime, Array3<f32>)>,
@@ -678,6 +680,27 @@ impl Pocket {
         );
         let main_states = States::of(&main)?;
         let decoder_states = States::of(&decoder)?;
+        // CUDA-P2A: экспериментальный путь включается ТОЛЬКО диагностическим
+        // флагом и только на CUDA. Неподдерживаемая комбинация/ошибка
+        // инициализации — явная ошибка, без тихого перехода на CPU.
+        let io_binding = crate::io_states::cuda_io_binding_enabled();
+        if io_binding && !opts.device.is_cuda() {
+            anyhow::bail!(
+                "SHTORM_CUDA_IO_BINDING=1 requires a CUDA device; \
+                 the experimental path has no CPU variant"
+            );
+        }
+        let main_io = match &opts.device {
+            Device::Cuda { device_id, .. } if io_binding => Some(
+                crate::io_states::IoStates::new(
+                    &main,
+                    &crate::io_states::cuda_state_memory(*device_id)?,
+                    &crate::io_states::cpu_output_memory()?,
+                )
+                .context("CUDA-P2A: initialize I/O binding for flow_lm_main")?,
+            ),
+            _ => None,
+        };
         let bpe = Bpe::load(&dir.join("tokenizer.model"))?;
         let rng = match opts.seed {
             Some(s) => rand::rngs::StdRng::seed_from_u64(s),
@@ -690,6 +713,7 @@ impl Pocket {
             flow,
             decoder,
             main_states,
+            main_io,
             decoder_states,
             bpe,
             voices: HashMap::new(),
@@ -857,6 +881,33 @@ impl Pocket {
         policy.resolve_for(words)
     }
 
+    /// Сброс состояний main перед чанком/повтором anti-repeat: обычный путь
+    /// пересоздаёт нулевые CPU-тензоры, CUDA-P2A — помечает GPU-состояния
+    /// нулевыми (одна H2D-копия нулей на следующий прогон, не на кадр).
+    fn main_reset(&mut self) -> Result<()> {
+        match &mut self.main_io {
+            Some(io) => {
+                io.reset();
+                Ok(())
+            }
+            None => self.main_states.reset(),
+        }
+    }
+
+    /// Один прогон main: обычный `States::run` (CPU↔GPU per frame) или
+    /// экспериментальный I/O Binding с GPU-резидентными состояниями.
+    /// Возвращает не-stateful выходы в порядке графа (conditioning, eos_logit).
+    fn main_run(
+        &mut self,
+        inputs: Vec<(String, DynValue)>,
+        tim: Option<(&mut u64, &mut u64)>,
+    ) -> Result<Vec<Vec<f32>>> {
+        match &mut self.main_io {
+            Some(io) => io.run(&mut self.main, inputs, tim),
+            None => self.main_states.run(&mut self.main, inputs, tim),
+        }
+    }
+
     /// Speech for [text] (stress as U+0301) in the voice of the recording [voice], 24 kHz.
     pub fn say(&mut self, text: &str, voice: &str) -> Result<Vec<f32>> {
         self.say_chunk(text, voice, 0)
@@ -987,7 +1038,7 @@ impl Pocket {
         tim: &mut Option<PhaseTimers>,
     ) -> Result<(Vec<f32>, bool)> {
         let t_reset = std::time::Instant::now();
-        self.main_states.reset()?;
+        self.main_reset()?;
         if let Some(t) = tim {
             PhaseTimers::accrue(&mut t.reset_ns, t_reset);
         }
@@ -995,8 +1046,7 @@ impl Pocket {
         // voice, then text, into the transformer's memory
         let vf = voice.shape()[1];
         let t_prefix = std::time::Instant::now();
-        self.main_states.run(
-            &mut self.main,
+        self.main_run(
             vec![
                 ("sequence".into(), empty_seq()?),
                 (
@@ -1007,8 +1057,7 @@ impl Pocket {
             tim.as_mut()
                 .map(|t| (&mut t.main_run_ns, &mut t.main_ext_ns)),
         )?;
-        self.main_states.run(
-            &mut self.main,
+        self.main_run(
             vec![
                 ("sequence".into(), empty_seq()?),
                 (
@@ -1034,8 +1083,7 @@ impl Pocket {
             if let Some(t) = tim {
                 PhaseTimers::accrue(&mut t.input_ns, t_input);
             }
-            let out = self.main_states.run(
-                &mut self.main,
+            let out = self.main_run(
                 vec![
                     ("sequence".into(), seq),
                     ("text_embeddings".into(), emb_empty),

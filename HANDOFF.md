@@ -1,16 +1,58 @@
 # HANDOFF.md — оперативный снимок проекта (читать первым вместе с AGENTS.md)
 
-- **Дата обновления**: 2026-11-09 (CUDA-P1: диагностика отставания Rust-CUDA
-  от Python; следующий — G5 или CUDA-P2 по отдельному заданию).
+- **Дата обновления**: 2026-11-09 (CUDA-P2A: экспериментальный I/O Binding +
+  GPU-резидентные состояния main; следующий этап — только по отдельному
+  заданию: P2B или G5).
 - **Последний функциональный коммит**: G4.1 — фактический хэш брать из Git
   (`git log -1 --oneline`); в документе не хардкодится.
 - **HEAD**: только из Git (`git log -1 --oneline`), не из этого файла.
-- **Бэкап на NAS (подтверждён; сделан ПЕРЕД изменениями CUDA-P1)**: полный
-  архив HEAD `2828476` —
-  `\\DISKSTATION\Ableton 2\Temp2\ShtormTTS-Windows-full-2828476-20261109-213611.zip`,
-  SHA256 `902B93D6E5771520514A8AF53E21EF2EB9272C717AA624333C267FB974A45A93`,
-  134/134 blob совпадают. Предыдущий: `…full-5fa4a8d-20261109-202318.zip`
-  (детали выше по истории G4.1).
+- **Бэкап на NAS (подтверждён; сделан ПЕРЕД изменениями CUDA-P2A)**: полный
+  архив HEAD `374097b` —
+  `\\DISKSTATION\Ableton 2\Temp2\ShtormTTS-Windows-full-374097b-20261109-223351.zip`,
+  SHA256 `593A0594B77B4033F2C03B5153D866D46D4559BF8ED84ED8F549508279A2F1D6`,
+  135/135 blob совпадают. Предыдущий: `…full-2828476-20261109-213611.zip`
+  (CUDA-P1).
+
+## CUDA-P2A — что сделано (эксперимент за флагом, по умолчанию выключен)
+
+- **Новый путь**: `SHTORM_CUDA_IO_BINDING=1` + `Device::Cuda` → состояния
+  `flow_lm_main` живут на GPU между кадрами через `IoBinding` (ort
+  2.0.0-rc.11): выход кадра k привязывается входом k+1 без хост-копии.
+  Два binding'а (ping-pong), состояния сопоставляются ПО ИМЕНАМ
+  `state_*` ↔ `out_state_*`, checked типы/формы; `reset()` = одна H2D-копия
+  нулей на чанк/попытку; на CPU читаются только `conditioning` (4 КиБ) и
+  `eos_logit`. `flow`/`decoder`/CPU-путь не менялись; флаг на CPU — явная
+  ошибка. Код: `crates/shtorm-engine/src/io_states.rs`, в `pocket.rs` —
+  `main_io` + `main_reset`/`main_run` (без флага — прежний `States::run`).
+- **Результаты** (13 чанков/64.01 с речи, seed 42, temp 0.3, steps 1,
+  EOS −4/5/3, FP32/TF32=0, прогрев + 3 повтора; чистый синтез без загрузки):
+  old 1w 33.3 с (RTF 0.476), new 1w **8.15 с (RTF 0.116)** — 4.1×;
+  new 2w 7.35 с (0.105), 3w 7.30 с (0.104). main.run 36.3 → **5.96 мс/кадр**
+  при 1w; средний чанк 2.56 → 0.62 с. Новый 1w быстрее Python/PyTorch
+  (8.7–9.35 с, RTF 0.135–0.146) на том же стенде.
+- **WAV побитово**: 31 прогон (old/new × 1/2/3w × warmup/3 повтора/clean) +
+  pilot — один SHA256 `5ca845c093ab73b5…`; равен эталону CUDA-P1. Smoke
+  одной фразы old==new `ac2b77a9…`.
+- **VRAM не вырос**: пики 2714/4766/6842 МБ (old 2715/4767/6825).
+  Ping-pong +93.75 МиБ/воркер компенсируется исчезновением staging.
+- **Устранение копий доказано**: контролируемый A/B на синтетическом графе
+  с 18 стейтами как у main — 31.50 мс/прогон (старая схема) против
+  0.65 мс (binding), 48×; трафик за задание ~78.8 ГиБ → ~0.61 ГиБ (~130×);
+  `state[0].memory_info()` = CUDA; ORT-trace old/new идентичны (55 993
+  события). Nsight/CUPTI на этой машине недоступны (nsys: «Connection to
+  Agent lost», нужен elevation) — 14.6 мс из CUDA-P1 не считать GPU-временем.
+- **Оставшееся узкое место**: shape-узлы CPU (222/кадр) и синхронизации;
+  воркеры ≥2 почти не дают выигрыша (new wall 9.8/9.4/9.8 с; GPU avg 40–41%,
+  пик 48–83%). Это цель P2B, не копии.
+- **Проверки**: `cargo test` 153 passed / 0 failed; clippy 0; fmt; release OK;
+  синтетические тесты (CPU+CUDA): ping-pong/reset/zero-size/пустая sequence/
+  несовпадения имён-типов-динамики/50 циклов create-drop/замер копий.
+  Модели: `crates/shtorm-engine/tests/models` (генератор
+  `tools/gen_p2a_models.py`). Подробно, включая API и методику, —
+  `docs/CUDA_PROFILE_P2A.md`, сырые данные `out/p2a/`.
+- **Решение**: путь оставлен экспериментальным за флагом; в пользовательский
+  режим НЕ включать. P2B (flow-binding, shape-узлы/синхронизации,
+  масштабирование воркеров) — только по отдельному заданию. P2A завершён.
 
 ## CUDA-P1 — что сделано (диагностика, без оптимизаций)
 
@@ -350,7 +392,12 @@ Python `pocket-tts_gui.py`. Постоянные правила и архите�
   GUI требует перезапуска приложения (сообщение в UI).
 - ~~Auto-EOS/`frames_after_eos`~~ — закрыто в G4.1: параметры EOS задаются
   явно (−4/5/3 по teratts-android; «Авто» ≡ −4.0; EOS из `runtime.json`
-  намеренно не читается). CUDA I/O Binding — не начат.
+  намеренно не читается). CUDA I/O Binding — реализован в CUDA-P2A, но
+  **только за `SHTORM_CUDA_IO_BINDING=1`** (эксперимент; по умолчанию прежний
+  путь). Ограничения флага: только CUDA, только main-граф (flow/decoder —
+  старый путь), статические формы состояний.
+- CUDA-P2A: 3 воркера не масштабируются (wall ≈ как у 1w); причина —
+  shape-узлы CPU и синхронизации, не копии (см. `docs/CUDA_PROFILE_P2A.md`).
 - Портативный пакет проверен на машине разработки; чистая Windows VM без
   Python/Torch/ORT/FFmpeg **не проверялась**. Модели и голосовой пример не
   имеют подтверждённой лицензии на публичную редистрибуцию (личное
@@ -376,6 +423,9 @@ Python `pocket-tts_gui.py`. Постоянные правила и архите�
 Cargo.toml            # workspace: shtorm-engine, text-processing,
                       #   audio-processing, app-core, gui
 crates/shtorm-engine/src/pocket.rs     # движок (FP32-only, Device, seed)
+crates/shtorm-engine/src/io_states.rs  # CUDA-P2A: IoBinding + GPU-стейты main
+crates/shtorm-engine/examples/graph_meta.rs  # метаданные графов (диагностика)
+crates/shtorm-engine/tests/models/     # синтетические ONNX (P2A; ген. tools/gen_p2a_models.py)
 crates/text-processing/src/{chunking,char_rules,pauses}.rs
 crates/audio-processing/src/stream.rs  # StreamingWav, publish_no_replace
 crates/app-core/src/pipeline.rs        # synthesize_stream, StreamError,
@@ -394,7 +444,8 @@ tools/*.ps1, tools/gen_*_golden.py     # smoke и генераторы golden
 tests/golden/*.json                    # 96 + 314 + 20 кейсов
 docs/SAFETY_AUDIT.md, docs/GUI_PLAN.md, docs/NEXT_STEPS.md,
 docs/G3_BATCH.md, docs/PORTABLE_BUILD.md,
-docs/FEATURE_PARITY.md, docs/BENCHMARKS.md
+docs/FEATURE_PARITY.md, docs/BENCHMARKS.md,
+docs/CUDA_PROFILE_P1.md, docs/CUDA_PROFILE_P2A.md
 ```
 
 ## Сборка / запуск / проверки (Windows, Git Bash)
@@ -411,6 +462,9 @@ SHTORM_GUI_TEST_DEVICE=cuda cargo test -p shtorm-gui --release --lib \
 cargo test -p shtorm-gui --release --lib real_batch_cpu -- --ignored --nocapture
 # G4.1 реальный GUI↔CLI паритет нестандартных EOS (−1/0/0 и none/none):
 cargo test -p shtorm-gui --release --lib real_eos_parity -- --ignored --nocapture
+# CUDA-P2A синтетика (CPU; на CUDA добавить SHTORM_P2A_DEVICE=cuda и PATH deps/portable):
+ORT_DYLIB_PATH=deps/ort-cpu/onnxruntime-win-x64-1.23.2/lib/onnxruntime.dll \
+  cargo test --release -p shtorm-engine --lib io_states -- --ignored --nocapture
 # GUI: ./target/release/shtorm-gui.exe
 # G4 portable (новый каталог вне репозитория; см. docs/PORTABLE_BUILD.md):
 powershell -ExecutionPolicy Bypass -File tools/build-portable.ps1 `
@@ -423,11 +477,13 @@ powershell -ExecutionPolicy Bypass -File tools/build-portable.ps1 `
 
 ## NEXT TASK (НЕ НАЧИНАТЬ без явного задания)
 
-CUDA-P1 завершён (см. раздел выше). Кандидаты следующего этапа:
+CUDA-P1 и CUDA-P2A завершены (см. разделы выше). Кандидаты следующего этапа:
 
-1. **CUDA-P2**: I/O Binding + резидентные GPU-стейты main/flow — план,
-   ожидания и риски в `docs/CUDA_PROFILE_P1.md` §7. Только по отдельному
-   заданию (меняет ядро CUDA-пути).
+1. **CUDA-P2B** — только по отдельному заданию. Приоритеты (обоснование —
+   `docs/CUDA_PROFILE_P2A.md` §9): (а) shape-узлы/межEP-синхронизации
+   (222 CPU-узла/кадр, главный простой GPU), (б) масштабирование воркеров
+   (3w ≈ 1w по wall: 9.8/9.4/9.8 с), (в) flow/decoder I/O Binding (малый
+   выигрыш: flow 1.37 мс/кадр при 1w). Не начинать автоматически.
 2. G5-полировка GUI: интерактивный клик-проход, тема/копирование лога,
    RTF без времени загрузки моделей, уточнение ошибок CUDA/VRAM.
 3. Переиспользование пула воркеров между файлами — после замеров старта/
