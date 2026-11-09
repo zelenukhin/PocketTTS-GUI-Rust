@@ -3,16 +3,18 @@
 //! Логика (форма/настройки/задание синтеза) — в библиотеке shtorm_gui.
 //!
 //! G4: диагностические режимы портативной сборки:
-//! `--portable-check`, `--portable-selftest`, `--portable-selftest-batch`.
-//! Они используют тот же `execute_job`/`execute_batch`, что и GUI, и не
-//! заменяют интерактивную проверку окна.
+//! `--portable-check`, `--portable-selftest`, `--portable-selftest-batch`,
+//! `--portable-selftest-cancel`. Они используют тот же
+//! `execute_job`/`execute_batch`, что и GUI, и не заменяют интерактивную
+//! проверку окна.
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use shtorm_gui::job::{
-    execute_batch, execute_job, resolve_model_dir, resolve_ort_dylib, JobConfig, JobStatus,
+    execute_batch, execute_job, resolve_model_dir, resolve_ort_dylib, JobConfig, JobEvent,
+    JobStatus,
 };
 use shtorm_gui::resources;
 use shtorm_gui::settings::{
@@ -27,6 +29,9 @@ fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--portable-check") {
         std::process::exit(portable_check(&args));
+    }
+    if args.iter().any(|a| a == "--portable-selftest-cancel") {
+        std::process::exit(portable_selftest_cancel(&args));
     }
     if args.iter().any(|a| a == "--portable-selftest-batch") {
         std::process::exit(portable_selftest(&args, true));
@@ -230,6 +235,82 @@ fn portable_selftest(args: &[String], batch: bool) -> i32 {
     if result.status == JobStatus::Completed {
         0
     } else {
+        1
+    }
+}
+
+/// G4/P2A.1: диагностика Stop/Cancel на портативном exe. Текст утраивается,
+/// чтобы чанков было заведомо несколько; отмена ставится после первого
+/// готового чанка (воркер в этот момент уже генерирует следующий). Проверка:
+/// Cancelled без итогового файла, `.partial` существует; повторный запуск на
+/// том же пути — Completed. Возвращает 0 только при обеих проверках.
+fn portable_selftest_cancel(args: &[String]) -> i32 {
+    let mut s = match load_portable_settings() {
+        Ok(s) => s,
+        Err(e) => {
+            println!("SETTINGS ERROR: {e}");
+            return 2;
+        }
+    };
+    apply_overrides(&mut s, args);
+    let base = std::fs::read_to_string(resources::resolve_user_path(&s.text_file))
+        .unwrap_or_else(|_| FALLBACK_TEXT.to_string());
+    let text = format!("{base} {base} {base}");
+    let stamp = format!("{}-{}", std::process::id(), nanos());
+    let out_root = resources::resolve_user_path(&s.out_dir);
+    if let Err(e) = std::fs::create_dir_all(&out_root) {
+        println!("OUTPUT DIR ERROR: {}: {e}", out_root.display());
+        return 2;
+    }
+    let out_path = out_root.join(format!(
+        "cancel-selftest-{stamp}.{}",
+        s.format.extension_str()
+    ));
+    let cfg = JobConfig {
+        settings: s.clone(),
+        text,
+        out_path: out_path.clone(),
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    let c2 = Arc::clone(&cancel);
+    let first = execute_job(&cfg, &cancel, &|ev| {
+        if let JobEvent::Progress { done, .. } = &ev {
+            if *done >= 1 {
+                c2.store(true, Ordering::SeqCst);
+            }
+        }
+    });
+    println!("STATUS: {}", first.status.label());
+    println!("SUMMARY: {}", first.summary);
+    if let Some(p) = &first.partial_path {
+        println!("PARTIAL: {}", p.display());
+    }
+    let cancel_ok = first.status == JobStatus::Cancelled
+        && first.final_path.is_none()
+        && first.partial_path.as_ref().is_some_and(|p| p.is_file());
+
+    let second = execute_job(
+        &JobConfig {
+            settings: cfg.settings.clone(),
+            text: cfg.text.clone(),
+            out_path,
+        },
+        &Arc::new(AtomicBool::new(false)),
+        &|_| {},
+    );
+    println!("RERUN STATUS: {}", second.status.label());
+    println!("RERUN SUMMARY: {}", second.summary);
+    if let Some(p) = &second.final_path {
+        println!("RERUN OUTPUT: {}", p.display());
+    }
+    let rerun_ok = second.status == JobStatus::Completed && second.final_path.is_some();
+
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    if cancel_ok && rerun_ok {
+        println!("CANCEL SELFTEST OK");
+        0
+    } else {
+        println!("CANCEL SELFTEST FAILED (cancel_ok={cancel_ok}, rerun_ok={rerun_ok})");
         1
     }
 }

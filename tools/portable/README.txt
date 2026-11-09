@@ -42,3 +42,7 @@ Diagnostics:
       Run a short synthesis from the portable directory and exit.
   shtorm-gui.exe --portable-selftest-batch [--device cpu|cuda]
       Run a two-file batch into a new output subdirectory and exit.
+  shtorm-gui.exe --portable-selftest-cancel [--device cpu|cuda]
+      Run a multi-chunk job, cancel after the first finished chunk, verify
+      that the final file is not published and the draft remains, then re-run
+      on the same path and verify completion.
