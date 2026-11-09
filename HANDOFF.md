@@ -1,9 +1,14 @@
 # HANDOFF.md — оперативный снимок проекта (читать первым вместе с AGENTS.md)
 
-- **Дата обновления**: 2026-11-09.
-- **HEAD**: `38507a8` (G1). Рабочее дерево: **чистое** (0 изменений).
-- **Бэкап HEAD на NAS**: `\\DISKSTATION\Ableton 2\Temp2\ShtormTTS-Windows-backup-38507a8.zip`
-  (113 файлов, CRC OK, верифицирован сравнением).
+- **Дата обновления**: 2026-11-09 (вторая сессия: фиксы A5.2/G1 + G2).
+- **HEAD**: `f114987` (G2). Рабочее дерево: **чистое**.
+- **Бэкап**: NAS `\\DISKSTATION\Ableton 2\Temp2` был НЕДОСТУПЕН в этой сессии
+  (отказ SMB). Код HEAD'а на момент старта сессии (973ef24 == 38507a8 кодово)
+  покрыт бэкапом NAS прошлой сессии (`ShtormTTS-Windows-backup-38507a8.zip`).
+  Локальный верифицированный zip сессии:
+  `C:\PocketTTS-GUI-Rust\ShtormTTS-Windows-backup-973ef24-local.zip`
+  (MD5 OK, 138 файлов). **При следующей сессии: проверить доступность NAS и
+  доложить бэкапы 973ef24/c6fdc1b/f114987.**
 
 ## Цель проекта
 
@@ -14,44 +19,105 @@ Python `pocket-tts_gui.py`. Постоянные правила и архите�
 
 ## Завершённые этапы (кратко; история — git log, детали — docs/)
 
-- **A1** чанкование (golden 96, ветка comma-semantics Python).
-- **A2** char_rules (golden 314; хвостовая запятая сохраняется).
-- **A3** паузы teratts + склейка (golden 20; исправление: конец абзаца
-  приоритетнее soft_break — задокументированное расхождение с Python-багом).
-- **A4** пул воркеров (N × свой Pocket, скользящее окно backpressure,
-  seed=base+индекс; детерминизм CPU/CUDA 1w≡2w побитово).
-- **A5/A5.1/A5.2** потоковый вывод: StreamingWav + FfmpegSink (writer-поток,
-  wait_with_timeout, kill-before-join), уникальные `.partial`,
-  publish_no_replace (MoveFileW), RunStatus/StreamError/DiagMeta,
-  диагностические журналы, Ctrl+C exit=2.
-- **G1** каркас GUI (`crates/gui`, eframe 0.31): форма+валидация+настройки
-  (round-trip unknown keys, атомарная запись, импорт Python read-only),
-  кириллица (Segoe UI), anti_repeat реально в Pocket. Синтез из GUI — G2.
+- **A1** чанкование (golden 96), **A2** char_rules (golden 314), **A3** паузы
+  (golden 20; конец абзаца > soft_break — задокументированное расхождение).
+- **A4** пул воркеров (N × свой Pocket, backpressure-окно, seed=base+индекс,
+  детерминизм CPU/CUDA 1w≡2w побитово).
+- **A5/A5.1/A5.2** потоковый вывод: StreamingWav + FfmpegSink, уникальные
+  `.partial`, publish_no_replace, RunStatus/StreamError/DiagMeta, Ctrl+C.
+- **G1** каркас GUI (форма/валидация/настройки round-trip/импорт Python RO).
+- **Фиксы A5.2/G1** (c6fdc1b, эта сессия):
+  1) `synthesize_stream` возвращает ошибку `run_job` как ТИПИЗИРОВАННЫЙ
+     `StreamError` (реальный прогресс done_ref/total, base_seed, путь
+     partial) — `synthesize_stream_impl` с инъекцией фабрики; сквозной
+     мок-тест (WavSink, сбой на 3-м чанке: chunks_done=2, черновик есть,
+     итога нет) + реальный smoke CLI с битым путём модели.
+  2) `FfmpegSink.bytes_fed` — ОДИН общий Arc между писателем и структурой
+     (раньше поле читало всегда 0) + аксессор + тест 19200 байт после abort.
+  3) `save_settings`: tmp создаётся эксклюзивно `create_new` (без TOCTOU);
+     `write_exclusive` + тест отказа при занятом имени.
+  4) Свёртки GUI управляются полем настроек: `.open(Some(field))` +
+     `header_clicked` (клик переворачивает поле) — все 5 секций (поля
+     `*_open` + новые model_open/pauses_open) реально сохраняются;
+     headless-тест с симуляцией клика PointerButton + round-trip тест.
+- **G2** (f114987, эта сессия) — реальный синтез из GUI, см. ниже.
+
+## G2 — что сделано (f114987)
+
+- `crates/gui/src/job.rs`: `execute_job` в фоновом потоке вызывает
+  `app_core::pipeline::synthesize_stream` **напрямую** (CLI не запускается).
+  - Модель: fast/slow от `onnx_base` (новое поле, дефолт
+    `C:\Users\alexa\Downloads\pocket_tts_android\build\onnx`), custom —
+    `model_dir`; общий резолвер для валидации и запуска.
+  - ORT: `resolve_ort_dylib` (явный путь из настроек ort_cpu_dll/ort_gpu_dll
+    → авто: CPU `deps/ort-cpu/…`, CUDA `deps/portable` (полный комплект
+    providers+CUDA+cuDNN, 15 DLL) → `deps/ort-gpu-wheel`+torch-venv);
+    PATH prepend и `ORT_DYLIB_PATH` — ТОЛЬКО в процессе GUI (система не
+    трогается); `ort::init` один раз на процесс (`OnceLock`), смена
+    CPU/CUDA внутри процесса — честная ошибка «перезапустите приложение».
+  - Конвертация `GuiSettings → PipelineOptions` без потери параметров
+    (тест на каждое поле); threads (новое поле, дефолт 4 = CLI), seed -1 →
+    случайный, char_rules из `{model_dir}/runtime.json` (как CLI
+    --char-rules; в текущих моделях файла нет → правила не применяются).
+  - WAV/MP3/Opus через `make_sink` (ffmpeg из настроек → resolve_ffmpeg).
+  - События `JobEvent {Progress, Log, Finished}` в mpsc-канал +
+    `ctx.request_repaint`; итог `JobResult` — статус, сводка (RTF, паузы,
+    денойз), пути итог/черновик/диагностический журнал/лог чанков.
+- `app.rs`: «Запустить синтез» → поток (текст читается в потоке, UI не
+  блокируется); «Стоп» → `Arc<AtomicBool>`; полоса прогресса X/N; запрет
+  второго задания (кнопка + guard); закрытие окна при живом задании —
+  `ViewportCommand::CancelClose` + отмена + автозакрытие по завершении
+  потока; `JobHandle::drop` = cancel + join (сиротских ffmpeg нет).
+- `write_chunk_log`/`log_path_for` перенесены в `app-core::pipeline`
+  (CLI и GUI пишут одинаковый журнал чанков).
+- GUI-логика в lib-крейте (`shtorm_gui`), main — только запуск eframe.
 
 ## Подтверждённые результаты
 
-- `cargo test` **91 passed / 0 failed**; `cargo clippy --all-targets` **0**;
-  сборка release OK (в т.ч. `shtorm-gui.exe` 7.2 МБ).
-- WAV-паритет: потоковый A5 == A4 побитово (при одинаковых `--threads`;
-  разное число intra-op потоков ORT меняет порядок редукций — это норма).
-- Детерминизм: CPU и CUDA, 1w vs 2w — побитово (3 и 47 чанков).
-- MP3 (`-V2`): ffprobe 24 kHz mono, 18.455 с, декод OK. Opus (`opus 64k`):
-  48 kHz mono, 18.4615 с, декод OK (обе задержки — кодек, ≤ кадра).
-- Память (доказательство streaming): 18.45 с vs 262.39 с текст, 1 воркер —
-  пик Private 1591→1095 МБ (не растёт), буфер пула ≤ 856 КиБ.
-- RTF (ru-v2-slow, 47 чанков): CPU 1w 0.728 / 2w 0.558; CUDA 1w 0.531 /
-  2w 0.465. Рекомендация: CPU 2w, CUDA 1w.
-- Сквозная отмена (WAV и MP3): exit=2, итогового файла нет, `.partial` и
-  диагностический журнал (прогресс+seed) сохранены, сиротских ffmpeg нет.
+- `cargo test` **98 passed / 0 failed** (4 ignored: 3 ONNX + real_matrix);
+  `cargo clippy --all-targets` **0**; release-сборка OK (shtorm-gui.exe
+  запускается, окно живо).
+- **Реальные проверки G2** (`cargo test -p shtorm-gui --release --lib
+  real_matrix -- --ignored --nocapture`, второй прогон с
+  `SHTORM_GUI_TEST_DEVICE=cuda`; CPU и CUDA — РАЗНЫЕ процессы, ORT в
+  процессе грузится один раз):
+  - CPU FP32 → WAV: 7.80 с аудио, RTF 0.882, Completed.
+  - CPU FP32 → MP3 (-V2): Completed, RTF 0.908.
+  - CUDA FP32 → WAV: Completed; **VRAM-дельта +1.4 ГиБ** (681→2136 МиB,
+    WDDM per-process недоступен — тотал-поллинг nvidia-smi).
+  - CUDA FP32 → Opus (64k): Completed.
+  - Отмена после ≥1 готового чанка: Cancelled, итог НЕ опубликован,
+    `.partial` и диагностический журнал существуют, прогресс в JobResult.
+  - Повторный запуск после отмены (тот же путь): Completed, итог создан.
+  - **GUI↔CLI побитовый WAV-паритет** при одинаковых настройках
+    (threads=4, workers=2, seed=42, temp=0.3, EOS=-4, brightness=8,
+    паузы 1.0/0.9, max_tokens=40): 374444 байта идентичны.
+- Реальный аварийный путь (CLI, битый путь модели): типизированный
+  StreamError «обработано 0/1, base_seed, черновик», диагностический
+  журнал создан, итогового файла нет.
 
 ## Состояние подсистем
 
-- **CPU FP32** — работает (ORT CPU dll). **CUDA FP32** — работает
-  (`use_tf32=0` принудительно; VRAM-дельта — обязательная проверка GPU,
-  WDDM не отдаёт per-process). Денойз DPDFNet: код готов; без файла модели —
-  явный статус Missing (реального прогона с моделью ещё не было).
-- **WAV/MP3/Opus streaming** — готов; ffmpeg резолв: явный путь → рядом с
-  exe → `../ffmpeg` → PATH; портативный: `C:\PocketTTS-GUI\ffmpeg\ffmpeg.exe`.
+- **CPU FP32** — работает. **CUDA FP32** — работает (deps/portable, TF32
+  выключен принудительно; VRAM-дельта — обязательная проверка GPU).
+  Денойз DPDFNet: код готов; без файла модели — явный статус Missing.
+- **WAV/MP3/Opus streaming** — готов (CLI и GUI).
+- **GUI G2** — готов для одиночного файла: полный цикл
+  запуск/прогресс/Стоп/статусы/журналы/закрытие.
+
+## Актуальные ограничения / нерешённое
+
+- ORT грузится в процесс GUI один раз: смена CPU↔CUDA внутри одной сессии
+  GUI требует перезапуска приложения (сообщение в UI).
+- Auto-EOS (`runtime.json`-резолвер), `frames_after_eos`, пакетный режим
+  (G3, walkdir), перезапуск воркеров каждые N файлов, CUDA I/O Binding,
+  портативная сборка — **не начаты** (не имитировать наличие).
+- Денойз не прогонялся с реальной моделью DPDFNet; decode_steps>1 не мерили.
+- WAV > ~4 ГиБ — явная ошибка (RF64/разбиение — будущая функция).
+- RTF GUI включает загрузку моделей (короткие тексты: RTF>1 — норма).
+- Ручной клик-тест окна (кнопки/прогресс глазами) не выполнялся —
+  автоматизированные проверки состояния/событий + запуск exe есть;
+  полноценный интерактивный проход остаётся на усмотрение пользователя.
 
 ## Структура и ключевые файлы
 
@@ -61,114 +127,53 @@ Cargo.toml            # workspace: shtorm-engine, text-processing,
 crates/shtorm-engine/src/pocket.rs     # движок (FP32-only, Device, seed)
 crates/text-processing/src/{chunking,char_rules,pauses}.rs
 crates/audio-processing/src/stream.rs  # StreamingWav, publish_no_replace
-crates/app-core/src/pipeline.rs        # synthesize_stream, RunStatus,
-                                       #   StreamError, DiagMeta, write_diag_log
+crates/app-core/src/pipeline.rs        # synthesize_stream, StreamError,
+                                       #   write_diag_log, write_chunk_log
 crates/app-core/src/pool.rs            # run_job (воркеры, окно, отмена)
-crates/app-core/src/worker.rs          # real_worker_factory (Pocket+DSP)
-crates/app-core/src/sink.rs            # FfmpegSink (writer-поток, abort/Drop)
-crates/gui/src/{app,settings,main}.rs  # G1-каркас
+crates/app-core/src/sink.rs            # WavSink/FfmpegSink, bytes_fed
+crates/gui/src/job.rs                  # G2: execute_job, ORT env, резолвы
+crates/gui/src/app.rs                  # форма + задание/прогресс/Стоп
+crates/gui/src/settings.rs             # GuiSettings (+onnx_base/dll/threads)
 tools/*.ps1, tools/gen_*_golden.py     # smoke и генераторы golden
 tests/golden/*.json                    # 96 + 314 + 20 кейсов
 docs/SAFETY_AUDIT.md, docs/GUI_PLAN.md, docs/NEXT_STEPS.md,
 docs/FEATURE_PARITY.md, docs/BENCHMARKS.md
 ```
 
-## Сборка / запуск / smoke (Windows, Git Bash)
+## Сборка / запуск / проверки (Windows, Git Bash)
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo build --release                       # всё
+cargo build --release                       # всё (вкл. shtorm-gui.exe)
 cargo test && cargo clippy --all-targets    # норма: 0 failed / 0 warning
-# smoke CPU:
-ORT_DYLIB_PATH="C:\PocketTTS-GUI-Rust\ShtormTTS-Windows\deps\ort-cpu\
-onnxruntime-win-x64-1.23.2\lib\onnxruntime.dll" ./target/release/smoke.exe \
-  --model-dir <onnx\ru-v2-slow> --voice <wav> --text "Стр+елки час+ов." \
-  --out out\smoke_cpu.wav --device cpu
-# smoke CUDA: то же + PATH с deps\ort-gpu-wheel\x\onnxruntime\capi и
-#   venv\...\torch\lib (cudart/cublas/cudnn), --device cuda
-# CLI синтеза: ./target/release/synthesize.exe --help  (форматы/воркеры/пресеты)
-# GUI: ./target/release/shtorm-gui.exe   (G1: форма без запуска синтеза)
+# реальные проверки GUI-задания (по одному устройству на процесс):
+cargo test -p shtorm-gui --release --lib real_matrix -- --ignored --nocapture
+SHTORM_GUI_TEST_DEVICE=cuda cargo test -p shtorm-gui --release --lib \
+  real_matrix -- --ignored --nocapture
+# GUI: ./target/release/shtorm-gui.exe
 ```
-Зависимости: Rust MSVC (rustup, компоненты rustfmt+clippy), ORT dylib в
-`deps/ort-cpu|ort-gpu-wheel` (1.23.2; ort-крейт пин rc.11), CUDA/cuDNN DLL
-— из torch-venv (портативный комплект `deps/portable`, 15 DLL, проверен),
-ffmpeg — `C:\PocketTTS-GUI\ffmpeg`. Модели — см. AGENTS.md.
+Настройки real_matrix-теста: ru-v2-slow, voice
+`C:\PocketTTS-GUI\examples\Microsoft Brian Speed 1.wav`, ffmpeg
+`C:\PocketTTS-GUI\ffmpeg\ffmpeg.exe`, seed 42, threads 4 (CPU 2w / CUDA 1w).
 
-## Актуальные ограничения / нерешённое
+## NEXT TASK — G3: пакетный режим (НЕ НАЧИНАТЬ без явного задания)
 
-- Auto-EOS (`runtime.json`-резолвер), `frames_after_eos`, пакетный режим
-  (walkdir), перезапуск воркеров каждые N файлов, CUDA I/O Binding,
-  портативная сборка — **не начаты** (не имитировать наличие).
-- Денойз не прогонялся с реальной моделью DPDFNet; decode_steps>1 не мерили.
-- WAV > ~4 ГиБ — явная ошибка (RF64/разбиение — будущая функция).
-- GUI: диалоги rfd модальны (UI ждёт выбора — приемлемо, но не «повесить»
-  долгую работу в UI-потоке).
-
-## NEXT TASK — фиксы перед G2 + подключение синтеза к GUI
-
-**Сначала исправить (дефекты подтверждены чтением кода 2026-11-09):**
-
-1. `crates/app-core/src/sink.rs` — **два разных `Arc<AtomicU64>` для
-   `bytes_fed`**: локальный `fed` (строка ~291, инкрементируется писателем) и
-   поле структуры `bytes_fed` (~348, отдельный экземпляр, всегда 0; он же
-   читается в сообщениях об ошибках). Объединить: один Arc, клон в писателя,
-   поле структуры — тот же счётчик. Добавить тест на ненулевой bytes_fed
-   после feeding (или доступность в сообщении об ошибке).
-2. `crates/gui/src/settings.rs::save_settings` — tmp создаётся как
-   `ensure!(!tmp.exists())` + `fs::write` (гонка). Заменить на
-   **эксклюзивное создание** `OpenOptions::new().write(true).create_new(true)`
-   (как write_wav16), сохраняя атомарный MoveFileExW после успеха.
-3. `crates/gui/src/app.rs` — состояния сворачиваемых секций
-   (`source_open/gen_open/out_open`) читаются для `default_open`, но
-   **никогда не записываются** при переключении пользователем → в конфиг
-   сохраняются стартовые значения. Сохранять фактические состояния
-   (колбэк `CollapsingHeader::show` → обновлять поля перед save).
-4. `pipeline.rs::synthesize_stream` — **проверить на реальном аварийном
-   пути** (не мок), что ошибка `run_job()` действительно оборачивается в
-   `StreamError` с корректным `chunks_done` (сейчас `done_ref` считается в
-   progress-callback; убедиться, что sink-ошибки/воркер-провал дают
-   реальный прогресс, а не 0; при необходимости скорректировать источник
-   значения). Юнит-тест с моком уже есть; нужна проверка кодом чтения +
-   при возможности smoke с заведомо битым путем модели.
-
-**Затем G2 (реальный синтез из GUI):**
-
-5. Кнопка «Запустить» (валидность уже проверяется) → в фоне (не UI-поток):
-   инициализация ORT (`ort::init()` в процессе GUI; `ORT_DYLIB_PATH` —
-   задать до init из настроек/поиска как в `resolve_ffmpeg`), выбор модели
-   fast/slow/свой каталог, `PipelineOptions` **паритет CLI** (все поля,
-   включая `anti_repeat`, `eos_threshold=-4.0` тератт-режим как в CLI),
-   `make_sink` (WAV/MP3/Opus; ffmpeg через `resolve_ffmpeg`), вызов
-   `app_core::pipeline::synthesize_stream` напрямую (не subprocess!).
-6. Прогресс `done/total` → полоса (канал в UI-поток + `ctx.request_repaint`).
-7. «Стоп» → общий `Arc<AtomicBool>` → статус Cancelled, путь `.partial`
-   и диагностического журнала — в UI.
-8. Статусы Completed/Cancelled/Failed и итоговая строка (RTF, паузы,
-   денойз) — в журнал UI.
-9. GUI **не должен** запускать внешний `synthesize.exe` — только app-core.
-
-**Не начинать**: Auto-EOS/frames_after_eos, пакетную обработку,
-CUDA I/O Binding, портативную сборку, длительные бенчмарки.
-
-## Файлы для чтения перед NEXT TASK (по порядку)
-
-1. `AGENTS.md` (правила/безопасность), этот файл.
-2. `crates/app-core/src/pipeline.rs` — `synthesize_stream`, `StreamError`.
-3. `crates/app-core/src/sink.rs` — `FfmpegSink` (writer/abort/finalize,
-   `bytes_fed` — дефект №1).
-4. `crates/app-core/src/pool.rs` — `run_job` (отмена/ошибки/окно).
-5. `crates/gui/src/settings.rs` (дефект №2), `crates/gui/src/app.rs`
-   (дефект №3, точки подключения G2).
-6. `crates/app-core/src/bin/synthesize.rs` — эталон сборки PipelineOptions
-   и обработки статусов для G2.
-7. `docs/GUI_PLAN.md`, `docs/NEXT_STEPS.md`, `docs/SAFETY_AUDIT.md`.
+1. Batch-обход каталога (walkdir; `.txt/.md/.log` как в Python GUI
+   `_process_directory_recursively`), сохранение относительной структуры в
+   папку результата, общий прогресс по файлам + построчный по чанкам,
+   ошибка одного файла не валит задание (файл → Failed, общий отчёт K из N).
+2. «Перезапуск воркеров каждые N файлов» — пересоздание пула Pocket
+   (сейчас пул живёт в рамках одного задания synthesize_stream; понадобится
+   внешний цикл заданий в job.rs + счётчик файлов).
+3. Решить: авто-EOS/runtime.json-резолвер (в моделях ru-v2 файла
+   runtime.json НЕТ — резолверу нечего читать; согласовать с пользователем,
+   нужно ли «Авто» вообще) — до решения не имитировать.
+4. Кандидаты на полировку: интерактивный клик-проход GUI, тема/копирование
+   лога (G5), RTF без времени загрузки моделей.
 
 ## Критерии готовности следующего этапа
 
-- Дефекты 1–4 исправлены, покрыты тестами (bytes_fed ≠ 0; tmp create_new —
-  отказ при занятом имени; состояния секций переживают save/load;
-  StreamError на аварийном пути подтверждён).
-- G2: синтез из GUI на CPU и CUDA (короткий текст) — файл создаётся,
-  прогресс/Стоп работают, отмена не публикует файл, `.partial`/diag-журнал
-  показываются; `cargo test` зелёные, clippy 0; CLI-паритет параметров.
-- HANDOFF.md обновлён после этапа.
+- G3: пакетный прогон на каталоге из ≥3 файлов (с ошибочным файлом внутри):
+  K из N в отчёте, относительные пути сохранены, отмена останавливает
+  обход, детерминизм и паритет CLI не сломаны; `cargo test` зелёные,
+  clippy 0; HANDOFF.md обновлён.
