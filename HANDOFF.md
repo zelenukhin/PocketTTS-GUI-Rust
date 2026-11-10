@@ -362,9 +362,18 @@ WAV/MP3/Opus без накопления аудио в памяти, одино�
   hybrid cancel/overwrite/MP3/Opus, single overwrite WAV, batch CPU —
   зелёные.
 - **Portable**: новый комплект
-  `ShtormTTS-Portable-2026-11-11-g623-autosave-no-console` (собран из
-  коммита G6.2.3, структура без изменений; проверки — `docs/PORTABLE_BUILD.md`
-  раздел G6.2.3). `g62-final`/`g622-final` не изменялись.
+  `C:\PocketTTS-GUI-Rust\dist\ShtormTTS-Portable-2026-11-11-g623-autosave-no-console`
+  — git `9a74f6c` dirty=false, 54 файла, 3404.1 MiB, exe SHA256
+  `0BF311BC7FC6155A6E9E0353A403D1B4DCB0888F87C10FE3C7DCBA7CB19EC08F`
+  (структура без изменений; `tools/portable/README.txt` дополнен).
+  Проверки из комплекта с CWD `C:\` (`out/g623_portable_acceptance.ps1`):
+  portable-check OK (всё exe-relative); автосохранение в комплекте + повторное
+  открытие (тема Off), no-change закрытие байт-в-байт; реальные CUDA WAV и
+  MP3 (комплектный ffmpeg) без console-окон; реальный 2×2 — «4 воркера,
+  Pocket загружен 4, процессов CUDA: 2», 4/4 WAV; закрытие при активном 2×2
+  → отмена, автосохранение, exit 0, сирот 0, console-окон 0 — **ALL PASS**.
+  Подробности — `docs/PORTABLE_BUILD.md` раздел G6.2.3.
+  `g62-final`/`g622-final` не изменялись.
 
 ## G6.1.1 — что сделано (предыдущий этап)
 
