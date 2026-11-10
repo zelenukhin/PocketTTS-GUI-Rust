@@ -107,7 +107,12 @@ impl ShtormApp {
                 format!("настройки не загружены ({e:#}); значения по умолчанию"),
             ),
         };
-        let theme_applied = settings.theme_dark;
+        // G5.2 (визуальный контроль): ни один кадр ещё не нарисован — если
+        // пометить тему «применённой» здесь, update() никогда не вызовет
+        // set_visuals и приложение стартует со светлым дефолтом eframe даже
+        // при theme_dark=true. Помечаем НЕ применённой: первый кадр
+        // установит visuals до отрисовки (без вспышки светлой темы).
+        let theme_applied = !settings.theme_dark;
         Self {
             settings,
             log: String::new(),
@@ -988,6 +993,19 @@ impl eframe::App for ShtormApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// G5.2 (баг визуального контроля): при старте тема обязана примениться
+    /// на первом кадре — theme_applied начинается «не применённой»,
+    /// иначе update() не вызовет set_visuals и окно откроется светлым
+    /// даже при theme_dark=true.
+    #[test]
+    fn first_frame_must_apply_theme() {
+        let app = ShtormApp::new();
+        assert_ne!(
+            app.theme_applied, app.settings.theme_dark,
+            "первый кадр обязан применить тему из настроек"
+        );
+    }
 
     /// Управляемая свёртка: поле настроек — единственный источник истины.
     /// 1) открытое поле → тело показано; закрытое поле → тело скрыто.
