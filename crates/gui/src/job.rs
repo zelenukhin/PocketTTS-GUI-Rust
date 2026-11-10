@@ -11,16 +11,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use app_core::persistent::{loaned_real_worker_factory, spawn_workers, WorkerSlot};
 use app_core::pipeline::{
-    log_path_for, synthesize_stream, write_chunk_log, write_diag_log, ChunkLogMeta, DiagMeta,
-    PipelineOptions, RunPhase, RunStatus, StreamError,
+    log_path_for, synthesize_stream, synthesize_stream_with_worker_factory, write_chunk_log,
+    write_diag_log, ChunkLogMeta, DiagMeta, PipelineOptions, RunPhase, RunStatus, StreamError,
 };
 use app_core::sink::{make_sink_with_overwrite, OutputFormat};
+use app_core::worker::{real_worker_factory, RealWorker};
 use shtorm_engine::Device;
 use text_processing::CharRules;
 
 use crate::batch::{
-    plan_batch, run_batch, BatchEvent, BatchReport, BatchStatus, FileReport, FileStatus,
+    count_actionable, plan_batch, preflight_batch, run_batch, run_prepared_parallel, BatchEvent,
+    BatchFile, BatchPlan, BatchReport, BatchStatus, FileReport, FileStatus, PreparedBatch,
+    PreparedFile,
 };
 use crate::resources;
 use crate::settings::{DeviceChoice, GuiSettings, ModelChoice, OutputFormatChoice};
@@ -57,6 +61,9 @@ impl From<RunPhase> for JobPhase {
 }
 
 /// События задания для UI-потока (канал + `ctx.request_repaint`).
+/// В пакетном режиме события разных файлов приходят ВПЕРЕМЕШКУ (G6.1:
+/// постоянный пул обрабатывает файлы параллельно) — приёмник различает их
+/// по `index` (K файла), а не по порядку прибытия.
 #[derive(Debug, Clone)]
 pub enum JobEvent {
     Progress {
@@ -65,12 +72,32 @@ pub enum JobEvent {
     },
     /// G5.1: смена фазы (генерация/финализация/публикация).
     Phase(JobPhase),
-    /// Пакетный режим: прогресс чанков текущего файла + номер файла K/N.
+    /// G6.1: пакет начат: всего файлов и сколько обрабатывается одновременно
+    /// (постоянных воркеров пула; 1 — последовательный путь).
+    BatchStarted {
+        total: usize,
+        workers: usize,
+    },
+    /// G6.1: файл K/N стартовал (в параллельном пакете — из потока воркера).
+    FileStarted {
+        index: usize,
+        total: usize,
+        input: PathBuf,
+        output: PathBuf,
+    },
+    /// Пакетный режим: прогресс чанков файла K/N.
     FileProgress {
         index: usize,
         total: usize,
         done: usize,
         chunks_total: usize,
+    },
+    /// G6.1: фаза конкретного файла пакета. После Finalizing отмена уже не
+    /// может предотвратить публикацию ЭТОГО файла — «Стоп» учитывает фазы
+    /// всех активных файлов.
+    FilePhase {
+        index: usize,
+        phase: JobPhase,
     },
     /// Пакетный режим: итог одного файла (для журнала/статуса).
     FileDone {
@@ -596,15 +623,23 @@ pub fn execute_job(cfg: &JobConfig, cancel: &AtomicBool, emit: &dyn Fn(JobEvent)
     attach_warning(res, &char_warning)
 }
 
-/// G3: пакетный прогон. Снимок файлов строится ДО первого синтеза; каждый
-/// файл идёт через `execute_job` (пул воркеров создаётся/освобождается на
-/// файл — существующий жизненный цикл). Ошибки изолированы, отмена
-/// останавливает текущий файл и не запускает следующий.
+/// G3/G6.1: пакетный прогон. Снимок файлов строится ДО первого синтеза
+/// (`plan_batch`), предзапусковые проверки — ДО запуска воркеров
+/// (`preflight_batch`). Два пути выполнения:
+/// - **Постоянный пул (G6.1)**: пакетный CUDA с ≥2 файлами-кандидатами —
+///   N воркеров, каждый со своим Pocket, загруженным ОДИН раз на весь пакет;
+///   один файл целиком обрабатывает один воркер; общая динамическая очередь.
+///   Диагностический откат на прежний пофайловый путь — `SHTORM_GUI_BATCH_POOL=0`.
+/// - **Последовательный путь (прежний G3)**: модель создаётся на каждый файл
+///   (CPU-пакеты, пакеты из одного файла, откат выше).
+///
+/// Ошибки изолированы; отмена останавливает выдачу новых файлов, активные
+/// дорабатывают по семантике G5.1.
 pub fn execute_batch(
     settings: &GuiSettings,
     source: &Path,
     cancel: &Arc<AtomicBool>,
-    emit: &dyn Fn(JobEvent),
+    emit: &Arc<dyn Fn(JobEvent) + Send + Sync>,
 ) -> JobResult {
     let t0 = Instant::now();
     // относительная папка результата — от каталога exe (портативный режим)
@@ -626,6 +661,8 @@ pub fn execute_batch(
             files: Vec::new(),
             conflicts: plan.conflicts.clone(),
             cancelled,
+            pool_loads: None,
+            pool_workers: None,
         };
         return JobResult {
             status: if cancelled {
@@ -650,12 +687,265 @@ pub fn execute_batch(
 
     let ext = settings.format.extension_str().to_string();
     let overwrite = settings.overwrite_existing;
-    let report = run_batch(
-        &plan,
-        &ext,
+    let pool = settings.device == DeviceChoice::Cuda
+        && std::env::var("SHTORM_GUI_BATCH_POOL").as_deref() != Ok("0")
+        && count_actionable(&plan, &ext, overwrite) >= 2;
+    let report = if pool {
+        match execute_batch_persistent_pool(settings, &plan, &ext, overwrite, cancel, emit) {
+            Ok(r) => r,
+            Err(e) => return JobResult::failed(format!("пакетный режим: {e:#}")),
+        }
+    } else {
+        execute_batch_sequential(settings, &plan, &ext, overwrite, cancel, emit)
+    };
+
+    let status = match report.status() {
+        BatchStatus::Completed => JobStatus::Completed,
+        BatchStatus::Partial => JobStatus::Partial,
+        BatchStatus::Cancelled => JobStatus::Cancelled,
+        BatchStatus::Failed => JobStatus::Failed,
+        BatchStatus::NoWork => JobStatus::NoWork,
+    };
+    let mut summary = report.summary();
+    summary.push_str(&format!("; {:.1} с", t0.elapsed().as_secs_f32()));
+    JobResult {
+        status,
+        summary,
+        final_path: None,
+        partial_path: None,
+        diag_path: None,
+        chunk_log_path: None,
+        rtf: None,
+        progress: (report.total(), report.total()),
+        replaced_existing: false,
+        batch: Some(report),
+    }
+}
+
+/// Перевод BatchEvent → JobEvent для последовательного пути пакета.
+/// `cur_file` — K текущего файла (обновляется на FileStarted ДО synth):
+/// фазы execute_job превращаются в FilePhase с индексом файла.
+#[allow(clippy::too_many_arguments)]
+fn execute_batch_sequential(
+    settings: &GuiSettings,
+    plan: &BatchPlan,
+    ext: &str,
+    overwrite: bool,
+    cancel: &Arc<AtomicBool>,
+    emit: &Arc<dyn Fn(JobEvent) + Send + Sync>,
+) -> BatchReport {
+    emit(JobEvent::BatchStarted {
+        total: plan.files.len(),
+        workers: 1,
+    });
+    let cur_file = std::sync::atomic::AtomicUsize::new(0);
+    let emit_batch = |ev: BatchEvent| match ev {
+        BatchEvent::Planned { total, warnings } => {
+            emit(JobEvent::Log(format!(
+                "пакет: план зафиксирован — {total} файлов, предупреждений: {}",
+                warnings.len()
+            )));
+        }
+        BatchEvent::FileStarted {
+            index,
+            total,
+            input,
+            output,
+        } => {
+            cur_file.store(index, Ordering::SeqCst);
+            let msg = format!(
+                "[{index}/{total}] старт: {} → {}",
+                input.display(),
+                output.display()
+            );
+            emit(JobEvent::FileStarted {
+                index,
+                total,
+                input,
+                output,
+            });
+            emit(JobEvent::Log(msg));
+        }
+        BatchEvent::FileProgress {
+            index,
+            total,
+            done,
+            chunks_total,
+        } => {
+            emit(JobEvent::FileProgress {
+                index,
+                total,
+                done,
+                chunks_total,
+            });
+        }
+        BatchEvent::FileFinished {
+            index,
+            total,
+            report,
+        } => {
+            emit(JobEvent::Log(format!(
+                "[{index}/{total}] {}",
+                report.line()
+            )));
+            emit(JobEvent::FileDone {
+                index,
+                total,
+                report,
+            });
+        }
+        BatchEvent::Log(line) => emit(JobEvent::Log(line)),
+    };
+    run_batch(
+        plan,
+        ext,
         overwrite,
         cancel,
-        &|ev| match ev {
+        &emit_batch,
+        |file, out_path, cancel, progress| {
+            let text = match std::fs::read_to_string(&file.input) {
+                Ok(t) => t,
+                Err(e) => {
+                    return FileReport::failed(
+                        file,
+                        Some(out_path.to_path_buf()),
+                        format!("прочитать {}: {e}", file.input.display()),
+                    )
+                }
+            };
+            let cfg = JobConfig {
+                settings: settings.clone(),
+                text,
+                out_path: out_path.to_path_buf(),
+            };
+            // execute_job принимает Fn, а progress — FnMut: внутренняя
+            // изменяемость через RefCell (без потери промежуточных событий).
+            let progress_cell = std::cell::RefCell::new(progress);
+            let res = execute_job(&cfg, cancel, &|ev| match ev {
+                JobEvent::Progress { done, total } => {
+                    if let Ok(mut p) = progress_cell.try_borrow_mut() {
+                        (*p)(done, total);
+                    }
+                }
+                JobEvent::Phase(ph) => {
+                    emit(JobEvent::FilePhase {
+                        index: cur_file.load(Ordering::SeqCst),
+                        phase: ph,
+                    });
+                }
+                JobEvent::Log(line) => {
+                    emit(JobEvent::Log(format!("[{}] {line}", file.input.display())));
+                }
+                _ => {}
+            });
+            file_report_from_job_result(&file.input, &file.relative, out_path, res)
+        },
+    )
+}
+
+/// Рекомендованное авто-число постоянных воркеров пакетного CUDA
+/// (P2B.2/P2B.3: 2 воркера — лучший баланс скорости и VRAM, 4.9 ГБ).
+const BATCH_POOL_AUTO_WORKERS: usize = 2;
+/// Ориентировочная VRAM одного CUDA-воркера (Pocket + арены ORT), МБ —
+/// по замерам P2B.3 (2 воркера ≈ 4.9 ГБ, база ~0.2 ГБ).
+const BATCH_POOL_VRAM_PER_WORKER_MB: f64 = 2355.0;
+/// Запас поверх N воркеров (фон/фрагментация). Префлайт — НЕ абсолютная
+/// защита от OOM, а способ заранее выбрать экономную конфигурацию.
+const BATCH_POOL_VRAM_RESERVE_MB: f64 = 900.0;
+
+/// G6.1: решение о числе постоянных воркеров пакетного CUDA.
+/// Авто — 2 (при нехватке VRAM по префлайту деградирует до 1 с записью в
+/// журнал); ручной выбор не игнорируется молча: при нехватке VRAM — явное
+/// предупреждение, при >2 — предупреждение по итогам P2B.2/P2B.3.
+/// Число также ограничивается числом файлов-кандидатов (лишние Pocket
+/// не загружаются). `free_vram_mb` — префлайт nvidia-smi (None — недоступен;
+/// префлайт не абсолютная защита от OOM, только ранняя экономия).
+fn decide_batch_pool_workers(
+    s: &GuiSettings,
+    actionable: usize,
+    free_vram_mb: Option<f64>,
+    log: &dyn Fn(String),
+) -> usize {
+    let requested = s
+        .workers
+        .map(|w| w.max(1) as usize)
+        .unwrap_or(BATCH_POOL_AUTO_WORKERS);
+    let w = requested.min(actionable.max(1));
+    if w <= 1 {
+        return 1;
+    }
+    if let Some(free) = free_vram_mb {
+        let need = w as f64 * BATCH_POOL_VRAM_PER_WORKER_MB + BATCH_POOL_VRAM_RESERVE_MB;
+        if free < need {
+            if s.workers.is_none() {
+                log(format!(
+                    "VRAM-префлайт: свободно {free:.0} МБ < {need:.0} МБ — авто: 1 воркер \
+                     (один постоянный Pocket)"
+                ));
+                return 1;
+            }
+            log(format!(
+                "ВНИМАНИЕ: VRAM-префлайт: свободно {free:.0} МБ < {need:.0} МБ — ручная \
+                 конфигурация {w} воркеров может не загрузиться (ошибка загрузки завершит \
+                 пакет с диагнозом)"
+            ));
+        }
+    }
+    if w > BATCH_POOL_AUTO_WORKERS {
+        log(format!(
+            "ВНИМАНИЕ: {w} воркеров CUDA: по замерам P2B.2/P2B.3 больше 2 не ускоряет \
+             пакет и расходует ~2.1 ГБ VRAM на воркер"
+        ));
+    }
+    w
+}
+
+/// G5.1-подготовка пути результата одного файла пакета (в последовательном
+/// пути её делает execute_job; в пуле — ДО запуска воркеров, чтобы конфликт
+/// путей не всплывал посреди параллельного прогона): проверка безопасности
+/// ДО создания каталогов, создание без следования по reparse-точкам,
+/// повторная валидация ПОСЛЕ создания.
+fn batch_file_prepare_paths(s: &GuiSettings, out_path: &Path, model_dir: &Path) -> Result<()> {
+    ensure_output_path_safe(s, out_path, model_dir)?;
+    if let Some(parent) = out_path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            create_dir_all_no_reparse(parent)?;
+        }
+    }
+    ensure_output_path_safe(s, out_path, model_dir)
+}
+
+/// G6.1: пакет на ПОСТОЯННОМ пуле CUDA-воркеров. Pocket загружается ровно
+/// один раз на воркера (на весь пакет); каждый файл целиком обрабатывает
+/// один воркер; файлы распределяет общая динамическая очередь.
+fn execute_batch_persistent_pool(
+    settings: &GuiSettings,
+    plan: &BatchPlan,
+    extension: &str,
+    overwrite: bool,
+    cancel: &Arc<AtomicBool>,
+    emit: &Arc<dyn Fn(JobEvent) + Send + Sync>,
+) -> Result<BatchReport> {
+    let total = plan.files.len();
+
+    // --- подготовка движка: один раз на весь пакет ---
+    let model_dir = resolve_model_dir(settings)?;
+    emit(JobEvent::Log(format!("модель: {}", model_dir.display())));
+    let mut char_rules = None;
+    match load_char_rules(&model_dir) {
+        CharRulesLoad::Absent => {}
+        CharRulesLoad::Loaded(rules) => char_rules = Some(rules),
+        CharRulesLoad::Warning(w) => {
+            // невалидный/неполный runtime.json не игнорируем молча
+            emit(JobEvent::Log(format!("ВНИМАНИЕ: {w}")));
+        }
+    }
+    setup_ort_environment(settings)?;
+
+    // --- предзапусковые проверки ДО запуска воркеров ---
+    let emit_batch: Arc<dyn Fn(BatchEvent) + Send + Sync> = {
+        let emit = Arc::clone(emit);
+        Arc::new(move |ev: BatchEvent| match ev {
             BatchEvent::Planned { total, warnings } => {
                 emit(JobEvent::Log(format!(
                     "пакет: план зафиксирован — {total} файлов, предупреждений: {}",
@@ -668,11 +958,18 @@ pub fn execute_batch(
                 input,
                 output,
             } => {
-                emit(JobEvent::Log(format!(
+                let msg = format!(
                     "[{index}/{total}] старт: {} → {}",
                     input.display(),
                     output.display()
-                )));
+                );
+                emit(JobEvent::FileStarted {
+                    index,
+                    total,
+                    input,
+                    output,
+                });
+                emit(JobEvent::Log(msg));
             }
             BatchEvent::FileProgress {
                 index,
@@ -703,100 +1000,300 @@ pub fn execute_batch(
                 });
             }
             BatchEvent::Log(line) => emit(JobEvent::Log(line)),
-        },
-        |file, out_path, cancel, progress| {
-            let text = match std::fs::read_to_string(&file.input) {
-                Ok(t) => t,
-                Err(e) => {
-                    return FileReport::failed(
-                        file,
-                        Some(out_path.to_path_buf()),
-                        format!("прочитать {}: {e}", file.input.display()),
-                    )
-                }
-            };
-            let cfg = JobConfig {
-                settings: settings.clone(),
-                text,
-                out_path: out_path.to_path_buf(),
-            };
-            // execute_job принимает Fn, а progress — FnMut: внутренняя
-            // изменяемость через RefCell (без потери промежуточных событий).
-            let progress_cell = std::cell::RefCell::new(progress);
-            let res = execute_job(&cfg, cancel, &|ev| match ev {
-                JobEvent::Progress { done, total } => {
-                    if let Ok(mut p) = progress_cell.try_borrow_mut() {
-                        (*p)(done, total);
-                    }
-                }
-                JobEvent::Log(line) => {
-                    emit(JobEvent::Log(format!("[{}] {line}", file.input.display())));
-                }
-                _ => {}
-            });
-            let mut rep = FileReport::new(file, Some(out_path.to_path_buf()));
-            rep.chunks_done = res.progress.0;
-            rep.chunks_total = res.progress.1;
-            rep.final_path = res.final_path;
-            rep.partial_path = res.partial_path;
-            rep.diag_path = res.diag_path;
-            rep.chunk_log_path = res.chunk_log_path;
-            match res.status {
-                JobStatus::Completed => {
-                    rep.status = FileStatus::Completed;
-                    // G5.1: та же семантика, что в одиночном режиме, —
-                    // «обновлён» только для реально существовавшего файла,
-                    // новый файл не называется «обновлённым».
-                    rep.reason = Some(if res.replaced_existing {
-                        "файл обновлён (старый заменён)".into()
-                    } else {
-                        "создан новый файл".into()
-                    });
-                }
-                JobStatus::Cancelled => {
-                    rep.status = FileStatus::Cancelled;
-                    rep.reason = Some(res.summary);
-                }
-                JobStatus::Failed => {
-                    rep.status = FileStatus::Failed;
-                    rep.reason = Some(res.summary);
-                }
-                // для одного файла эти статусы не возникают; не маскируем
-                // неожиданное состояние под успех
-                JobStatus::Partial => {
-                    rep.status = FileStatus::Failed;
-                    rep.reason = Some(format!("частичный результат: {}", res.summary));
-                }
-                JobStatus::NoWork | JobStatus::Skipped => {
-                    rep.status = FileStatus::Skipped;
-                    rep.reason = Some(res.summary);
-                }
+        })
+    };
+    let prepared = preflight_batch(plan, extension, overwrite, cancel, &|ev| emit_batch(ev));
+    let mut reports = prepared.reports;
+
+    // подготовка путей результатов (reparse/каталоги) — тоже до воркеров
+    let mut to_synth = Vec::with_capacity(prepared.to_synth.len());
+    for pf in prepared.to_synth {
+        match batch_file_prepare_paths(settings, &pf.out, &model_dir) {
+            Ok(()) => to_synth.push(pf),
+            Err(e) => {
+                let file = &plan.files[pf.index];
+                let r = FileReport::failed(file, Some(pf.out.clone()), format!("{e:#}"));
+                emit_batch(BatchEvent::FileFinished {
+                    index: pf.index + 1,
+                    total,
+                    report: Box::new(r.clone()),
+                });
+                reports[pf.index] = r;
             }
-            rep
-        },
+        }
+    }
+    if to_synth.is_empty() {
+        return Ok(BatchReport {
+            files: reports,
+            conflicts: prepared.conflicts,
+            cancelled: cancel.load(Ordering::SeqCst),
+            pool_loads: None,
+            pool_workers: None,
+        });
+    }
+
+    // --- число воркеров: авто 2 / ручной выбор + VRAM-префлайт ---
+    let workers = decide_batch_pool_workers(
+        settings,
+        to_synth.len(),
+        app_core::diagnostics::gpu_free_mb(settings.device_id),
+        &|m| emit(JobEvent::Log(m)),
     );
 
-    let status = match report.status() {
-        BatchStatus::Completed => JobStatus::Completed,
-        BatchStatus::Partial => JobStatus::Partial,
-        BatchStatus::Cancelled => JobStatus::Cancelled,
-        BatchStatus::Failed => JobStatus::Failed,
-        BatchStatus::NoWork => JobStatus::NoWork,
-    };
-    let mut summary = report.summary();
-    summary.push_str(&format!("; {:.1} с", t0.elapsed().as_secs_f32()));
-    JobResult {
-        status,
-        summary,
-        final_path: None,
-        partial_path: None,
-        diag_path: None,
-        chunk_log_path: None,
-        rtf: None,
-        progress: (report.total(), report.total()),
-        replaced_existing: false,
-        batch: Some(report),
+    // --- загрузка пула: Pocket один раз на воркера, параллельно ---
+    let opts = pipeline_options(settings, model_dir, char_rules);
+    let spawn_seed = opts.seed.unwrap_or(42);
+    emit(JobEvent::Log(format!(
+        "постоянный пул: загрузка {workers} Pocket…"
+    )));
+    let t_pool = Instant::now();
+    let spawned = spawn_workers(workers, real_worker_factory(&opts, spawn_seed), spawn_seed);
+    if !spawned.failures.is_empty() {
+        // частично созданные Pocket освобождаются drop'ом слотов; повторов
+        // загрузки нет; пакет в неопределённом состоянии НЕ начинается —
+        // файлы получают Failed с диагнозом (готовых результатов нет)
+        let msg = spawned
+            .failures
+            .iter()
+            .map(|(w, e)| format!("воркер {w}: {e}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        emit(JobEvent::Log(format!("ВНИМАНИЕ: пул не запущен: {msg}")));
+        let mut conflicts = prepared.conflicts;
+        for pf in &to_synth {
+            let file = &plan.files[pf.index];
+            let r =
+                FileReport::failed(file, Some(pf.out.clone()), format!("пул не запущен: {msg}"));
+            emit_batch(BatchEvent::FileFinished {
+                index: pf.index + 1,
+                total,
+                report: Box::new(r.clone()),
+            });
+            reports[pf.index] = r;
+        }
+        return Ok(BatchReport {
+            files: reports,
+            conflicts: std::mem::take(&mut conflicts),
+            cancelled: false,
+            pool_loads: Some(spawned.loaded),
+            pool_workers: Some(workers),
+        });
     }
+    let load_ms: Vec<_> = spawned.load_ms.iter().map(|ms| format!("{ms}")).collect();
+    emit(JobEvent::Log(format!(
+        "постоянный пул: {workers} воркер(ов) готовы за {:.1} с (загрузки: {} мс); Pocket \
+         загружен {workers} раз(а); файлов к синтезу: {}",
+        t_pool.elapsed().as_secs_f32(),
+        load_ms.join("/"),
+        to_synth.len()
+    )));
+    emit(JobEvent::BatchStarted { total, workers });
+
+    // --- параллельный прогон на пуле ---
+    let settings_c = settings.clone();
+    let opts_c = opts.clone();
+    let cancel_c = Arc::clone(cancel);
+    let emit_c = Arc::clone(emit);
+    let synth = move |pf: &PreparedFile, _wid: usize, slot: &WorkerSlot<RealWorker>| {
+        execute_batch_file_persistent(&settings_c, &opts_c, pf, total, &cancel_c, &emit_c, slot)
+    };
+    let mut report = run_prepared_parallel(
+        plan,
+        PreparedBatch {
+            reports,
+            to_synth,
+            conflicts: prepared.conflicts,
+        },
+        cancel,
+        spawned.slots,
+        &emit_batch,
+        synth,
+    );
+    report.pool_loads = Some(spawned.loaded);
+    report.pool_workers = Some(workers);
+    Ok(report)
+}
+
+/// Один файл пакета на ПОСТОЯННОМ воркере (выполняется в потоке воркера
+/// пула). Тот же конвейер, что `execute_job` (без per-файловой подготовки
+/// движка/путей — она сделана до запуска воркеров), но:
+/// - файл целиком идёт через один loan-воркер (`workers = 1`);
+/// - per-file seed устанавливается на постоянный Pocket фабрикой одалживания;
+/// - ошибка движка ОТРАВЛЯЕТ слот (Pocket не переиспользуется), ошибка
+///   публикации — нет (кодирование прошло успешно, Pocket исправен).
+#[allow(clippy::too_many_arguments)]
+fn execute_batch_file_persistent(
+    s: &GuiSettings,
+    opts: &PipelineOptions,
+    pf: &PreparedFile,
+    total_files: usize,
+    cancel: &Arc<AtomicBool>,
+    emit: &Arc<dyn Fn(JobEvent) + Send + Sync>,
+    slot: &WorkerSlot<RealWorker>,
+) -> FileReport {
+    let t0 = Instant::now();
+    let k = pf.index + 1;
+    // чтение текста — ошибка файла, движок не при чём: Pocket не трогаем
+    let text = match std::fs::read_to_string(&pf.input) {
+        Ok(t) => t,
+        Err(e) => {
+            return FileReport::failed(
+                &batch_file_of(pf),
+                Some(pf.out.clone()),
+                format!("прочитать {}: {e}", pf.input.display()),
+            )
+        }
+    };
+    let cfg = JobConfig {
+        settings: s.clone(),
+        text,
+        out_path: pf.out.clone(),
+    };
+    let existed_before = pf.out.exists();
+    let ffmpeg_path = if s.ffmpeg_path.trim().is_empty() {
+        None
+    } else {
+        Some(resources::resolve_user_path(&s.ffmpeg_path))
+    };
+    let preset = s.preset_for_format();
+    let overwrite = s.overwrite_existing;
+    // создание sink — тоже до движка: ошибка ffmpeg/пути не отравляет Pocket
+    let sink = match make_sink_with_overwrite(
+        &pf.out,
+        24_000,
+        output_format(s.format),
+        preset,
+        ffmpeg_path.as_deref(),
+        overwrite,
+    ) {
+        Ok(sink) => sink,
+        Err(e) => {
+            return FileReport::failed(&batch_file_of(pf), Some(pf.out.clone()), format!("{e:#}"))
+        }
+    };
+    emit(JobEvent::Log(format!(
+        "[{k}/{total_files}] запуск: {} | {} | постоянный пул | {} | {}",
+        pf.out.display(),
+        device_label(s),
+        s.format.label(),
+        if preset.is_empty() { "-" } else { preset }
+    )));
+
+    let result = synthesize_stream_with_worker_factory(
+        &cfg.text,
+        opts,
+        sink,
+        |done, total| {
+            emit(JobEvent::FileProgress {
+                index: k,
+                total: total_files,
+                done,
+                chunks_total: total,
+            });
+        },
+        cancel,
+        &|ph| {
+            emit(JobEvent::FilePhase {
+                index: k,
+                phase: ph.into(),
+            })
+        },
+        loaned_real_worker_factory(Arc::clone(slot)),
+    );
+    let elapsed = t0.elapsed().as_secs_f32();
+
+    let (res, engine_broken) = match result {
+        Ok(outcome) => {
+            // Ok = Completed или Cancelled; отмена прерывала файл посреди
+            // генерации — defensive-отравление (пакет всё равно завершается)
+            let broken = outcome.status == RunStatus::Cancelled;
+            (
+                finish_from_outcome(&cfg, outcome, elapsed, cancel, overwrite, existed_before),
+                broken,
+            )
+        }
+        Err(e) => {
+            let publish_failed = e
+                .downcast_ref::<StreamError>()
+                .map(|se| se.publish_failed)
+                .unwrap_or(false);
+            (finish_from_error(&cfg, &e, elapsed), !publish_failed)
+        }
+    };
+    if engine_broken {
+        // Pocket в неопределённом состоянии — освободить и не переиспользовать
+        if let Ok(mut guard) = slot.lock() {
+            *guard = None;
+        }
+        emit(JobEvent::Log(format!(
+            "[{k}/{total_files}] ВНИМАНИЕ: Pocket этого воркера после сбоя не \
+             переиспользуется (слот отравлен)"
+        )));
+    }
+    file_report_from_job_result(&pf.input, &pf.relative, &pf.out, res)
+}
+
+/// Временный BatchFile-вид PreparedFile для конструкторов FileReport
+/// (вход/относительный путь совпадают с планом).
+fn batch_file_of(pf: &PreparedFile) -> BatchFile {
+    BatchFile {
+        input: pf.input.clone(),
+        relative: pf.relative.clone(),
+    }
+}
+
+/// Преобразование JobResult одного файла в FileReport пакета — единая
+/// семантика статусов/причин последовательного пути и постоянного пула.
+fn file_report_from_job_result(
+    input: &Path,
+    relative: &Path,
+    out_path: &Path,
+    res: JobResult,
+) -> FileReport {
+    let mut rep = FileReport {
+        input: input.to_path_buf(),
+        relative: relative.to_path_buf(),
+        output: Some(out_path.to_path_buf()),
+        status: FileStatus::Skipped,
+        reason: None,
+        final_path: res.final_path.clone(),
+        partial_path: res.partial_path.clone(),
+        diag_path: res.diag_path.clone(),
+        chunk_log_path: res.chunk_log_path.clone(),
+        chunks_done: res.progress.0,
+        chunks_total: res.progress.1,
+    };
+    match res.status {
+        JobStatus::Completed => {
+            rep.status = FileStatus::Completed;
+            // G5.1: «обновлён» только для реально существовавшего файла,
+            // новый файл не называется «обновлённым».
+            rep.reason = Some(if res.replaced_existing {
+                "файл обновлён (старый заменён)".into()
+            } else {
+                "создан новый файл".into()
+            });
+        }
+        JobStatus::Cancelled => {
+            rep.status = FileStatus::Cancelled;
+            rep.reason = Some(res.summary);
+        }
+        JobStatus::Failed => {
+            rep.status = FileStatus::Failed;
+            rep.reason = Some(res.summary);
+        }
+        // для одного файла эти статусы не возникают; не маскируем
+        // неожиданное состояние под успех
+        JobStatus::Partial => {
+            rep.status = FileStatus::Failed;
+            rep.reason = Some(format!("частичный результат: {}", res.summary));
+        }
+        JobStatus::NoWork | JobStatus::Skipped => {
+            rep.status = FileStatus::Skipped;
+            rep.reason = Some(res.summary);
+        }
+    }
+    rep
 }
 
 /// Явное предупреждение (например, невалидный runtime.json) — в начало
@@ -1441,7 +1938,8 @@ mod tests {
             ..Default::default()
         };
         let cancel = Arc::new(AtomicBool::new(false));
-        let res = execute_batch(&s, &src, &cancel, &|_| {});
+        let emit: Arc<dyn Fn(JobEvent) + Send + Sync> = Arc::new(|_| {});
+        let res = execute_batch(&s, &src, &cancel, &emit);
         assert_eq!(res.status, JobStatus::NoWork, "{}", res.summary);
         assert!(res.summary.contains("не найдено"), "{}", res.summary);
         assert!(res.summary.contains("НЕЧЕГО ДЕЛАТЬ"), "{}", res.summary);
@@ -1464,7 +1962,8 @@ mod tests {
             ..Default::default()
         };
         let cancel = Arc::new(AtomicBool::new(false));
-        let res = execute_batch(&s, &src, &cancel, &|_| {});
+        let emit: Arc<dyn Fn(JobEvent) + Send + Sync> = Arc::new(|_| {});
+        let res = execute_batch(&s, &src, &cancel, &emit);
         assert_eq!(res.status, JobStatus::NoWork, "{}", res.summary);
         assert!(res.summary.contains("НЕЧЕГО ДЕЛАТЬ"), "{}", res.summary);
         let report = res.batch.expect("отчёт");
@@ -1486,7 +1985,8 @@ mod tests {
             ..Default::default()
         };
         let cancel = Arc::new(AtomicBool::new(true));
-        let res = execute_batch(&s, &src, &cancel, &|_| {});
+        let emit: Arc<dyn Fn(JobEvent) + Send + Sync> = Arc::new(|_| {});
+        let res = execute_batch(&s, &src, &cancel, &emit);
         assert_eq!(res.status, JobStatus::Cancelled, "{}", res.summary);
         assert!(res.summary.contains("ОТМЕНЕНО"), "{}", res.summary);
         let report = res.batch.expect("отчёт");
@@ -1591,8 +2091,13 @@ mod tests {
         s.workers = Some(2);
         s.clamped();
         let cancel = Arc::new(AtomicBool::new(false));
-        let events = std::cell::RefCell::new(Vec::new());
-        let res = execute_batch(&s, &src, &cancel, &|ev| events.borrow_mut().push(ev));
+        let events: Arc<std::sync::Mutex<Vec<JobEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let emit: Arc<dyn Fn(JobEvent) + Send + Sync> = {
+            let events = Arc::clone(&events);
+            Arc::new(move |ev| events.lock().unwrap().push(ev))
+        };
+        let res = execute_batch(&s, &src, &cancel, &emit);
         eprintln!("[g3_batch] {} | {}", res.status.label(), res.summary);
         for line in res.summary.lines() {
             eprintln!("  {line}");
@@ -1627,7 +2132,7 @@ mod tests {
         );
 
         // прогресс по файлам и чанкам шёл через события
-        let events = events.into_inner();
+        let events = events.lock().unwrap().clone();
         let file_starts = events
             .iter()
             .filter(|e| matches!(e, JobEvent::FileProgress { .. }))
@@ -1923,7 +2428,8 @@ mod tests {
         s.overwrite_existing = true;
         s.clamped();
         let cancel = Arc::new(AtomicBool::new(false));
-        let res = execute_batch(&s, &src, &cancel, &|_| {});
+        let emit: Arc<dyn Fn(JobEvent) + Send + Sync> = Arc::new(|_| {});
+        let res = execute_batch(&s, &src, &cancel, &emit);
         eprintln!("[g51_batch_ow] {} | {}", res.status.label(), res.summary);
         assert_eq!(res.status, JobStatus::Completed, "{}", res.summary);
         let report = res.batch.expect("отчёт");
@@ -1966,7 +2472,8 @@ mod tests {
         let before_b = std::fs::read(out.join("b.wav")).unwrap();
         let mut s2 = s.clone();
         s2.overwrite_existing = false;
-        let res2 = execute_batch(&s2, &src, &Arc::new(AtomicBool::new(false)), &|_| {});
+        let emit2: Arc<dyn Fn(JobEvent) + Send + Sync> = Arc::new(|_| {});
+        let res2 = execute_batch(&s2, &src, &Arc::new(AtomicBool::new(false)), &emit2);
         eprintln!(
             "[g51_batch_ow_skip] {} | {}",
             res2.status.label(),
@@ -2245,5 +2752,565 @@ mod tests {
                 "none",
             ],
         );
+    }
+
+    // ===== G6.1: решение о числе воркеров постоянного пула (чистая логика) =====
+
+    fn cuda_auto() -> GuiSettings {
+        GuiSettings {
+            device: DeviceChoice::Cuda,
+            ..Default::default()
+        }
+    }
+
+    /// Авто: 2 воркера при достаточной VRAM; 1 — при нехватке (с записью в
+    /// журнал); nvidia-smi недоступен (None) — авто не деградирует молча.
+    #[test]
+    fn pool_workers_auto_2_or_1_by_preflight() {
+        let logs: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        let log = |m: String| logs.lock().unwrap().push(m);
+        // авто + достаточно VRAM → 2
+        assert_eq!(
+            decide_batch_pool_workers(&cuda_auto(), 5, Some(12_000.0), &log),
+            2
+        );
+        assert!(logs.lock().unwrap().is_empty(), "без предупреждений");
+        // авто + мало VRAM → 1 + запись в журнал
+        assert_eq!(
+            decide_batch_pool_workers(&cuda_auto(), 5, Some(3_000.0), &log),
+            1
+        );
+        assert!(logs
+            .lock()
+            .unwrap()
+            .join(
+                "
+"
+            )
+            .contains("авто: 1 воркер"));
+        // nvidia-smi недоступен → авто 2 без деградации
+        assert_eq!(decide_batch_pool_workers(&cuda_auto(), 5, None, &log), 2);
+        // файлов меньше — воркеров не больше файлов (лишние Pocket не грузим)
+        assert_eq!(
+            decide_batch_pool_workers(&cuda_auto(), 1, Some(12_000.0), &log),
+            1
+        );
+        assert_eq!(
+            decide_batch_pool_workers(&cuda_auto(), 2, Some(12_000.0), &log),
+            2
+        );
+    }
+
+    /// Ручной выбор не игнорируется молча: нехватка VRAM и >2 — явные
+    /// предупреждения, число сохраняется.
+    #[test]
+    fn pool_workers_manual_respected_with_warnings() {
+        let logs: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        let log = |m: String| logs.lock().unwrap().push(m);
+        let mut s = cuda_auto();
+        s.workers = Some(2);
+        assert_eq!(decide_batch_pool_workers(&s, 5, Some(3_000.0), &log), 2);
+        assert!(logs
+            .lock()
+            .unwrap()
+            .join(
+                "
+"
+            )
+            .contains("ВНИМАНИЕ: VRAM-префлайт"));
+        logs.lock().unwrap().clear();
+        s.workers = Some(4);
+        assert_eq!(decide_batch_pool_workers(&s, 8, Some(12_000.0), &log), 4);
+        let all = logs.lock().unwrap().join(
+            "
+",
+        );
+        assert!(all.contains("больше 2 не ускоряет"), "{all}");
+        s.workers = Some(1);
+        assert_eq!(decide_batch_pool_workers(&s, 8, Some(100.0), &log), 1);
+    }
+
+    // ===== G6.1: реальный пакетный CUDA на постоянном пуле =====
+    // Запуск (по одному на процесс; ORT грузится один раз):
+    //   SHTORM_GUI_TEST_DEVICE=cuda cargo test -p shtorm-gui --release --lib \
+    //     real_batch_cuda_pool -- --ignored --nocapture --test-threads=1
+
+    /// Параметры эталона P2B.3: slow FP32, TF32=0, I/O binding on (дефолт),
+    /// temp 0.3, steps 1, seed 42, EOS -4/5/3, anti-repeat, brightness 8 дБ,
+    /// denoise off, pause_scale 1.0, paragraph_pause 0.9, max_tokens 50,
+    /// голос — эталон P2B.1/P2B.2/P2B.3 «Василий Леванов F5-TTS3.wav».
+    const P2B_VOICE: &str = r"C:\PocketTTS-GUI\examples\Василий Леванов F5-TTS3.wav";
+    const P2B_SOURCE: &str =
+        r"C:\Users\alexa\Documents\Гарри Поттер отрывок 2_accented_processed_normalized.txt";
+    /// Набор из P2B.3 (12 файлов, 77 чанков на весь текст).
+    const P2B_PARTS_DIR: &str = r"out\cuda_p2b3\main12_bal_20261110-122635";
+
+    /// Каталог частей P2B.3: 12 файлов, конкатенация побайтово = исходник.
+    fn p2b3_parts() -> Vec<PathBuf> {
+        let root = crate::job::find_project_root().expect("корень проекта");
+        // SHTORM_G61_PARTS_DIR — другой набор P2B.3 (например ctrl6) для
+        // контрольных прогонов той же матрицы
+        let dir = std::env::var("SHTORM_G61_PARTS_DIR")
+            .map(|d| root.join(d))
+            .unwrap_or_else(|_| root.join(P2B_PARTS_DIR));
+        let expected_files: usize = std::env::var("SHTORM_G61_PARTS_FILES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(12);
+        let mut parts: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("набор P2B.3 не найден {}: {e}", dir.display()))
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("part_") && n.ends_with(".txt"))
+            })
+            .collect();
+        assert_eq!(
+            parts.len(),
+            expected_files,
+            "ожидалось {expected_files} частей набора"
+        );
+        parts.sort();
+        // исходный текст сохраняется побайтово (сильнее хеша)
+        let joined: Vec<u8> = parts
+            .iter()
+            .flat_map(|p| std::fs::read(p).unwrap())
+            .collect();
+        let original = std::fs::read(P2B_SOURCE).expect("исходный текст P2B.3 (только чтение)");
+        assert_eq!(
+            joined, original,
+            "конкатенация частей обязана быть побайтово равна исходнику"
+        );
+        parts
+    }
+
+    /// Настройки эталона P2B.3 для пакетного прогона (CUDA, seed 42).
+    fn p2b3_settings(out_dir: &Path, workers: Option<u32>) -> GuiSettings {
+        let mut s = real_settings(OutputFormatChoice::Wav, out_dir);
+        s.device = DeviceChoice::Cuda;
+        s.voice_wav = P2B_VOICE.into();
+        s.max_tokens = 50;
+        s.seed = 42;
+        s.workers = workers;
+        s.clamped();
+        s
+    }
+
+    fn ffmpeg_process_count() -> u32 {
+        let out = std::process::Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq ffmpeg.exe", "/FO", "CSV", "/NH"])
+            .output()
+            .expect("tasklist");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.to_ascii_lowercase().starts_with("\"ffmpeg.exe"))
+            .count() as u32
+    }
+
+    /// G6.1: главный тест — пакет 12 файлов на постоянном пуле 2 воркеров:
+    /// Pocket загружен ровно 2 раза за весь пакет, каждый WAV побитово равен
+    /// результату последовательного пути (модель на файл, те же настройки).
+    /// Покрывает: независимость от того, какой Pocket получил файл,
+    /// влияние повторного использования Pocket, 77 чанков без потерь/дублей.
+    #[test]
+    #[ignore = "реальный пакетный синтез CUDA: модели + ORT GPU DLL (2 прогона 12 файлов)"]
+    fn real_batch_cuda_pool() {
+        let parts = p2b3_parts();
+        let expected_files: usize = std::env::var("SHTORM_G61_PARTS_FILES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(12);
+        let ffmpeg0 = ffmpeg_process_count();
+        let vram0 = app_core::diagnostics::gpu_total_used_mb();
+        let src_dir = parts[0].parent().unwrap().to_path_buf();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let emit: Arc<dyn Fn(JobEvent) + Send + Sync> = Arc::new(|_| {});
+
+        // 1) эталон: прежний последовательный путь (модель на КАЖДЫЙ файл)
+        std::env::set_var("SHTORM_GUI_BATCH_POOL", "0");
+        let d_ref = tmpdir("g61_pool_ref");
+        let mut s_ref = p2b3_settings(&d_ref, Some(1));
+        s_ref.out_dir = d_ref.join("out").display().to_string();
+        s_ref.clamped();
+        let ref_res = execute_batch(&s_ref, &src_dir, &cancel, &emit);
+        eprintln!("[g61_ref] {} | {}", ref_res.status.label(), ref_res.summary);
+        assert_eq!(ref_res.status, JobStatus::Completed, "{}", ref_res.summary);
+        let ref_rep = ref_res.batch.expect("отчёт");
+        assert_eq!(ref_rep.completed(), expected_files);
+        assert!(
+            ref_rep.pool_loads.is_none(),
+            "последовательный путь без пула"
+        );
+
+        // 2) новый путь: постоянный пул, авто 2 воркера
+        std::env::remove_var("SHTORM_GUI_BATCH_POOL");
+        let d_pool = tmpdir("g61_pool_new");
+        let mut s_pool = p2b3_settings(&d_pool, None);
+        s_pool.out_dir = d_pool.join("out").display().to_string();
+        s_pool.clamped();
+        let cancel2 = Arc::new(AtomicBool::new(false));
+        let logs: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let emit2: Arc<dyn Fn(JobEvent) + Send + Sync> = {
+            let logs = Arc::clone(&logs);
+            Arc::new(move |ev| {
+                if let JobEvent::Log(line) = ev {
+                    logs.lock().unwrap().push(line);
+                }
+            })
+        };
+        let pool_res = execute_batch(&s_pool, &src_dir, &cancel2, &emit2);
+        eprintln!(
+            "[g61_pool] {} | {}",
+            pool_res.status.label(),
+            pool_res.summary
+        );
+        assert_eq!(
+            pool_res.status,
+            JobStatus::Completed,
+            "{}",
+            pool_res.summary
+        );
+        let pool_rep = pool_res.batch.expect("отчёт");
+        assert_eq!(pool_rep.completed(), expected_files);
+        // ГЛАВНЫЙ КРИТЕРИЙ: Pocket загружен ровно 2 раза на весь пакет
+        assert_eq!(pool_rep.pool_loads, Some(2), "{}", pool_rep.summary());
+        assert_eq!(pool_rep.pool_workers, Some(2));
+        let logs = logs.lock().unwrap().join("\n");
+        assert!(
+            logs.contains("Pocket загружен 2 раз"),
+            "журнал пула: {logs}"
+        );
+
+        // 3) побитовый паритет всех 12 WAV: пул == последовательный путь
+        for f in &pool_rep.files {
+            let out_pool = f.final_path.as_ref().expect("итог пула");
+            let out_ref = d_ref.join("out").join(f.relative.with_extension("wav"));
+            let a = std::fs::read(out_pool).expect("WAV пула");
+            let b = std::fs::read(&out_ref)
+                .unwrap_or_else(|e| panic!("WAV эталона {}: {e}", out_ref.display()));
+            assert_eq!(
+                a,
+                b,
+                "{}: WAV пула обязан быть побитово равен эталону",
+                f.relative.display()
+            );
+            assert!(a.starts_with(b"RIFF"));
+        }
+
+        // 4) все чанки на месте (77 на весь текст любого набора P2B.3)
+        let chunks: usize = pool_rep.files.iter().map(|f| f.chunks_total).sum();
+        assert_eq!(chunks, 77, "сумма чанков набора");
+        assert!(pool_rep
+            .files
+            .iter()
+            .all(|f| f.chunks_done == f.chunks_total));
+
+        // 5) без осиротевших ffmpeg; VRAM вернулась к базе (без утечки)
+        assert_eq!(ffmpeg_process_count(), ffmpeg0, "сиротских ffmpeg нет");
+        let vram1 = app_core::diagnostics::gpu_total_used_mb();
+        if let (Some(v0), Some(v1)) = (vram0, vram1) {
+            assert!(
+                v1 < v0 + 2500.0,
+                "VRAM после пакета {v1:.0} МБ против базы {v0:.0} МБ — похоже на утечку"
+            );
+            eprintln!("[g61_vram] база {v0:.0} МБ → после пакета {v1:.0} МБ");
+        }
+    }
+
+    /// G6.1: отмена в середине пакета: новые файлы не назначаются, готовые
+    /// ДО отмены файлы целы, повторный запуск доделывает остальные.
+    #[test]
+    #[ignore = "реальный пакетный синтез CUDA: модели + ORT GPU DLL"]
+    fn real_batch_cuda_pool_cancel() {
+        let parts = p2b3_parts();
+        let src_dir = parts[0].parent().unwrap().to_path_buf();
+        let d = tmpdir("g61_pool_cancel");
+        let mut s = p2b3_settings(&d, None);
+        s.out_dir = d.join("out").display().to_string();
+        s.clamped();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_e = Arc::clone(&cancel);
+        let done_files = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let done_e = Arc::clone(&done_files);
+        let emit: Arc<dyn Fn(JobEvent) + Send + Sync> = Arc::new(move |ev| {
+            if let JobEvent::FileDone { .. } = ev {
+                // «Стоп» после первого готового файла
+                if done_e.fetch_add(1, Ordering::SeqCst) == 0 {
+                    cancel_e.store(true, Ordering::SeqCst);
+                }
+            }
+        });
+        let res = execute_batch(&s, &src_dir, &cancel, &emit);
+        eprintln!("[g61_cancel] {} | {}", res.status.label(), res.summary);
+        assert_eq!(res.status, JobStatus::Cancelled, "{}", res.summary);
+        let rep = res.batch.expect("отчёт");
+        assert!(rep.completed() >= 1, "готовое до отмены не теряется");
+        assert!(rep.skipped() >= 1, "назначение новых файлов остановлено");
+        let completed = rep
+            .files
+            .iter()
+            .filter(|f| f.status == FileStatus::Completed)
+            .count();
+        for f in rep
+            .files
+            .iter()
+            .filter(|f| f.status == FileStatus::Completed)
+        {
+            let p = f.final_path.as_ref().expect("итог готового файла");
+            assert!(p.is_file(), "{} цел после отмены", p.display());
+        }
+        // повторный запуск без отмены доделывает остальные
+        let emit2: Arc<dyn Fn(JobEvent) + Send + Sync> = Arc::new(|_| {});
+        let res2 = execute_batch(&s, &src_dir, &Arc::new(AtomicBool::new(false)), &emit2);
+        eprintln!("[g61_retry] {} | {}", res2.status.label(), res2.summary);
+        assert_eq!(res2.status, JobStatus::Completed, "{}", res2.summary);
+        let rep2 = res2.batch.expect("отчёт");
+        assert_eq!(rep2.completed(), 12 - completed, "{}", rep2.summary());
+        assert_eq!(rep2.skipped(), completed, "готовые ранее — пропущены");
+        assert_eq!(ffmpeg_process_count(), 0, "сиротских ffmpeg нет");
+    }
+
+    /// G6.1: перезапись в пакете — overwrite=false: существующие результаты
+    /// пропускаются побайтово неизменными; overwrite=true: безопасная замена
+    /// («файл обновлён») только после успешного синтеза.
+    #[test]
+    #[ignore = "реальный пакетный синтез CUDA: модели + ORT GPU DLL"]
+    fn real_batch_cuda_pool_overwrite() {
+        let parts = p2b3_parts();
+        let src_dir = parts[0].parent().unwrap().to_path_buf();
+        let d = tmpdir("g61_pool_ow");
+        let out = d.join("out");
+        let mut s = p2b3_settings(&d, None);
+        s.out_dir = out.display().to_string();
+        s.clamped();
+        let no_cancel = || Arc::new(AtomicBool::new(false));
+        let emit: Arc<dyn Fn(JobEvent) + Send + Sync> = Arc::new(|_| {});
+
+        // 1) первый прогон — всё создаётся
+        let r1 = execute_batch(&s, &src_dir, &no_cancel(), &emit);
+        assert_eq!(r1.status, JobStatus::Completed, "{}", r1.summary);
+        let before: Vec<Vec<u8>> = parts
+            .iter()
+            .map(|p| {
+                let name = p.file_name().unwrap();
+                std::fs::read(out.join(name).with_extension("wav")).unwrap()
+            })
+            .collect();
+
+        // 2) повтор с overwrite=false: всё пропущено, байты нетронуты
+        let r2 = execute_batch(&s, &src_dir, &no_cancel(), &emit);
+        assert_eq!(r2.status, JobStatus::NoWork, "{}", r2.summary);
+        for (i, p) in parts.iter().enumerate() {
+            let name = p.file_name().unwrap();
+            assert_eq!(
+                std::fs::read(out.join(name).with_extension("wav")).unwrap(),
+                before[i],
+                "старые байты целы при выключенной перезаписи"
+            );
+        }
+
+        // 3) повтор с overwrite=true: обновление после успешного синтеза
+        let mut s3 = s.clone();
+        s3.overwrite_existing = true;
+        let r3 = execute_batch(&s3, &src_dir, &no_cancel(), &emit);
+        assert_eq!(r3.status, JobStatus::Completed, "{}", r3.summary);
+        let rep3 = r3.batch.expect("отчёт");
+        assert_eq!(rep3.completed(), 12);
+        assert!(rep3
+            .files
+            .iter()
+            .all(|f| f.reason.as_deref().is_some_and(|r| r.contains("обновлён"))));
+        // после замены не осталось .partial
+        assert!(!std::fs::read_dir(&out)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".partial")));
+        assert_eq!(ffmpeg_process_count(), 0, "сиротских ffmpeg нет");
+    }
+
+    /// G6.1: MP3/Opus в пакете на пуле — корректные контейнеры, без сирот.
+    #[test]
+    #[ignore = "реальный пакетный синтез CUDA: модели + ORT GPU DLL + ffmpeg"]
+    fn real_batch_cuda_pool_mp3_opus() {
+        let parts = p2b3_parts();
+        let src_dir = parts[0].parent().unwrap().to_path_buf();
+        let ffmpeg0 = ffmpeg_process_count();
+        for (fmt, magic) in [
+            (OutputFormatChoice::Mp3, &b"ID3"[..]),
+            (OutputFormatChoice::Opus, &b"OggS"[..]),
+        ] {
+            let d = tmpdir(&format!("g61_pool_{fmt:?}"));
+            let mut s = p2b3_settings(&d, None);
+            s.out_dir = d.join("out").display().to_string();
+            s.format = fmt;
+            s.clamped();
+            let emit: Arc<dyn Fn(JobEvent) + Send + Sync> = Arc::new(|_| {});
+            let res = execute_batch(&s, &src_dir, &Arc::new(AtomicBool::new(false)), &emit);
+            eprintln!("[g61_{fmt:?}] {} | {}", res.status.label(), res.summary);
+            assert_eq!(res.status, JobStatus::Completed, "{}", res.summary);
+            let rep = res.batch.expect("отчёт");
+            assert_eq!(rep.completed(), 12);
+            for f in &rep.files {
+                let p = f.final_path.as_ref().expect("итог");
+                let bytes = std::fs::read(p).unwrap();
+                assert!(
+                    bytes.starts_with(magic),
+                    "контейнер {}: {}",
+                    fmt.label(),
+                    p.display()
+                );
+            }
+        }
+        assert_eq!(ffmpeg_process_count(), ffmpeg0, "сиротских ffmpeg нет");
+    }
+
+    /// G6.1: замеры производительности пакетного CUDA на наборе main12 —
+    /// прежний пофайловый путь (модель на каждый файл) против постоянного
+    /// пула 1/2 воркера. Прогрев + 3 измеренных повтора на режим; в процессе
+    /// сэмплируются GPU util/VRAM (nvidia-smi, ~0.3 с) и CPU (PowerShell,
+    /// реже). wall — полный прогон пакета (включая загрузки Pocket).
+    #[test]
+    #[ignore = "длительный бенчмарк CUDA (~10 мин): модели + ORT GPU DLL"]
+    fn real_batch_cuda_bench() {
+        fn gpu_sample() -> Option<(u64, u64)> {
+            let out = std::process::Command::new("nvidia-smi")
+                .args([
+                    "--query-gpu=utilization.gpu,memory.used",
+                    "--format=csv,noheader,nounits",
+                ])
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            let t = String::from_utf8_lossy(&out.stdout);
+            let mut it = t.lines().next()?.trim().split(',');
+            Some((
+                it.next()?.trim().parse().ok()?,
+                it.next()?.trim().parse().ok()?,
+            ))
+        }
+        fn cpu_sample() -> Option<u64> {
+            let out = std::process::Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-Command",
+                    "(Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter \"Name='_Total'\" -Property PercentProcessorTime).PercentProcessorTime",
+                ])
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+        }
+
+        let parts = p2b3_parts();
+        let src_dir = parts[0].parent().unwrap().to_path_buf();
+        let base = tmpdir("g61_bench");
+        let emit: Arc<dyn Fn(JobEvent) + Send + Sync> = Arc::new(|_| {});
+        let stop = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(std::sync::Mutex::new((0u64, 0u64, 0u64, 0u64, 0u64)));
+        // (max_vram_mb, sum_util, n_util, sum_cpu, n_cpu)
+        {
+            let stop = Arc::clone(&stop);
+            let stats = Arc::clone(&stats);
+            std::thread::spawn(move || {
+                let mut i = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    if let Some((util, used)) = gpu_sample() {
+                        let mut s = stats.lock().unwrap();
+                        s.0 = s.0.max(used);
+                        s.1 += util;
+                        s.2 += 1;
+                    }
+                    if i.is_multiple_of(4) {
+                        if let Some(cpu) = cpu_sample() {
+                            let mut s = stats.lock().unwrap();
+                            s.3 += cpu;
+                            s.4 += 1;
+                        }
+                    }
+                    i += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                }
+            });
+        }
+
+        // (имя, прежний путь?, workers): old1 — модель на каждый файл;
+        // pool1/pool2 — постоянный пул с 1/2 Pocket.
+        let modes: [(&str, bool, Option<u32>); 3] = [
+            ("old1", true, Some(1)),
+            ("pool1", false, Some(1)),
+            ("pool2", false, None),
+        ];
+        for (name, old, workers) in modes {
+            if old {
+                std::env::set_var("SHTORM_GUI_BATCH_POOL", "0");
+            } else {
+                std::env::remove_var("SHTORM_GUI_BATCH_POOL");
+            }
+            for rep in 0..=3u32 {
+                let d = base.join(format!("{name}_r{rep}"));
+                let mut s = p2b3_settings(&d, workers);
+                s.out_dir = d.join("out").display().to_string();
+                s.clamped();
+                {
+                    let mut s = stats.lock().unwrap();
+                    *s = (0, 0, 0, 0, 0);
+                }
+                let t0 = Instant::now();
+                let res = execute_batch(&s, &src_dir, &Arc::new(AtomicBool::new(false)), &emit);
+                let wall = t0.elapsed().as_secs_f32();
+                assert_eq!(
+                    res.status,
+                    JobStatus::Completed,
+                    "{name} r{rep}: {}",
+                    res.summary
+                );
+                // длительность аудио набора — по размерам WAV (PCM16 mono 24 кГц)
+                let audio_s: f64 = std::fs::read_dir(d.join("out"))
+                    .unwrap()
+                    .filter_map(|e| e.ok())
+                    .filter(|e| {
+                        e.file_name()
+                            .to_string_lossy()
+                            .to_ascii_lowercase()
+                            .ends_with(".wav")
+                    })
+                    .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
+                    .map(|len| len.saturating_sub(44) as f64 / 48_000.0)
+                    .sum();
+                let (vram_max, util_avg, cpu_avg) = {
+                    let s = stats.lock().unwrap();
+                    (
+                        s.0,
+                        if s.2 > 0 {
+                            s.1 as f64 / s.2 as f64
+                        } else {
+                            0.0
+                        },
+                        if s.4 > 0 {
+                            s.3 as f64 / s.4 as f64
+                        } else {
+                            0.0
+                        },
+                    )
+                };
+                let rep_kind = if rep == 0 { "warmup" } else { "measured" };
+                eprintln!(
+                    "BENCH {name} {rep_kind}: wall {wall:.2} s | аудио {audio_s:.1} с | \
+                     throughput {:.2} реч-с/с | VRAM max {vram_max} МБ | GPU util {util_avg:.0}% | \
+                     CPU {cpu_avg:.0}% | {}",
+                    audio_s / wall as f64,
+                    res.summary
+                );
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        std::env::remove_var("SHTORM_GUI_BATCH_POOL");
     }
 }

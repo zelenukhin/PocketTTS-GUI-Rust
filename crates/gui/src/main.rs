@@ -204,7 +204,8 @@ fn portable_selftest(args: &[String], batch: bool) -> i32 {
         let cancel = Arc::new(AtomicBool::new(false));
         println!("BATCH SOURCE: {}", src.display());
         println!("BATCH OUT: {}", s.out_dir);
-        execute_batch(&s, &src, &cancel, &|_| {})
+        let emit: Arc<dyn Fn(JobEvent) + Send + Sync> = Arc::new(|_| {});
+        execute_batch(&s, &src, &cancel, &emit)
     } else {
         let out_path = out_root.join(format!("selftest-{stamp}.{}", s.format.extension_str()));
         let cfg = JobConfig {

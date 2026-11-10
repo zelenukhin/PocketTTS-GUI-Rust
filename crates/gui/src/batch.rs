@@ -164,6 +164,12 @@ pub struct BatchReport {
     /// Пользователь отменил пакет (флаг НЕ выводится из статусов файлов:
     /// отмена может совпасть с ошибкой текущего файла или произойти до старта).
     pub cancelled: bool,
+    /// G6.1: постоянный пул — сколько Pocket реально загружено на пакет
+    /// (None — последовательный путь, модель создаётся на каждый файл).
+    pub pool_loads: Option<usize>,
+    /// G6.1: число постоянных воркеров пула (файлов обрабатывается
+    /// одновременно столько же).
+    pub pool_workers: Option<usize>,
 }
 
 impl BatchReport {
@@ -172,6 +178,8 @@ impl BatchReport {
             files: Vec::new(),
             conflicts: Vec::new(),
             cancelled: false,
+            pool_loads: None,
+            pool_workers: None,
         }
     }
 
@@ -232,6 +240,11 @@ impl BatchReport {
         );
         if !self.conflicts.is_empty() {
             s.push_str(&format!(" | конфликтов имён: {}", self.conflicts.len()));
+        }
+        if let (Some(w), Some(l)) = (self.pool_workers, self.pool_loads) {
+            s.push_str(&format!(
+                " | пул: {w} воркер(ов), Pocket загружен {l} раз(а)"
+            ));
         }
         match self.status() {
             BatchStatus::Cancelled => s.push_str(" | ОТМЕНЕНО"),
@@ -668,20 +681,39 @@ fn conflict_path_with_ext(stem_path: &Path, ext: &str) -> PathBuf {
     stem_path.with_file_name(format!("{name}.{ext}"))
 }
 
-/// Прогнать план. `synth` инжектируется (в GUI — реальный `execute_job`,
-/// в тестах — мок). Ошибки одного файла изолированы; отмена не запускает
-/// следующий файл и помечает оставшиеся как Skipped.
-pub fn run_batch<F>(
+/// Файл, готовый к синтезу: все предзапусковые проверки плана пройдены
+/// (не конфликт, путь результата безопасен лексически, существующего
+/// результата нет либо разрешена перезапись).
+#[derive(Debug, Clone)]
+pub struct PreparedFile {
+    /// Индекс в `plan.files` (0-based); K для событий = index + 1.
+    pub index: usize,
+    pub input: PathBuf,
+    pub relative: PathBuf,
+    pub out: PathBuf,
+}
+
+/// Результат предзапусковых проверок пакета: отчёты всех файлов плана
+/// (index-aligned) и список файлов, готовых к синтезу.
+#[derive(Debug, Clone)]
+pub struct PreparedBatch {
+    pub reports: Vec<FileReport>,
+    pub to_synth: Vec<PreparedFile>,
+    /// Конфликты с уже подставленным расширением результата.
+    pub conflicts: Vec<OutputConflict>,
+}
+
+/// Предзапусковые проверки пакета (G6.1): конфликты имён, безопасность
+/// выходного пути и существующие результаты разрешаются ДО запуска воркеров.
+/// Файлы с проблемами получают готовый FileReport (+FileFinished);
+/// синтезируемые — плейсхолдер, который заменит раннер.
+pub fn preflight_batch(
     plan: &BatchPlan,
     extension: &str,
     overwrite: bool,
     cancel: &AtomicBool,
     emit: &dyn Fn(BatchEvent),
-    mut synth: F,
-) -> BatchReport
-where
-    F: FnMut(&BatchFile, &Path, &AtomicBool, &mut dyn FnMut(usize, usize)) -> FileReport,
-{
+) -> PreparedBatch {
     let total = plan.files.len();
     emit(BatchEvent::Planned {
         total,
@@ -711,23 +743,13 @@ where
     }
 
     let mut reports = Vec::with_capacity(total);
-    let mut stopped = false;
+    let mut to_synth = Vec::new();
+    let cancelled_upfront = cancel.load(Ordering::SeqCst);
     for (idx, file) in plan.files.iter().enumerate() {
-        if stopped || cancel.load(Ordering::SeqCst) {
-            stopped = true;
+        let report = if cancelled_upfront {
             let out = output_path_for(&plan.out_root, &file.relative, extension).ok();
-            let r = FileReport::skipped(file, out, "отменено до запуска");
-            emit(BatchEvent::FileFinished {
-                index: idx + 1,
-                total,
-                report: Box::new(r.clone()),
-            });
-            reports.push(r);
-            continue;
-        }
-        // Конфликт имён обнаружен ещё в плане: не синтезируем и не
-        // переименовываем молча — файл пропускается с явной причиной.
-        if let Some(ci) =
+            FileReport::skipped(file, out, "отменено до запуска")
+        } else if let Some(ci) =
             conflict_by_key.get(&norm_str(&output_stem_path(&plan.out_root, &file.relative)))
         {
             let c = &plan.conflicts[*ci];
@@ -739,55 +761,143 @@ where
                 .collect::<Vec<_>>()
                 .join(", ");
             let out = output_path_for(&plan.out_root, &file.relative, extension).ok();
-            let r = FileReport::skipped(
+            FileReport::skipped(
                 file,
                 out,
                 format!(
                     "конфликт выходных имён: {names} → {} — синтез не запускался",
                     conflict_out.display()
                 ),
-            );
+            )
+        } else {
+            match output_path_for(&plan.out_root, &file.relative, extension) {
+                Ok(out) => {
+                    if out.exists() && !overwrite {
+                        FileReport::skipped(
+                            file,
+                            Some(out),
+                            "результат уже существует — перезапись выключена",
+                        )
+                    } else {
+                        to_synth.push(PreparedFile {
+                            index: idx,
+                            input: file.input.clone(),
+                            relative: file.relative.clone(),
+                            out: out.clone(),
+                        });
+                        FileReport::new(file, Some(out))
+                    }
+                }
+                Err(e) => FileReport::failed(file, None, format!("{e:#}")),
+            }
+        };
+        let is_placeholder = report.status == FileStatus::Skipped && report.reason.is_none();
+        if !is_placeholder {
+            emit(BatchEvent::FileFinished {
+                index: idx + 1,
+                total,
+                report: Box::new(report.clone()),
+            });
+        }
+        reports.push(report);
+    }
+
+    let conflicts = plan
+        .conflicts
+        .iter()
+        .map(|c| OutputConflict {
+            output: conflict_path_with_ext(&c.output, extension),
+            inputs: c.inputs.clone(),
+        })
+        .collect();
+    PreparedBatch {
+        reports,
+        to_synth,
+        conflicts,
+    }
+}
+
+/// Быстрый подсчёт файлов-кандидатов на синтез (те же условия, что
+/// `preflight_batch`, без событий) — для решения о постоянном пуле ДО
+/// его создания (G6.1: не грузить 2 Pocket ради 1 файла).
+pub fn count_actionable(plan: &BatchPlan, extension: &str, overwrite: bool) -> usize {
+    let conflict_keys: std::collections::BTreeSet<String> =
+        plan.conflicts.iter().map(|c| norm_str(&c.output)).collect();
+    plan.files
+        .iter()
+        .filter(|f| {
+            !conflict_keys.contains(&norm_str(&output_stem_path(&plan.out_root, &f.relative)))
+        })
+        .filter_map(|f| output_path_for(&plan.out_root, &f.relative, extension).ok())
+        .filter(|out| overwrite || !out.exists())
+        .count()
+}
+
+/// Собрать BatchReport из готовых отчётов + признака отмены.
+fn assemble_report(prepared: PreparedBatch, cancelled: bool) -> BatchReport {
+    BatchReport {
+        files: prepared.reports,
+        conflicts: prepared.conflicts,
+        cancelled,
+        pool_loads: None,
+        pool_workers: None,
+    }
+}
+
+/// Прогнать план ПОСЛЕДОВАТЕЛЬНО (существующий путь G3: пул воркеров
+/// создаётся/освобождается на каждый файл внутри `synth`). `synth`
+/// инжектируется (в GUI — реальный `execute_job`, в тестах — мок). Ошибки
+/// одного файла изолированы; отмена не запускает следующий файл и помечает
+/// оставшиеся как Skipped.
+pub fn run_batch<F>(
+    plan: &BatchPlan,
+    extension: &str,
+    overwrite: bool,
+    cancel: &AtomicBool,
+    emit: &dyn Fn(BatchEvent),
+    synth: F,
+) -> BatchReport
+where
+    F: FnMut(&BatchFile, &Path, &AtomicBool, &mut dyn FnMut(usize, usize)) -> FileReport,
+{
+    let prepared = preflight_batch(plan, extension, overwrite, cancel, emit);
+    run_prepared_sequential(plan, prepared, cancel, emit, synth)
+}
+
+/// Последовательный раннер подготовленного пакета.
+pub fn run_prepared_sequential<F>(
+    plan: &BatchPlan,
+    prepared: PreparedBatch,
+    cancel: &AtomicBool,
+    emit: &dyn Fn(BatchEvent),
+    mut synth: F,
+) -> BatchReport
+where
+    F: FnMut(&BatchFile, &Path, &AtomicBool, &mut dyn FnMut(usize, usize)) -> FileReport,
+{
+    let total = plan.files.len();
+    let mut reports = prepared.reports;
+    let mut stopped = false;
+    for pf in prepared.to_synth {
+        let idx = pf.index;
+        let file = &plan.files[idx];
+        if stopped || cancel.load(Ordering::SeqCst) {
+            stopped = true;
+            let r = FileReport::skipped(file, Some(pf.out.clone()), "отменено до запуска");
             emit(BatchEvent::FileFinished {
                 index: idx + 1,
                 total,
                 report: Box::new(r.clone()),
             });
-            reports.push(r);
+            reports[idx] = r;
             continue;
         }
-        let out = match output_path_for(&plan.out_root, &file.relative, extension) {
-            Ok(p) => p,
-            Err(e) => {
-                let r = FileReport::failed(file, None, format!("{e:#}"));
-                emit(BatchEvent::FileFinished {
-                    index: idx + 1,
-                    total,
-                    report: Box::new(r.clone()),
-                });
-                reports.push(r);
-                continue;
-            }
-        };
         emit(BatchEvent::FileStarted {
             index: idx + 1,
             total,
             input: file.input.clone(),
-            output: out.clone(),
+            output: pf.out.clone(),
         });
-        if out.exists() && !overwrite {
-            let r = FileReport::skipped(
-                file,
-                Some(out),
-                "результат уже существует — перезапись выключена",
-            );
-            emit(BatchEvent::FileFinished {
-                index: idx + 1,
-                total,
-                report: Box::new(r.clone()),
-            });
-            reports.push(r);
-            continue;
-        }
         let mut progress = |done: usize, chunks_total: usize| {
             emit(BatchEvent::FileProgress {
                 index: idx + 1,
@@ -796,31 +906,135 @@ where
                 chunks_total,
             });
         };
-        let report = synth(file, &out, cancel, &mut progress);
+        let report = synth(file, &pf.out, cancel, &mut progress);
         let was_cancel = report.status == FileStatus::Cancelled;
         emit(BatchEvent::FileFinished {
             index: idx + 1,
             total,
             report: Box::new(report.clone()),
         });
-        reports.push(report);
+        reports[idx] = report;
         if was_cancel || cancel.load(Ordering::SeqCst) {
             stopped = true;
         }
     }
+    // отмена до первого файла (preflight пометил всё Skipped) — пакет
+    // обязан остаться Cancelled, а не NoWork
+    let cancelled = stopped || cancel.load(Ordering::SeqCst);
+    assemble_report(
+        PreparedBatch {
+            reports,
+            to_synth: Vec::new(),
+            conflicts: prepared.conflicts,
+        },
+        cancelled,
+    )
+}
 
-    BatchReport {
-        files: reports,
-        conflicts: plan
-            .conflicts
-            .iter()
-            .map(|c| OutputConflict {
-                output: conflict_path_with_ext(&c.output, extension),
-                inputs: c.inputs.clone(),
-            })
-            .collect(),
-        cancelled: stopped,
+/// G6.1: параллельный раннер подготовленного пакета на ПОСТОЯННОМ пуле
+/// воркеров. Каждый воркер `slots` в собственном потоке берёт следующий файл
+/// из общей динамической очереди и обрабатывает его ЦЕЛИКОМ (`synth`).
+/// События файлов (Started/Progress/Finished) приходят из разных потоков
+/// вперемешку — приёмник обязан различать их по индексу файла.
+/// Отмена останавливает выдачу новых файлов; паника `synth` отравляет слот
+/// (Pocket не переиспользуется), файл получает Failed, остальные файлы
+/// разбирают живые воркеры.
+pub fn run_prepared_parallel<W, S>(
+    plan: &BatchPlan,
+    prepared: PreparedBatch,
+    cancel: &std::sync::Arc<AtomicBool>,
+    slots: Vec<app_core::persistent::WorkerSlot<W>>,
+    emit: &std::sync::Arc<dyn Fn(BatchEvent) + Send + Sync>,
+    synth: S,
+) -> BatchReport
+where
+    W: Send + 'static,
+    S: Fn(&PreparedFile, usize, &app_core::persistent::WorkerSlot<W>) -> FileReport
+        + Send
+        + Sync
+        + 'static,
+{
+    let total = plan.files.len();
+    let to_synth = std::sync::Arc::new(prepared.to_synth);
+    let conflicts = prepared.conflicts;
+    let mut reports = prepared.reports;
+    let to_synth_iter = std::sync::Arc::clone(&to_synth);
+
+    let n = to_synth.len();
+    let emit_q = std::sync::Arc::clone(emit);
+    let synth = std::sync::Arc::new(synth);
+    let job = move |file_pos: usize, wid: usize, slot: &app_core::persistent::WorkerSlot<W>| {
+        let pf = &to_synth[file_pos];
+        emit_q(BatchEvent::FileStarted {
+            index: pf.index + 1,
+            total,
+            input: pf.input.clone(),
+            output: pf.out.clone(),
+        });
+        let report = synth(pf, wid, slot);
+        emit_q(BatchEvent::FileFinished {
+            index: pf.index + 1,
+            total,
+            report: Box::new(report.clone()),
+        });
+        report
+    };
+    let mut outcome = app_core::persistent::run_dynamic_queue(slots, n, cancel, job);
+
+    for (wid, fp, msg) in &outcome.worker_fatal {
+        emit(BatchEvent::Log(format!(
+            "ВНИМАНИЕ: фатальный сбой воркера {wid} на файле {}: {msg}",
+            fp + 1
+        )));
     }
+    for (pos, pf) in to_synth_iter.iter().enumerate() {
+        let report = match outcome.results[pos].take() {
+            Some(r) => r,
+            None => {
+                // файл не был завершён: паника воркера на нём, отмена до
+                // выдачи или исчерпание живых воркеров
+                let file = &plan.files[pf.index];
+                let r = if let Some((_, _, msg)) =
+                    outcome.worker_fatal.iter().find(|(_, fp, _)| *fp == pos)
+                {
+                    FileReport::failed(
+                        file,
+                        Some(pf.out.clone()),
+                        format!("фатальный сбой воркера: {msg}"),
+                    )
+                } else if cancel.load(Ordering::SeqCst) {
+                    FileReport::skipped(file, Some(pf.out.clone()), "отменено до запуска")
+                } else {
+                    FileReport::skipped(
+                        file,
+                        Some(pf.out.clone()),
+                        "не запущено: воркеры пула завершились",
+                    )
+                };
+                // K/N-счётчик UI должен двигаться и на незапущенных файлах
+                emit(BatchEvent::FileFinished {
+                    index: pf.index + 1,
+                    total,
+                    report: Box::new(r.clone()),
+                });
+                r
+            }
+        };
+        reports[pf.index] = report;
+    }
+
+    let cancelled =
+        cancel.load(Ordering::SeqCst) || reports.iter().any(|r| r.status == FileStatus::Cancelled);
+    let mut report = assemble_report(
+        PreparedBatch {
+            reports,
+            to_synth: Vec::new(),
+            conflicts,
+        },
+        cancelled,
+    );
+    report.pool_workers = Some(outcome.claimed.len().max(1));
+    report
 }
 
 #[cfg(test)]
@@ -1440,5 +1654,230 @@ mod tests {
         let err = output_path_for(&out, Path::new("a.txt"), "wav").unwrap_err();
         assert!(format!("{err:#}").contains("перенаправления"), "{err:#}");
         assert_eq!(std::fs::read(&target).unwrap(), b"target");
+    }
+
+    // ===== G6.1: параллельный раннер на постоянном пуле (мок-воркеры) =====
+
+    use std::sync::atomic::AtomicBool as AB;
+    use std::sync::{Arc, Mutex};
+
+    /// Мок постоянного воркера: u8 «Pocket», переживает все файлы.
+    fn pool_slots(n: usize) -> Vec<app_core::persistent::WorkerSlot<u8>> {
+        (0..n as u8)
+            .map(|i| Arc::new(Mutex::new(Some(i))))
+            .collect()
+    }
+
+    /// Параллельный прогон 4 файлов на 2 воркерах: все файлы готовы, отчёт в
+    /// ИСХОДНОМ порядке плана, K/N событий корректны, оба слота пережили пакет.
+    #[test]
+    fn parallel_run_completes_in_plan_order() {
+        let d = tmpdir("par_ok");
+        let src = d.join("src");
+        write(&src.join("a.txt"), b"a");
+        write(&src.join("b.txt"), b"b");
+        write(&src.join("c.txt"), b"c");
+        write(&src.join("d.txt"), b"d");
+        let out = d.join("out");
+        let plan = plan_batch(&src, &out).unwrap();
+        let slots = pool_slots(2);
+        let slot_copies: Vec<_> = slots.iter().map(Arc::clone).collect();
+        let cancel = Arc::new(AB::new(false));
+        let emit: Arc<dyn Fn(BatchEvent) + Send + Sync> = Arc::new(|_| {});
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let started_c = Arc::clone(&started);
+        let report = run_prepared_parallel(
+            &plan,
+            preflight_batch(&plan, "wav", false, &cancel, &|_| {}),
+            &cancel,
+            slots,
+            &emit,
+            move |pf, _wid, _slot| {
+                started_c.lock().unwrap().push(pf.index);
+                if let Some(p) = pf.out.parent() {
+                    std::fs::create_dir_all(p).unwrap();
+                }
+                std::fs::write(&pf.out, b"mock").unwrap();
+                let mut r = FileReport::new(
+                    &BatchFile {
+                        input: pf.input.clone(),
+                        relative: pf.relative.clone(),
+                    },
+                    Some(pf.out.clone()),
+                );
+                r.status = FileStatus::Completed;
+                r
+            },
+        );
+        assert_eq!(
+            report.status(),
+            BatchStatus::Completed,
+            "{}",
+            report.summary()
+        );
+        assert_eq!(report.completed(), 4);
+        // отчёт в исходном порядке плана
+        let rels: Vec<String> = report
+            .files
+            .iter()
+            .map(|f| f.relative.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(rels, vec!["a.txt", "b.txt", "c.txt", "d.txt"]);
+        // каждый файл стартовал ровно один раз
+        let mut s = started.lock().unwrap().clone();
+        s.sort_unstable();
+        assert_eq!(s, vec![0, 1, 2, 3]);
+        // 4 файла на 2 слотах без пересоздания: воркеры переиспользованы;
+        // после пакета Pocket освобождены (слоты пусты — жизненный цикл G6.1)
+        assert!(
+            slot_copies.iter().all(|sl| sl.lock().unwrap().is_none()),
+            "Pocket освобождены после пакета"
+        );
+        assert_eq!(report.pool_workers, Some(2));
+        assert!(
+            report.pool_loads.is_none(),
+            "pool_loads ставит вызывающий (job.rs)"
+        );
+    }
+
+    /// Отмена параллельного пакета: незапущенные файлы — Skipped «отменено
+    /// до запуска», готовые до отмены — Completed, статус Cancelled.
+    #[test]
+    fn parallel_run_cancel_marks_remaining_skipped() {
+        let d = tmpdir("par_cancel");
+        let src = d.join("src");
+        for i in 0..4 {
+            write(&src.join(format!("{i}.txt")), b"x");
+        }
+        let plan = plan_batch(&src, &d.join("out")).unwrap();
+        let slots = pool_slots(2);
+        let cancel = Arc::new(AB::new(false));
+        let cancel_synth = Arc::clone(&cancel);
+        let emit: Arc<dyn Fn(BatchEvent) + Send + Sync> = Arc::new(|_| {});
+        let report = run_prepared_parallel(
+            &plan,
+            preflight_batch(&plan, "wav", false, &cancel, &|_| {}),
+            &cancel,
+            slots,
+            &emit,
+            move |pf, _wid, _slot| {
+                // отмена после первого готового файла
+                cancel_synth.store(true, Ordering::SeqCst);
+                let mut r = FileReport::new(
+                    &BatchFile {
+                        input: pf.input.clone(),
+                        relative: pf.relative.clone(),
+                    },
+                    Some(pf.out.clone()),
+                );
+                r.status = FileStatus::Completed;
+                r
+            },
+        );
+        assert_eq!(
+            report.status(),
+            BatchStatus::Cancelled,
+            "{}",
+            report.summary()
+        );
+        assert!(report.cancelled);
+        assert!(report.completed() >= 1, "готовое до отмены сохранено");
+        assert!(report.skipped() >= 1, "незапущенное помечено Skipped");
+        assert!(report
+            .files
+            .iter()
+            .filter(|f| f.status == FileStatus::Skipped)
+            .all(|f| f.reason.as_deref() == Some("отменено до запуска")));
+    }
+
+    /// Паника synth в воркере: файл — Failed с диагнозом, очередь доделывают
+    /// живые воркеры, слот паниковавшего отравлен (Pocket не переиспользуется).
+    #[test]
+    fn parallel_run_panic_fails_file_poisons_slot() {
+        let d = tmpdir("par_panic");
+        let src = d.join("src");
+        for i in 0..3 {
+            write(&src.join(format!("{i}.txt")), b"x");
+        }
+        let plan = plan_batch(&src, &d.join("out")).unwrap();
+        let slots = pool_slots(2);
+        let slot_copies: Vec<_> = slots.iter().map(Arc::clone).collect();
+        let cancel = Arc::new(AB::new(false));
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let logs_c = Arc::clone(&logs);
+        let emit: Arc<dyn Fn(BatchEvent) + Send + Sync> = Arc::new(move |ev| {
+            if let BatchEvent::Log(l) = ev {
+                logs_c.lock().unwrap().push(l);
+            }
+        });
+        let report = run_prepared_parallel(
+            &plan,
+            preflight_batch(&plan, "wav", false, &cancel, &|_| {}),
+            &cancel,
+            slots,
+            &emit,
+            move |pf, _wid, _slot| {
+                if pf.relative.to_string_lossy().contains('1') {
+                    panic!("мок-паника воркера");
+                }
+                let mut r = FileReport::new(
+                    &BatchFile {
+                        input: pf.input.clone(),
+                        relative: pf.relative.clone(),
+                    },
+                    Some(pf.out.clone()),
+                );
+                r.status = FileStatus::Completed;
+                r
+            },
+        );
+        // паниковавший файл — Failed с текстом паники; остальные — готово
+        let failed: Vec<&FileReport> = report
+            .files
+            .iter()
+            .filter(|f| f.status == FileStatus::Failed)
+            .collect();
+        assert_eq!(failed.len(), 1, "{}", report.summary());
+        assert!(failed[0].reason.as_deref().unwrap().contains("мок-паника"));
+        assert_eq!(report.completed(), 2);
+        assert_eq!(report.status(), BatchStatus::Partial);
+        assert!(
+            slot_copies.iter().any(|s| s.lock().unwrap().is_none()),
+            "слот паниковавшего отравлен"
+        );
+        assert!(logs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("фатальный сбой")));
+    }
+
+    /// Preflight исключает конфликты/существующие результаты из to_synth
+    /// ДО запуска воркеров (мок-пул их не получает вовсе).
+    #[test]
+    fn parallel_preflight_excludes_conflicts_and_existing() {
+        let d = tmpdir("par_pre");
+        let src = d.join("src");
+        write(&src.join("chapter.txt"), b"a");
+        write(&src.join("chapter.md"), b"b");
+        write(&src.join("c.txt"), b"c");
+        let out = d.join("out");
+        write(&out.join("c.wav"), b"already");
+        let plan = plan_batch(&src, &out).unwrap();
+        let cancel = AB::new(false);
+        let prepared = preflight_batch(&plan, "wav", false, &cancel, &|_| {});
+        assert_eq!(
+            prepared.to_synth.len(),
+            0,
+            "конфликт и существующий исключены"
+        );
+        assert_eq!(prepared.reports.len(), 3);
+        assert_eq!(
+            count_actionable(&plan, "wav", false),
+            0,
+            "count_actionable согласован с preflight"
+        );
+        // с overwrite существующий снова кандидат
+        assert_eq!(count_actionable(&plan, "wav", true), 1);
     }
 }

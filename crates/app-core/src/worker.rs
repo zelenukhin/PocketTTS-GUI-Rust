@@ -21,6 +21,17 @@ pub struct RealWorker {
     denoise_missing: bool,
 }
 
+impl RealWorker {
+    /// G6.1: per-file seed на ПОСТОЯННОМ Pocket. `Pocket::say_chunk`
+    /// пересеивает RNG как `seed + chunk_index` на каждый вызов, поэтому
+    /// установка поля перед первым чанком файла даёт поток, идентичный
+    /// свежему Pocket, загруженному с этим seed (побитовый паритет
+    /// переиспользования Pocket доказан P2B.2 §11; см. persistent.rs).
+    pub fn set_seed(&mut self, seed: u64) {
+        self.engine.seed = Some(seed);
+    }
+}
+
 /// Параметры генерации, снимаемые с `PipelineOptions` на КАЖДЫЙ экземпляр
 /// Pocket (G4.1): воркеры одного задания получают идентичные значения.
 /// Выделено в структуру для регрессионного теста без ONNX — сам Pocket

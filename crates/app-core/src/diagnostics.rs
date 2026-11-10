@@ -104,6 +104,27 @@ pub fn gpu_total_used_mb() -> Option<f64> {
     text.lines().next()?.trim().parse::<f64>().ok()
 }
 
+/// Свободная VRAM указанного GPU (МБ); None — nvidia-smi недоступен.
+/// Используется ТОЛЬКО как префлайт перед созданием N-го CUDA-воркера
+/// (G6.1): недостаток памяти — не абсолютная защита от OOM, а способ
+/// заранее выбрать экономную конфигурацию с понятной записью в журнале.
+pub fn gpu_free_mb(device_id: i32) -> Option<f64> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=memory.free",
+            "--format=csv,noheader,nounits",
+            "-i",
+            &device_id.to_string(),
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines().next()?.trim().parse::<f64>().ok()
+}
+
 pub fn pid() -> u32 {
     std::process::id()
 }

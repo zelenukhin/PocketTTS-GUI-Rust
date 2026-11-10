@@ -4,6 +4,7 @@
 //! следующий этап (см. docs/NEXT_STEPS.md).
 
 pub mod diagnostics;
+pub mod persistent;
 pub mod pipeline;
 pub mod pool;
 pub mod settings;

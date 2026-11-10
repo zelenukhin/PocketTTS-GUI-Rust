@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use crate::batch::FileStatus;
 use crate::job::{JobEvent, JobPhase, JobStatus};
 use crate::settings::{
     load_settings, save_settings, settings_path, DeviceChoice, GuiSettings, ModelChoice,
@@ -41,6 +42,36 @@ const EOS_TAIL_TOOLTIP: &str = "N передаётся движку напрям
     ни одного (кадр срабатывания отбрасывается). None — штатная политика \
     движка: 5 для чанков ≤4 слов и 3 для остальных.";
 
+/// G6.1: активный файл пакета в модели UI. События нескольких параллельных
+/// файлов приходят вперемешку — состояние каждого tracked по индексу K.
+#[derive(Debug, Clone)]
+struct ActiveFileUi {
+    /// K файла (1-based, соответствует JobEvent::File*).
+    index: usize,
+    /// Имя входного файла (короткое, для строки прогресса).
+    name: String,
+    done: usize,
+    total: usize,
+    phase: JobPhase,
+}
+
+/// G6.1: состояние пакетного задания. Итоговое состояние пакета определяется
+/// РЕАЛЬНЫМИ результатами всех файлов (счётчики), а не последним событием.
+#[derive(Debug, Default)]
+struct BatchUiState {
+    total: usize,
+    /// Файлов обрабатывается одновременно (постоянных воркеров пула).
+    workers: usize,
+    /// Завершено файлов (любым статусом) — K из N.
+    finished: usize,
+    completed: usize,
+    failed: usize,
+    skipped: usize,
+    cancelled: usize,
+    /// Активные файлы (не более `workers`).
+    active: Vec<ActiveFileUi>,
+}
+
 pub struct ShtormApp {
     pub settings: GuiSettings,
     log: String,
@@ -55,8 +86,11 @@ pub struct ShtormApp {
     file_progress: (usize, usize),
     /// Текущее задание — пакетное (для отображения прогресса по файлам).
     batch_running: bool,
+    /// G6.1: состояние пакетного задания (per-file модель параллельного пула).
+    batch_state: Option<BatchUiState>,
     /// G5.1: задание перешло фазу Finalizing/Publishing — публикация уже
     /// необратима, «Стоп» отключается (он не может предотвратить замену).
+    /// В пакетном режиме семантика per-file (см. stop_available).
     publishing: bool,
     /// Пользователь закрыл окно при живом задании: отменяем и закрываем сами,
     /// когда поток завершится (без сиротских ffmpeg).
@@ -122,6 +156,7 @@ impl ShtormApp {
             progress: (0, 0),
             file_progress: (0, 0),
             batch_running: false,
+            batch_state: None,
             publishing: false,
             close_pending: false,
             ffmpeg_check_key: None,
@@ -148,7 +183,16 @@ impl ShtormApp {
             crate::job::derive_out_path(&s)
         };
         let (tx, rx) = std::sync::mpsc::channel::<JobEvent>();
+        // G6.1: события приходят из НЕСКОЛЬКИХ потоков воркеров пула —
+        // Sender обёрнут в Mutex (Sync), emit — разделяемый Arc
+        let tx = Arc::new(std::sync::Mutex::new(tx));
         let ctx2 = ctx.clone();
+        let emit: Arc<dyn Fn(JobEvent) + Send + Sync> = Arc::new(move |ev: JobEvent| {
+            if let Ok(tx) = tx.lock() {
+                let _ = tx.send(ev);
+            }
+            ctx2.request_repaint();
+        });
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel2 = Arc::clone(&cancel);
         // относительный путь источника — от каталога exe, не от CWD
@@ -158,10 +202,7 @@ impl ShtormApp {
             .spawn(move || {
                 let result = if batch {
                     let source = text_file.clone();
-                    crate::job::execute_batch(&s, &source, &cancel2, &|ev| {
-                        let _ = tx.send(ev);
-                        ctx2.request_repaint();
-                    })
+                    crate::job::execute_batch(&s, &source, &cancel2, &emit)
                 } else {
                     let text = match std::fs::read_to_string(&text_file) {
                         Ok(t) => t,
@@ -170,9 +211,8 @@ impl ShtormApp {
                                 "прочитать текстовый файл {}: {e}",
                                 text_file.display()
                             ));
-                            let _ = tx.send(JobEvent::Log(r.summary.clone()));
-                            let _ = tx.send(JobEvent::Finished(Box::new(r)));
-                            ctx2.request_repaint();
+                            emit(JobEvent::Log(r.summary.clone()));
+                            emit(JobEvent::Finished(Box::new(r)));
                             return;
                         }
                     };
@@ -181,13 +221,10 @@ impl ShtormApp {
                         text,
                         out_path,
                     };
-                    crate::job::execute_job(&cfg, &cancel2, &|ev| {
-                        let _ = tx.send(ev);
-                        ctx2.request_repaint();
-                    })
+                    let emit_j = Arc::clone(&emit);
+                    crate::job::execute_job(&cfg, &cancel2, &move |ev| emit_j(ev))
                 };
-                let _ = tx.send(JobEvent::Finished(Box::new(result)));
-                ctx2.request_repaint();
+                emit(JobEvent::Finished(Box::new(result)));
             })
             .expect("spawn synth thread");
         self.job = Some(JobHandle {
@@ -198,6 +235,7 @@ impl ShtormApp {
         self.progress = (0, 0);
         self.file_progress = (0, 0);
         self.batch_running = batch;
+        self.batch_state = None;
         self.publishing = false;
         self.status = "задание запущено…".into();
     }
@@ -229,30 +267,89 @@ impl ShtormApp {
                     }
                 }
             }
+            JobEvent::BatchStarted { total, workers } => {
+                self.batch_state = Some(BatchUiState {
+                    total,
+                    workers,
+                    ..Default::default()
+                });
+                self.refresh_batch_status();
+            }
+            JobEvent::FileStarted {
+                index,
+                total,
+                input,
+                output: _,
+            } => {
+                if let Some(bs) = self.batch_state.as_mut() {
+                    bs.total = total;
+                    if !bs.active.iter().any(|f| f.index == index) {
+                        bs.active.push(ActiveFileUi {
+                            index,
+                            name: input
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_default(),
+                            done: 0,
+                            total: 0,
+                            phase: JobPhase::Generating,
+                        });
+                    }
+                }
+                self.refresh_batch_status();
+            }
             JobEvent::FileProgress {
                 index,
                 total,
                 done,
                 chunks_total,
             } => {
+                // per-file прогресс: события разных файлов вперемешку
                 self.file_progress = (index, total);
                 self.progress = (done, chunks_total);
-                self.status = format!("файл {index}/{total}: {done}/{chunks_total} чанков");
+                if let Some(bs) = self.batch_state.as_mut() {
+                    bs.total = total;
+                    if let Some(f) = bs.active.iter_mut().find(|f| f.index == index) {
+                        f.done = done;
+                        f.total = chunks_total;
+                    }
+                }
+                self.refresh_batch_status();
+            }
+            JobEvent::FilePhase { index, phase } => {
+                // фаза КОНКРЕТНОГО файла: публикация этого файла уже
+                // необратима, но другие активные файлы ещё отменяемы
+                if let Some(bs) = self.batch_state.as_mut() {
+                    if let Some(f) = bs.active.iter_mut().find(|f| f.index == index) {
+                        f.phase = phase;
+                    }
+                }
+                self.refresh_batch_status();
             }
             JobEvent::FileDone {
                 index,
                 total,
                 report,
             } => {
-                // K/N обновляется на КАЖДОМ завершённом файле, включая
-                // Failed/Skipped, — иначе прогресс пакета «замирает».
-                // Публикация этого файла закончилась: между файлами пакета
-                // «Стоп» снова доступен (отменит ДО старта следующего).
+                // K/N и счётчики обновляются на КАЖДОМ завершённом файле,
+                // включая Failed/Skipped; итог пакета считается по реальным
+                // результатам всех файлов, а не последнему событию.
+                if let Some(bs) = self.batch_state.as_mut() {
+                    bs.total = total;
+                    bs.active.retain(|f| f.index != index);
+                    bs.finished += 1;
+                    match report.status {
+                        FileStatus::Completed => bs.completed += 1,
+                        FileStatus::Failed => bs.failed += 1,
+                        FileStatus::Skipped => bs.skipped += 1,
+                        FileStatus::Cancelled => bs.cancelled += 1,
+                    }
+                }
                 self.publishing = false;
                 self.file_progress = (index, total);
                 self.progress = (report.chunks_done, report.chunks_total);
-                self.status = format!("файл {index}/{total}: {}", report.status.label());
                 self.push_log(&report.line());
+                self.refresh_batch_status();
             }
             JobEvent::Log(line) => self.push_log(&line),
             JobEvent::Finished(res) => {
@@ -267,6 +364,37 @@ impl ShtormApp {
                 self.push_log(&res.summary);
             }
         }
+    }
+
+    /// Строка статуса пакетного режима из счётчиков per-file модели.
+    fn refresh_batch_status(&mut self) {
+        let Some(bs) = &self.batch_state else { return };
+        if !self.batch_running {
+            return;
+        }
+        let mut s = format!(
+            "пакет: {}/{} файлов (готово {} | ошибок {} | пропущено {})",
+            bs.finished, bs.total, bs.completed, bs.failed, bs.skipped
+        );
+        if bs.cancelled > 0 {
+            s.push_str(&format!(" | отменено {}", bs.cancelled));
+        }
+        s.push_str(&format!("; одновременно {}", bs.workers));
+        self.status = s;
+    }
+
+    /// G6.1: доступность «Стоп». В пакете кнопка доступна, пока хотя бы один
+    /// активный файл находится в генерации (файлы, перешедшие точку
+    /// публикации, дорабатывают сами); между файлами — доступна. Одиночный
+    /// режим — прежняя семантика G5.1 (фазы одного файла).
+    fn stop_available(&self) -> bool {
+        if self.batch_running {
+            if let Some(bs) = &self.batch_state {
+                return bs.active.is_empty()
+                    || bs.active.iter().any(|f| f.phase == JobPhase::Generating);
+            }
+        }
+        !self.publishing
     }
 
     /// Дренаж событий задания + завершение потока (вызывается каждый кадр).
@@ -460,12 +588,12 @@ impl eframe::App for ShtormApp {
                     self.start_job(ctx);
                 }
                 if job_running {
-                    // G5.1: после точки решения о публикации (фазы
-                    // Finalizing/Publishing) «Стоп» уже не может
-                    // предотвратить замену файла — кнопка отключается и
-                    // статус честно показывает сохранение результата.
+                    // G5.1/G6.1: «Стоп» отключается, только когда отменять
+                    // нечего — в пакете все активные файлы уже в фазах
+                    // Finalizing/Publishing (их публикация необратима),
+                    // в одиночном режиме — после точки решения.
                     let stop = ui
-                        .add_enabled(!self.publishing, egui::Button::new("Стоп"))
+                        .add_enabled(self.stop_available(), egui::Button::new("Стоп"))
                         .on_disabled_hover_text(
                             "идёт сохранение результата — отмена уже не может предотвратить \
                              замену файла; кнопка вернётся после завершения",
@@ -508,18 +636,34 @@ impl eframe::App for ShtormApp {
                     );
                 }
             }
-            // Пакетный режим: ОТДЕЛЬНО прогресс по файлам K/N и по чанкам
-            // текущего файла; одиночный — один бар по чанкам.
-            if self.batch_running && self.file_progress.1 > 0 {
-                let (fi, ft) = self.file_progress;
-                let frac = if ft > 0 { fi as f32 / ft as f32 } else { 0.0 };
-                ui.add(
-                    egui::ProgressBar::new(frac)
-                        .text(format!("файл {fi}/{ft}"))
-                        .show_percentage(),
-                );
-            }
-            if self.job.is_some() || self.progress.1 > 0 {
+            // Пакетный режим (G6.1): общий прогресс по файлам K/N + активные
+            // файлы пула (каждый со своим прогрессом чанков и фазой);
+            // одиночный режим — один бар по чанкам.
+            if self.batch_running {
+                if let Some(bs) = &self.batch_state {
+                    if bs.total > 0 {
+                        let frac = bs.finished as f32 / bs.total as f32;
+                        ui.add(
+                            egui::ProgressBar::new(frac)
+                                .text(format!(
+                                    "файлы {}/{} (готово {} | ошибок {} | пропущено {})",
+                                    bs.finished, bs.total, bs.completed, bs.failed, bs.skipped
+                                ))
+                                .show_percentage(),
+                        );
+                        for f in &bs.active {
+                            let phase = match f.phase {
+                                JobPhase::Generating => "генерация",
+                                JobPhase::Finalizing | JobPhase::Publishing => "сохранение",
+                            };
+                            ui.label(format!(
+                                "  [{}/{}] {} — чанки {}/{} ({})",
+                                f.index, bs.total, f.name, f.done, f.total, phase
+                            ));
+                        }
+                    }
+                }
+            } else if self.job.is_some() || self.progress.1 > 0 {
                 let (done, total) = self.progress;
                 let frac = if total > 0 {
                     done as f32 / total as f32
@@ -528,11 +672,7 @@ impl eframe::App for ShtormApp {
                 };
                 ui.add(
                     egui::ProgressBar::new(frac)
-                        .text(if self.batch_running {
-                            format!("чанки текущего файла: {done}/{total}")
-                        } else {
-                            format!("{done}/{total} чанков")
-                        })
+                        .text(format!("{done}/{total} чанков"))
                         .show_percentage(),
                 );
             }
@@ -1121,11 +1261,22 @@ mod tests {
         );
     }
 
-    /// Пакетные события: K/N файлов и отдельно чанки текущего файла.
+    /// Пакетные события: K/N файлов, счётчики и отдельно чанки активных
+    /// файлов (G6.1: состояние per-file, не «последний пришедший»).
     #[test]
     fn batch_events_update_ui_state() {
         let mut app = ShtormApp::new();
         app.batch_running = true;
+        app.apply_event(crate::job::JobEvent::BatchStarted {
+            total: 5,
+            workers: 1,
+        });
+        app.apply_event(crate::job::JobEvent::FileStarted {
+            index: 2,
+            total: 5,
+            input: PathBuf::from("C:/src/sub/a.txt"),
+            output: PathBuf::from("C:/out/sub/a.wav"),
+        });
         app.apply_event(crate::job::JobEvent::FileProgress {
             index: 2,
             total: 5,
@@ -1134,7 +1285,11 @@ mod tests {
         });
         assert_eq!(app.file_progress, (2, 5));
         assert_eq!(app.progress, (1, 4));
-        assert!(app.status.contains("файл 2/5"), "{}", app.status);
+        let bs = app.batch_state.as_ref().expect("состояние пакета");
+        assert_eq!(bs.finished, 0);
+        assert_eq!(bs.active.len(), 1);
+        assert_eq!(bs.active[0].done, 1, "прогресс чанков файла 2");
+        assert_eq!(bs.active[0].total, 4);
 
         let mut report = crate::batch::FileReport::new(
             &crate::batch::BatchFile {
@@ -1149,8 +1304,115 @@ mod tests {
             total: 5,
             report: Box::new(report),
         });
-        assert!(app.status.contains("файл 2/5"), "{}", app.status);
+        let bs = app.batch_state.as_ref().expect("состояние пакета");
+        assert_eq!(bs.finished, 1, "K/N двигается на Completed");
+        assert!(bs.active.is_empty(), "файл покинул активные");
+        assert_eq!(bs.completed, 1);
+        assert!(app.status.contains("1/5"), "{}", app.status);
         assert!(app.log.contains("sub/a.txt") && app.log.contains("sub/a.wav"));
+    }
+
+    /// G6.1: параллельные файлы — события приходят ВПЕРЕМЕШКУ, состояние
+    /// каждого файла независимо; завершение в другом порядке не путает
+    /// счётчики; итог считается по всем файлам.
+    #[test]
+    fn parallel_batch_interleaved_events_keep_per_file_state() {
+        let mut app = ShtormApp::new();
+        app.batch_running = true;
+        app.apply_event(crate::job::JobEvent::BatchStarted {
+            total: 3,
+            workers: 2,
+        });
+        // стартовали файлы 1 и 2 (параллельно)
+        for k in [1, 2] {
+            app.apply_event(crate::job::JobEvent::FileStarted {
+                index: k,
+                total: 3,
+                input: PathBuf::from(format!("C:/src/f{k}.txt")),
+                output: PathBuf::from(format!("C:/out/f{k}.wav")),
+            });
+        }
+        // прогресс вперемешку: файл 2 опережает файл 1
+        for (k, done) in [(2, 1), (2, 2), (1, 1)] {
+            app.apply_event(crate::job::JobEvent::FileProgress {
+                index: k,
+                total: 3,
+                done,
+                chunks_total: 5,
+            });
+        }
+        {
+            let bs = app.batch_state.as_ref().unwrap();
+            let f1 = bs.active.iter().find(|f| f.index == 1).unwrap();
+            let f2 = bs.active.iter().find(|f| f.index == 2).unwrap();
+            assert_eq!(
+                (f1.done, f1.total),
+                (1, 5),
+                "файл 1 не перезаписан файлом 2"
+            );
+            assert_eq!(
+                (f2.done, f2.total),
+                (2, 5),
+                "файл 2 не перезаписан файлом 1"
+            );
+        }
+        // фазы вперемешку: файл 2 ушёл в публикацию, файл 1 генерируется
+        app.apply_event(crate::job::JobEvent::FilePhase {
+            index: 2,
+            phase: JobPhase::Publishing,
+        });
+        assert!(app.stop_available(), "файл 1 ещё отменяем — Стоп доступен");
+        app.apply_event(crate::job::JobEvent::FilePhase {
+            index: 1,
+            phase: JobPhase::Finalizing,
+        });
+        assert!(
+            !app.stop_available(),
+            "все активные файлы в фазах сохранения — Стоп отключён"
+        );
+        // завершение в обратном порядке: файл 2 готов, файл 1 отменён
+        let done2 = {
+            let mut r = crate::batch::FileReport::new(
+                &crate::batch::BatchFile {
+                    input: PathBuf::from("C:/src/f2.txt"),
+                    relative: PathBuf::from("f2.txt"),
+                },
+                Some(PathBuf::from("C:/out/f2.wav")),
+            );
+            r.status = crate::batch::FileStatus::Completed;
+            r
+        };
+        app.apply_event(crate::job::JobEvent::FileDone {
+            index: 2,
+            total: 3,
+            report: Box::new(done2),
+        });
+        // файл 1 всё ещё в Finalizing → отмена ничего не может — Стоп недоступен
+        assert!(!app.stop_available());
+        let done1 = {
+            let mut r = crate::batch::FileReport::new(
+                &crate::batch::BatchFile {
+                    input: PathBuf::from("C:/src/f1.txt"),
+                    relative: PathBuf::from("f1.txt"),
+                },
+                Some(PathBuf::from("C:/out/f1.wav")),
+            );
+            r.status = crate::batch::FileStatus::Cancelled;
+            r
+        };
+        app.apply_event(crate::job::JobEvent::FileDone {
+            index: 1,
+            total: 3,
+            report: Box::new(done1),
+        });
+        let bs = app.batch_state.as_ref().unwrap();
+        assert_eq!(bs.finished, 2);
+        assert_eq!((bs.completed, bs.cancelled), (1, 1));
+        assert!(bs.active.is_empty());
+        assert!(
+            app.stop_available(),
+            "активных файлов нет — Стоп (между файлами)"
+        );
     }
 
     /// G3.1: K/N обновляется на Failed/Skipped, а частичный успех и пустой
@@ -1159,10 +1421,20 @@ mod tests {
     fn batch_failed_skipped_and_partial_states() {
         let mut app = ShtormApp::new();
         app.batch_running = true;
+        app.apply_event(crate::job::JobEvent::BatchStarted {
+            total: 5,
+            workers: 1,
+        });
         let file = crate::batch::BatchFile {
             input: PathBuf::from("C:/src/b.txt"),
             relative: PathBuf::from("b.txt"),
         };
+        app.apply_event(crate::job::JobEvent::FileStarted {
+            index: 2,
+            total: 5,
+            input: file.input.clone(),
+            output: PathBuf::from("C:/out/b.wav"),
+        });
         let mut failed = crate::batch::FileReport::failed(&file, None, "мок-сбой");
         failed.chunks_done = 1;
         failed.chunks_total = 3;
@@ -1173,7 +1445,9 @@ mod tests {
         });
         assert_eq!(app.file_progress, (2, 5), "K/N обновился на Failed");
         assert_eq!(app.progress, (1, 3));
-        assert!(app.status.contains("ошибка"), "{}", app.status);
+        let bs = app.batch_state.as_ref().unwrap();
+        assert_eq!(bs.failed, 1);
+        assert!(app.status.contains("ошибок 1"), "{}", app.status);
 
         let skipped = crate::batch::FileReport::skipped(&file, None, "конфликт");
         app.apply_event(crate::job::JobEvent::FileDone {

@@ -625,6 +625,39 @@ where
     )
 }
 
+/// G6.1: потоковый конвейер ОДНОГО файла пакета на внешнем (постоянном)
+/// воркере. Фабрика вызывается ровно один раз (`workers = 1`): файл целиком
+/// обрабатывает один Pocket постоянного пула, который переживает файл.
+/// `factory(worker_id, base_seed)` получает base_seed, разрешённый из
+/// `opts.seed` на ЭТОТ файл (как в пути «модель на файл»), — постоянный пул
+/// обязан установить его на движок перед первым чанком
+/// (см. `persistent::loaned_real_worker_factory`).
+pub fn synthesize_stream_with_worker_factory<W, FacW, F>(
+    raw_text: &str,
+    opts: &PipelineOptions,
+    sink: Box<dyn AudioSink>,
+    progress: F,
+    cancel: &AtomicBool,
+    phase: &dyn Fn(RunPhase),
+    factory: FacW,
+) -> Result<StreamOutcome>
+where
+    W: crate::pool::ChunkWorker + 'static,
+    FacW: Fn(usize, u64) -> anyhow::Result<W> + Send + Sync + 'static,
+    F: FnMut(usize, usize),
+{
+    synthesize_stream_impl(
+        raw_text,
+        opts,
+        1,
+        sink,
+        progress,
+        cancel,
+        phase,
+        move |_seed| factory,
+    )
+}
+
 /// Реализация с инъекцией фабрики воркеров: публичная обёртка всегда берёт
 /// `real_worker_factory`; тесты подставляют мок и проверяют аварийный путь
 /// целиком (run_job → StreamError с реальным прогрессом/seed/черновиком).

@@ -44,14 +44,21 @@ GUI для Pocket-TTS на Rust. Оперативное состояние — *
   точкой решения о публикации — отмена до неё не публикует, после неё
   конвейер доходит до конца; RunStatus/StreamError (с `publish_failed`)/
   DiagMeta/write_diag_log, `write_chunk_log`/`log_path_for` — общий журнал
-  чанков CLI и GUI), `pool.rs` (N воркеров, скользящее окно backpressure,
-  catch_unwind, строгий порядок, отмена), `worker.rs` (RealWorker:
-  Pocket+DSP на воркер, base_seed), `sink.rs` (AudioSink: `finish()` +
+  чанков CLI и GUI; G6.1 `synthesize_stream_with_worker_factory` — файл
+  целиком на внешнем Pocket), `pool.rs` (N воркеров, скользящее окно
+  backpressure, catch_unwind, строгий порядок, отмена), `persistent.rs`
+  (G6.1: постоянный пул для пакетов — слоты, одалживание `Loaned` с
+  per-file seed, параллельный `spawn_workers`, динамическая очередь
+  `run_dynamic_queue`, отравление слота при сбое движка), `worker.rs`
+  (RealWorker: Pocket+DSP на воркер, base_seed, G6.1 `set_seed`),
+  `sink.rs` (AudioSink: `finish()` +
   `FinalizedSink::publish()`; WavSink/FfmpegSink — writer-поток stdin,
   wait_with_timeout, kill только своего child), `trace_dir.rs` (уникальные
-  каталоги трасс, только создание), `diagnostics.rs`, `settings.rs`
+  каталоги трасс, только создание), `diagnostics.rs` (память/VRAM; G6.1
+  `gpu_free_mb` — префлайт), `settings.rs`
   (SynthSettings — имена полей Python GUI), бинари `bin/{smoke,bench,
-  ep_probe,synthesize}.rs` (CLI — тестовый инструмент; GUI не должен их
+  ep_probe,synthesize,diag_p2b2,diag_p2b3}.rs` (CLI/диагностика —
+  тестовый инструмент; GUI не должен их
   запускать, а звать app-core напрямую).
 - `crates/gui` — eframe/egui 0.31: `settings.rs` (GuiSettings, round-trip
   unknown keys, атомарная запись tmp create_new + MoveFileExW; G5 — без

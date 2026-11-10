@@ -113,7 +113,7 @@ pub struct JobSummary {
     pub cancelled: bool,
 }
 
-fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
+pub(crate) fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = p.downcast_ref::<&str>() {
         (*s).to_string()
     } else if let Some(s) = p.downcast_ref::<String>() {
@@ -265,7 +265,9 @@ where
                     let _ = tx.send(WorkerMsg::Failed {
                         index: None,
                         worker_id: wid,
-                        error: format!("паника фабрики воркера {wid}: {}", panic_text(&p)),
+                        // p.as_ref(): прямой &p ансайзит Box и даёт TypeId Box —
+                        // текст паники терялся (латентный дефект A4, найден G6.1)
+                        error: format!("паника фабрики воркера {wid}: {}", panic_text(p.as_ref())),
                     });
                     return;
                 }
@@ -319,7 +321,7 @@ where
                         let _ = tx.send(WorkerMsg::Failed {
                             index: Some(task.index),
                             worker_id: wid,
-                            error: format!("паника воркера {wid}: {}", panic_text(&p)),
+                            error: format!("паника воркера {wid}: {}", panic_text(p.as_ref())),
                         });
                         break;
                     }
@@ -740,9 +742,17 @@ mod tests {
     #[test]
     fn random_seed_resolved_once_and_reported() {
         let s1 = SeedPolicy::Random.resolve();
-        let s2 = SeedPolicy::Random.resolve();
+        let mut s2 = SeedPolicy::Random.resolve();
         assert!(s1 >= 1 && s2 >= 1);
-        // коллизия наносекунд на одной машине практически исключена
+        // На Windows таймер может давать одинаковые наносекунды подряд
+        // (release-сборка успевает в один тик) — ждём реального изменения
+        // времени; обычно достаточно 0–2 итераций.
+        for _ in 0..10_000 {
+            if s1 != s2 {
+                break;
+            }
+            s2 = SeedPolicy::Random.resolve();
+        }
         assert_ne!(s1, s2, "случайные seed различаются");
     }
 
