@@ -12,7 +12,9 @@
 //! - опции (`--device`, `--format`, `--hold-ms`) допустимы ТОЛЬКО вместе с
 //!   диагностической командой и требуют корректного значения;
 //! - любой неизвестный/лишний/повторный аргумент, отсутствующее значение
-//!   параметра или несовместимые команды — диагностическая ошибка: сообщение
+//!   параметра, несовместимые команды или ПОВТОР ОПЦИИ (G6.1.2: повторный
+//!   `--device`/`--format`/`--hold-ms` — ошибка независимо от совпадения
+//!   значений) — диагностическая ошибка: сообщение
 //!   в stderr, подсказка `--help`, код выхода 2, окно НЕ открывается.
 //!
 //! Пути со пробелами/Unicode в аргументах не участвуют (диагностические
@@ -54,7 +56,8 @@ pub fn usage_text() -> String {
      \x20 --portable-selftest-batch   headless-пакет из двух файлов\n\
      \x20 --portable-selftest-cancel  headless-проверка отмены и повторного запуска\n\
      \x20 --help | -h                 эта справка (окно не открывается)\n\
-     Опции диагностических режимов (только вместе с командой выше):\n\
+     Опции диагностических режимов (только вместе с командой выше,\n\
+     каждая опция — ровно один раз):\n\
      \x20 --device cpu|cuda           устройство синтеза\n\
      \x20 --format wav|mp3|opus       формат вывода\n\
      \x20 --hold-ms <мс>              задержка перед выходом (неотрицательное целое)\n"
@@ -68,6 +71,10 @@ pub fn usage_text() -> String {
 pub fn parse_cli_args(args: &[String]) -> Result<CliCommand, String> {
     let mut command: Option<CliCommand> = None;
     let mut saw_option = false;
+    // G6.1.2: повтор опции — ошибка независимо от совпадения значений
+    // (прежде `--device cpu --device cuda` проходили парсер, а
+    // `apply_overrides` молча брал первое значение).
+    let mut seen = SeenOptions::default();
     let mut i = 0usize;
     while i < args.len() {
         let arg = args[i].as_str();
@@ -81,6 +88,11 @@ pub fn parse_cli_args(args: &[String]) -> Result<CliCommand, String> {
                 // значение обязательно; значение-опция — ошибка (не принимать
                 // ошибочное значение за самостоятельную опцию)
                 saw_option = true;
+                if seen.mark(arg) {
+                    return Err(format!(
+                        "параметр {arg} указан дважды — каждая опция допускается один раз"
+                    ));
+                }
                 let value = args.get(i + 1).ok_or_else(|| {
                     format!("отсутствует значение параметра {arg} (после него ничего нет)")
                 })?;
@@ -162,6 +174,27 @@ fn validate_option_value(key: &str, value: &str) -> Result<(), String> {
     }
 }
 
+/// G6.1.2: учёт уже встреченных опций. `mark(key)` возвращает true, если ключ
+/// был встречен РАНЕЕ (повтор — ошибка независимо от совпадения значений).
+#[derive(Debug, Default)]
+struct SeenOptions {
+    device: bool,
+    format: bool,
+    hold_ms: bool,
+}
+
+impl SeenOptions {
+    fn mark(&mut self, key: &str) -> bool {
+        let slot = match key {
+            "--device" => &mut self.device,
+            "--format" => &mut self.format,
+            "--hold-ms" => &mut self.hold_ms,
+            _ => return false,
+        };
+        std::mem::replace(slot, true)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,6 +255,16 @@ mod tests {
                 "--hold-ms",
                 "0",
             ],
+            // G6.1.2: тот же набор в ДРУГОМ порядке опций — тоже корректен
+            vec![
+                "--hold-ms",
+                "0",
+                "--format",
+                "opus",
+                "--device",
+                "cpu",
+                "--portable-check",
+            ],
         ] {
             assert!(
                 parse_cli_args(&args(&ok)).is_ok(),
@@ -245,11 +288,81 @@ mod tests {
             vec!["--portable-check", "--portable-check"], // команда дважды
             vec!["--help", "--portable-check"],   // help + команда
             vec!["--portable-check", "extra-positional"], // посторонний аргумент
+            // G6.1.2: повтор опции — ошибка (разные значения)
+            vec!["--portable-check", "--device", "cpu", "--device", "cuda"],
+            // G6.1.2: повтор опции с ОДИНАКОВЫМ значением — тоже ошибка
+            vec!["--portable-check", "--device", "cuda", "--device", "cuda"],
+            vec!["--device", "cpu", "--portable-check", "--device", "cuda"],
+            vec!["--portable-check", "--format", "wav", "--format", "mp3"],
+            vec!["--portable-check", "--hold-ms", "10", "--hold-ms", "20"],
         ] {
             assert!(
                 parse_cli_args(&args(&bad)).is_err(),
                 "должно быть ошибкой: {bad:?}"
             );
+        }
+    }
+
+    /// G6.1.2: сообщения об ошибках повтора называют параметр и говорят
+    /// «дважды» — пользователь понимает, что именно исправить.
+    #[test]
+    fn duplicate_option_error_is_diagnostic() {
+        let e = parse_cli_args(&args(&[
+            "--portable-check",
+            "--device",
+            "cpu",
+            "--device",
+            "cuda",
+        ]))
+        .unwrap_err();
+        assert!(e.contains("--device"), "{e}");
+        assert!(e.contains("дважды"), "{e}");
+        let e = parse_cli_args(&args(&[
+            "--portable-check",
+            "--hold-ms",
+            "1",
+            "--hold-ms",
+            "1",
+        ]))
+        .unwrap_err();
+        assert!(e.contains("--hold-ms") && e.contains("дважды"), "{e}");
+    }
+
+    /// G6.1.2: соответствие парсера и `apply_overrides` (main.rs). У любого
+    /// ПРИНЯТОГО набора аргументов каждая опция встречается ровно один раз —
+    /// значит `arg_value` (первое вхождение) вернёт то самое провалидированное
+    /// значение, второе молча проигнорировано быть не может.
+    #[test]
+    fn accepted_args_have_single_occurrence_of_each_option() {
+        let accepted = [
+            vec!["--portable-check"],
+            vec!["--portable-check", "--device", "cuda"],
+            vec!["--device", "cuda", "--portable-check"],
+            vec![
+                "--hold-ms",
+                "0",
+                "--format",
+                "opus",
+                "--device",
+                "cpu",
+                "--portable-check",
+            ],
+            vec!["--portable-selftest", "--format", "MP3"],
+        ];
+        for ok in accepted {
+            assert!(parse_cli_args(&args(&ok)).is_ok(), "{ok:?}");
+            for key in ["--device", "--format", "--hold-ms"] {
+                let n = ok.iter().filter(|a| **a == key).count();
+                assert!(n <= 1, "{ok:?}: {key} встречается {n} раз");
+            }
+        }
+        // все повторы отвергаются — «первое значение выигрывает» невозможно
+        for dup in [
+            vec!["--portable-check", "--device", "cpu", "--device", "cuda"],
+            vec!["--portable-check", "--format", "wav", "--format", "wav"],
+            vec!["--portable-check", "--hold-ms", "0", "--hold-ms", "0"],
+        ] {
+            assert!(parse_cli_args(&args(&dup)).is_err(), "{dup:?}");
         }
     }
 
