@@ -63,12 +63,13 @@ pub fn process_memory() -> std::io::Result<ProcessMemory> {
 /// Использованная VRAM (МБ) нашего процесса по nvidia-smi; 0.0 — если процесса
 /// нет в списке compute-apps или утилита недоступна (не ошибка).
 pub fn vram_used_mb(pid: u32) -> f64 {
-    let out = std::process::Command::new("nvidia-smi")
-        .args([
-            "--query-compute-apps=pid,used_memory",
-            "--format=csv,noheader,nounits",
-        ])
-        .output();
+    let mut cmd = std::process::Command::new("nvidia-smi");
+    cmd.args([
+        "--query-compute-apps=pid,used_memory",
+        "--format=csv,noheader,nounits",
+    ]);
+    crate::hide_console(&mut cmd);
+    let out = cmd.output();
     let Ok(out) = out else { return 0.0 };
     if !out.status.success() {
         return 0.0;
@@ -88,15 +89,15 @@ pub fn vram_used_mb(pid: u32) -> f64 {
 
 /// Суммарная использованная VRAM GPU 0 (МБ); None — nvidia-smi недоступен.
 pub fn gpu_total_used_mb() -> Option<f64> {
-    let out = std::process::Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=memory.used",
-            "--format=csv,noheader,nounits",
-            "-i",
-            "0",
-        ])
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new("nvidia-smi");
+    cmd.args([
+        "--query-gpu=memory.used",
+        "--format=csv,noheader,nounits",
+        "-i",
+        "0",
+    ]);
+    crate::hide_console(&mut cmd);
+    let out = cmd.output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -109,15 +110,15 @@ pub fn gpu_total_used_mb() -> Option<f64> {
 /// (G6.1): недостаток памяти — не абсолютная защита от OOM, а способ
 /// заранее выбрать экономную конфигурацию с понятной записью в журнале.
 pub fn gpu_free_mb(device_id: i32) -> Option<f64> {
-    let out = std::process::Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=memory.free",
-            "--format=csv,noheader,nounits",
-            "-i",
-            &device_id.to_string(),
-        ])
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new("nvidia-smi");
+    cmd.args([
+        "--query-gpu=memory.free",
+        "--format=csv,noheader,nounits",
+        "-i",
+        &device_id.to_string(),
+    ]);
+    crate::hide_console(&mut cmd);
+    let out = cmd.output().ok()?;
     if !out.status.success() {
         return None;
     }

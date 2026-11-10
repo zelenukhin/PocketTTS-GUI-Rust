@@ -12,6 +12,20 @@
 //! — неизвестный/повторный/некорректный аргумент завершает процесс с кодом 2
 //! и diagnostic-сообщением, окно НЕ открывается (раньше опечатка во флаге
 //! молча запускала GUI).
+//!
+//! G6.2.3: release-бинар собирается подсистемой Windows GUI — консольное
+//! окно не открывается ни при обычном запуске, ни у дочерних CUDA-процессов.
+//! Диагностика `--portable-*` читается через явно перенаправленные
+//! stdout/stderr (System.Diagnostics.Process, PowerShell-конвейер, pipes);
+//! ошибки CLI при запуске без потоков (двойной клик) показываются
+//! MessageBox (`cli_error_output`). Debug-сборка остаётся консольной —
+//! логи разработки видны в терминале.
+
+// Release: без консольного окна. Debug: консольная подсистема (логи dev).
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -30,6 +44,43 @@ use shtorm_gui::settings::{
 const FALLBACK_TEXT: &str =
     "Стр+елки час+ов показ+ывали п+олночь, а стрелк+и заст+ыли. Вт+орое предложение.";
 
+/// G6.2.3 (GUI-подсистема): диагностическое сообщение об ошибке аргументов.
+/// При работающем stderr (перенаправление скриптом, PowerShell, консоль) —
+/// только текст (автоматизацию окно не блокирует). Если потоков нет вовсе
+/// (двойной клик, «Выполнить» — GUI-подсистеме их не выделяют) — критичная
+/// ошибка показывается нативным MessageBox, иначе она была бы невидимой.
+fn cli_error_output(e: &str, usage: &str) {
+    eprintln!("ОШИБКА АРГУМЕНТОВ: {e}");
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+        // SAFETY: GetStdHandle — чистый запрос дескриптора процесса.
+        let stderr_handle = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
+        let no_stderr = stderr_handle.is_null() || stderr_handle == INVALID_HANDLE_VALUE;
+        if no_stderr {
+            let text = format!(
+                "ShtormTTS: ошибка аргументов командной строки.\n\n{e}\n\nПолная справка: shtorm-gui.exe --help"
+            );
+            let caption = "ShtormTTS — неверные аргументы";
+            let wide =
+                |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+            let (wt, wc) = (wide(&text), wide(caption));
+            // SAFETY: буферы — корректные NUL-терминированные UTF-16 строки.
+            unsafe {
+                MessageBoxW(
+                    std::ptr::null_mut(),
+                    wt.as_ptr(),
+                    wc.as_ptr(),
+                    MB_OK | MB_ICONERROR,
+                );
+            }
+        }
+    }
+    let _ = usage; // справка печатается вызывающим кодом при живом stderr
+}
+
 fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -38,7 +89,7 @@ fn main() -> eframe::Result<()> {
     let command = match parse_cli_args(&args) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("ОШИБКА АРГУМЕНТОВ: {e}");
+            cli_error_output(&e, &usage_text());
             eprint!("{}", usage_text());
             std::process::exit(2);
         }

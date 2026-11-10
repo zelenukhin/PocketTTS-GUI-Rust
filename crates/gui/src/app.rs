@@ -1,5 +1,9 @@
 //! G1/G2: форма GUI (eframe/egui) с рабочей валидацией и запуском синтеза
 //! (G2 — фоновый поток поверх app_core::pipeline::synthesize_stream).
+//!
+//! G6.2.3: автосохранение настроек при штатном закрытии окна — явная машина
+//! состояний [`CloseFlow`] (закрытие при живом задании по-прежнему ждёт
+//! отмены и завершения потока, публикация дорабатывает).
 
 use eframe::egui;
 use std::path::PathBuf;
@@ -76,11 +80,69 @@ struct BatchUiState {
     active: Vec<ActiveFileUi>,
 }
 
+/// G6.2.3: результат чтения собственного конфига при старте — определяет
+/// политику автосохранения при закрытии окна.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsLoadState {
+    /// Конфиг прочитан — автосохранение при закрытии разрешено.
+    Loaded,
+    /// Конфига нет (первый запуск) — автосохранение разрешено: создаёт
+    /// файл, перезаписывать нечего.
+    FirstRun,
+    /// Конфиг существует, но не читается/не разбирается (повреждён, BOM,
+    /// занят) — автосохранение ЗАПРЕЩЕНО: закрытие окна не должно незаметно
+    /// затирать непрочитанный пользовательский файл настройками по
+    /// умолчанию. Причина сообщается в статусе при старте; ручное
+    /// сохранение кнопкой остаётся осознанным решением пользователя.
+    Unreadable,
+}
+
+/// G6.2.3: явные состояния закрытия окна (замена одиночного `close_pending`).
+/// Каждое состояние однозначно: повторная инициализация закрытия и цикл
+/// `Close → CancelClose → Save → Close → …` исключены — в [`CloseFlow::Closing`]
+/// на `close_requested` (индуцированный собственным `ViewportCommand::Close`)
+/// НЕ отвечаем CancelClose, процесс завершается.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseFlow {
+    /// Обычная работа — закрытие не запрашивалось.
+    Idle,
+    /// Крестик при живом задании: отмена отправлена, окно удерживается
+    /// (CancelClose) до завершения фонового потока — семантика G2/G5.1
+    /// (публикация дорабатывает, сиротских процессов нет).
+    WaitingForJob,
+    /// Сохранить настройки и закрыться. Переходное состояние: попытка
+    /// выполняется в кадре перехода (задание уже завершено или его не было).
+    Saving,
+    /// Автосохранение не удалось: окно удерживается, пользователь явно
+    /// выбирает «Повторить» или «Выйти без сохранения» (существующий файл
+    /// не разрушается — атомарная замена в save_settings).
+    SaveFailed,
+    /// Решение принято (сохранено / пропущено по политике / отказ
+    /// пользователя) — фактическое закрытие: `ViewportCommand::Close` уже
+    /// отправлен, повторно не отправляется.
+    Closing,
+}
+
 pub struct ShtormApp {
     pub settings: GuiSettings,
     log: String,
     status: String,
     last_saved: Option<PathBuf>,
+    /// Путь собственного конфига (продакшн — `settings_path()` рядом с exe;
+    /// отдельное поле — инъекция изолированного пути в тестах).
+    conf_path: PathBuf,
+    /// G6.2.3: политика автосохранения по результату чтения конфига.
+    settings_load: SettingsLoadState,
+    /// G6.2.3: снимок сериализованных настроек на момент старта — при
+    /// закрытии файл пишется только при реальных изменениях (сессия без
+    /// правок не создаёт временных файлов).
+    settings_snapshot: String,
+    /// G6.2.3: состояние закрытия окна (автосохранение при закрытии).
+    close_flow: CloseFlow,
+    /// `ViewportCommand::Close` уже отправлен (ровно один раз).
+    close_sent: bool,
+    /// Текст последней ошибки автосохранения (диалог при закрытии).
+    autosave_error: Option<String>,
     /// Активное фоновое задание (None — можно запустить новое; два задания
     /// одновременно запрещены).
     job: Option<JobHandle>,
@@ -96,9 +158,6 @@ pub struct ShtormApp {
     /// необратима, «Стоп» отключается (он не может предотвратить замену).
     /// В пакетном режиме семантика per-file (см. stop_available).
     publishing: bool,
-    /// Пользователь закрыл окно при живом задании: отменяем и закрываем сами,
-    /// когда поток завершится (без сиротских ffmpeg).
-    close_pending: bool,
     /// Кэш проверки ffmpeg (resolve_ffmpeg запускает процесс — не каждый кадр):
     /// ключ = явный путь из настроек, значение = текст ошибки, если не найден.
     ffmpeg_check_key: Option<String>,
@@ -135,14 +194,35 @@ impl Default for ShtormApp {
 
 impl ShtormApp {
     pub fn new() -> Self {
-        let (settings, note) = match load_settings(&settings_path()) {
+        Self::with_conf_path(settings_path())
+    }
+
+    /// Конструктор с явным путём конфига (продакшн — рядом с exe; тесты —
+    /// изолированная песочница, т.к. `settings_path()` привязана к
+    /// `current_exe` тестового харнесса).
+    fn with_conf_path(conf_path: PathBuf) -> Self {
+        let (settings, settings_load, note) = match load_settings(&conf_path) {
             Ok(s) => (
                 s,
-                format!("настройки загружены: {}", settings_path().display()),
+                SettingsLoadState::Loaded,
+                format!("настройки загружены: {}", conf_path.display()),
+            ),
+            // Первый запуск: файла нет — это не «повреждённый конфиг»,
+            // автосохранение при закрытии разрешено (создаёт файл).
+            Err(_) if !conf_path.exists() => (
+                GuiSettings::default(),
+                SettingsLoadState::FirstRun,
+                format!(
+                    "настройки не найдены — значения по умолчанию (сохранятся при закрытии): {}",
+                    conf_path.display()
+                ),
             ),
             Err(e) => (
                 GuiSettings::default(),
-                format!("настройки не загружены ({e:#}); значения по умолчанию"),
+                SettingsLoadState::Unreadable,
+                format!(
+                    "настройки не загружены ({e:#}); конфиг не будет перезаписан автоматически"
+                ),
             ),
         };
         // G5.2 (визуальный контроль): ни один кадр ещё не нарисован — если
@@ -151,18 +231,25 @@ impl ShtormApp {
         // при theme_dark=true. Помечаем НЕ применённой: первый кадр
         // установит visuals до отрисовки (без вспышки светлой темы).
         let theme_applied = !settings.theme_dark;
+        // G6.2.3: снимок для сравнения «были ли изменения» при закрытии.
+        let settings_snapshot = serde_json::to_string_pretty(&settings).unwrap_or_default();
         Self {
             settings,
             log: String::new(),
             status: note,
             last_saved: None,
+            conf_path,
+            settings_load,
+            settings_snapshot,
+            close_flow: CloseFlow::Idle,
+            close_sent: false,
+            autosave_error: None,
             job: None,
             progress: (0, 0),
             file_progress: (0, 0),
             batch_running: false,
             batch_state: None,
             publishing: false,
-            close_pending: false,
             ffmpeg_check_key: None,
             ffmpeg_check_err: None,
             ffmpeg_checked_at: std::time::Instant::now(),
@@ -458,6 +545,128 @@ impl ShtormApp {
         }
     }
 
+    // ===== G6.2.3: закрытие окна и автосохранение настроек =====
+
+    /// Машина состояний закрытия (вызывается из update() каждый кадр ДО
+    /// панелей; отдельный метод — headless-тесты состояний без окна).
+    ///
+    /// Порядок при живом задании сохранён от G2: отмена → удержание окна
+    /// (CancelClose) → завершение потока → автосохранение → Close. Отмена
+    /// не блокирует UI-поток (нет ожидания CUDA/IPC — только флаг и дренаж
+    /// событий в poll_job).
+    fn handle_close_flow(&mut self, ctx: &egui::Context) {
+        let close_requested = ctx.input(|i| i.viewport().close_requested());
+        if close_requested {
+            match self.close_flow {
+                CloseFlow::Idle => {
+                    if let Some(job) = &self.job {
+                        job.cancel.store(true, Ordering::SeqCst);
+                        self.push_log("закрытие: ожидаю отмену задания…");
+                        self.close_flow = CloseFlow::WaitingForJob;
+                    } else {
+                        self.close_flow = CloseFlow::Saving;
+                    }
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                }
+                // Повторный крестик, пока окно удерживается (задание
+                // завершается / диалог ошибки сохранения открыт), не должен
+                // обгонять уже идущее закрытие — продолжаем отменять.
+                CloseFlow::WaitingForJob | CloseFlow::Saving | CloseFlow::SaveFailed => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                }
+                // Closing: собственный ViewportCommand::Close уже отправлен;
+                // индуцированный им close_requested — НЕ отменяем, иначе
+                // закрытие зациклится (процесс завершается после кадра).
+                CloseFlow::Closing => {}
+            }
+        }
+        // фоновое задание завершилось (после отмены) — к сохранению и закрытию
+        if self.close_flow == CloseFlow::WaitingForJob && self.job.is_none() {
+            self.close_flow = CloseFlow::Saving;
+        }
+        // попытка автосохранения — в кадре перехода; задание не живое,
+        // запись маленького JSON локальна и атомарна (UI не подвисает)
+        if self.close_flow == CloseFlow::Saving && self.job.is_none() {
+            self.attempt_autosave();
+        }
+        // решение принято — закрываем окно сами (ровно один Close)
+        if self.close_flow == CloseFlow::Closing && !self.close_sent {
+            self.close_sent = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    /// Попытка автосохранения при закрытии (G6.2.3). Политики:
+    /// - конфиг не читался при старте (повреждён) — НЕ перезаписывать молча:
+    ///   пользовательский файл остаётся нетронутым, причина — в журнале
+    ///   (и сообщалась в статусе при старте);
+    /// - изменений с момента старта нет — файл не трогаем (без tmp-файлов);
+    /// - ошибка записи — окно остаётся живым с явным выбором, существующий
+    ///   файл цел (атомарная замена: сбой до MoveFileExW не трогает его).
+    fn attempt_autosave(&mut self) {
+        if self.settings_load == SettingsLoadState::Unreadable {
+            self.push_log(&format!(
+                "закрытие: настройки при запуске не были прочитаны — автосохранение \
+                 пропущено, существующий конфиг не изменён ({})",
+                self.conf_path.display()
+            ));
+            self.close_flow = CloseFlow::Closing;
+            return;
+        }
+        self.settings.clamped();
+        let current = serde_json::to_string_pretty(&self.settings).unwrap_or_default();
+        if current == self.settings_snapshot {
+            self.close_flow = CloseFlow::Closing;
+            return;
+        }
+        match save_settings(&self.settings, &self.conf_path) {
+            Ok(()) => {
+                self.settings_snapshot = current;
+                self.close_flow = CloseFlow::Closing;
+            }
+            Err(e) => {
+                self.autosave_error = Some(format!("{e:#}"));
+                self.push_log(&format!("ошибка автосохранения настроек: {e:#}"));
+                self.close_flow = CloseFlow::SaveFailed;
+            }
+        }
+    }
+
+    /// Диалог ошибки автосохранения: окно не закрывается молча — явный выбор
+    /// «Повторить сохранение» или «Выйти без сохранения» (рендер после
+    /// панелей, поверх них).
+    fn show_autosave_dialog(&mut self, ctx: &egui::Context) {
+        if self.close_flow != CloseFlow::SaveFailed {
+            return;
+        }
+        let mut flow = self.close_flow;
+        let err = self
+            .autosave_error
+            .clone()
+            .unwrap_or_else(|| "неизвестная ошибка".into());
+        egui::Window::new("Настройки не сохранены")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label("Не удалось автоматически сохранить настройки:");
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(&err).small());
+                ui.add_space(4.0);
+                ui.label("Файл настроек не изменён.");
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Повторить сохранение").clicked() {
+                        flow = CloseFlow::Saving;
+                    }
+                    if ui.button("Выйти без сохранения").clicked() {
+                        flow = CloseFlow::Closing;
+                    }
+                });
+            });
+        self.close_flow = flow;
+    }
+
     /// Строка в журнал (ограничение размера: последние ~400 строк).
     fn push_log(&mut self, line: &str) {
         self.log.push_str(line);
@@ -585,26 +794,14 @@ impl eframe::App for ShtormApp {
         // события фонового задания (прогресс/логи/итог) — каждый кадр
         self.poll_job();
 
-        // Закрытие окна при живом задании: отменяем и удерживаем окно, пока
-        // поток не завершится (CancelClose), затем закрываем сами — синк
-        // дропается в потоке задания, сиротских ffmpeg не остаётся.
-        let close_requested = ctx.input(|i| i.viewport().close_requested());
-        if close_requested {
-            if let Some(job) = &self.job {
-                job.cancel.store(true, Ordering::SeqCst);
-                if !self.close_pending {
-                    self.close_pending = true;
-                    self.push_log("закрытие: ожидаю отмену задания…");
-                }
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            }
-        }
-        if self.close_pending && self.job.is_none() {
-            self.close_pending = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-        // пока задание живо — регулярные перерисовки для дренажа событий
-        if self.job.is_some() {
+        // G6.2.3: закрытие окна — машина состояний (закрытие при живом
+        // задании: отмена + удержание окна до завершения потока — синк
+        // дропается в потоке задания, сиротских ffmpeg не остаётся; затем
+        // автосохранение настроек и фактическое закрытие).
+        self.handle_close_flow(ctx);
+        // пока задание живо или закрытие в прогрессе — регулярные
+        // перерисовки (дренаж событий и переходы состояний закрытия)
+        if self.job.is_some() || self.close_flow != CloseFlow::Idle {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
@@ -658,10 +855,14 @@ impl eframe::App for ShtormApp {
                 }
                 if ui.button("Сохранить настройки").clicked() {
                     self.settings.clamped();
-                    match save_settings(&self.settings, &settings_path()) {
+                    match save_settings(&self.settings, &self.conf_path) {
                         Ok(()) => {
-                            self.last_saved = Some(settings_path());
-                            self.status = format!("сохранено: {}", settings_path().display());
+                            self.last_saved = Some(self.conf_path.clone());
+                            // G6.2.3: ручное сохранение обновляет снимок —
+                            // закрытие без дальнейших правок не пишет файл снова
+                            self.settings_snapshot =
+                                serde_json::to_string_pretty(&self.settings).unwrap_or_default();
+                            self.status = format!("сохранено: {}", self.conf_path.display());
                         }
                         Err(e) => self.status = format!("ошибка сохранения: {e:#}"),
                     }
@@ -1198,6 +1399,29 @@ impl eframe::App for ShtormApp {
                 }
             });
         });
+        // G6.2.3: диалог ошибки автосохранения — поверх панелей
+        self.show_autosave_dialog(ctx);
+    }
+
+    /// G6.2.3: страховка на случай выхода МИМО штатного потока закрытия
+    /// (close_flow остался Idle) — лучшая попытка автосохранения. Показать
+    /// ошибку пользователю уже некому: политика/снимок соблюдаются те же,
+    /// отказ фиксируется в stderr (при перенаправленных потоках — в журнале
+    /// скрипта). Основной путь — handle_close_flow, на Drop не полагаемся.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if self.close_flow != CloseFlow::Idle {
+            return; // штатный поток закрытия уже сохранил/осознанно пропустил
+        }
+        if self.settings_load == SettingsLoadState::Unreadable {
+            return;
+        }
+        self.settings.clamped();
+        let current = serde_json::to_string_pretty(&self.settings).unwrap_or_default();
+        if current != self.settings_snapshot {
+            if let Err(e) = save_settings(&self.settings, &self.conf_path) {
+                eprintln!("автосохранение при выходе не выполнено: {e:#}");
+            }
+        }
     }
 }
 
@@ -1917,5 +2141,314 @@ mod tests {
             crate::job::JobResult::failed("тест".into()),
         )));
         assert!(!app.publishing, "после итога «Стоп» не нужен");
+    }
+
+    // ===== G6.2.3: автосохранение при закрытии (headless-машина состояний) =====
+
+    /// Изолированная песочница с путём конфига (settings_path() в тестах
+    /// указывала бы на каталог тестового харнесса).
+    fn close_sandbox(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let d = std::env::temp_dir().join(format!(
+            "shtorm_close_{}_{}_{}",
+            std::process::id(),
+            tag,
+            nanos
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d.join("shtorm_gui_settings.json")
+    }
+
+    /// Один headless-кадр машины закрытия: close_requested подаётся через
+    /// RawInput (ViewportEvent::Close в ROOT), возвращаются viewport-команды.
+    fn close_frame(app: &mut ShtormApp, close_requested: bool) -> Vec<egui::ViewportCommand> {
+        let ctx = egui::Context::default();
+        let mut info = egui::ViewportInfo::default();
+        if close_requested {
+            info.events.push(egui::ViewportEvent::Close);
+        }
+        let mut raw = egui::RawInput::default();
+        raw.viewports.insert(egui::ViewportId::ROOT, info);
+        let full = ctx.run(raw, |ctx| app.handle_close_flow(ctx));
+        full.viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|o| o.commands.clone())
+            .unwrap_or_default()
+    }
+
+    fn has_cancel_close(cmds: &[egui::ViewportCommand]) -> bool {
+        cmds.iter()
+            .any(|c| matches!(c, egui::ViewportCommand::CancelClose))
+    }
+
+    fn has_close(cmds: &[egui::ViewportCommand]) -> bool {
+        cmds.iter()
+            .any(|c| matches!(c, egui::ViewportCommand::Close))
+    }
+
+    /// A1/A2/A3 (ядро): закрытие без задания сохраняет изменённые настройки
+    /// (модель/устройство/пакетный CUDA/тема/свёртки/неизвестные ключи),
+    /// повторная загрузка возвращает их.
+    #[test]
+    fn close_autosaves_changed_settings_and_reload_restores() {
+        let conf = close_sandbox("changed");
+        let mut app = ShtormApp::with_conf_path(conf.clone());
+        assert_eq!(app.settings_load, crate::app::SettingsLoadState::FirstRun);
+        app.settings.temperature = 0.65;
+        app.settings.model = ModelChoice::Fast;
+        app.settings.device = DeviceChoice::Cuda;
+        app.settings.batch_cuda_mode = crate::settings::BatchCudaMode::MaxSpeed;
+        app.settings.theme_dark = false;
+        app.settings.pauses_open = false;
+        // A6: неизвестный ключ не теряется автосохранением
+        app.settings
+            .extra
+            .insert("future_key".into(), serde_json::json!({"x": 1}));
+
+        let cmds = close_frame(&mut app, true);
+        assert!(has_cancel_close(&cmds), "кадр закрытия отменяет OS-close");
+        assert_eq!(app.close_flow, crate::app::CloseFlow::Closing);
+        assert!(has_close(&cmds), "фактическое закрытие отправлено");
+
+        let reloaded = load_settings(&conf).unwrap();
+        assert_eq!(reloaded.temperature, 0.65);
+        assert_eq!(reloaded.model, ModelChoice::Fast);
+        assert_eq!(reloaded.device, DeviceChoice::Cuda);
+        assert_eq!(
+            reloaded.batch_cuda_mode,
+            crate::settings::BatchCudaMode::MaxSpeed,
+            "A2: MaxSpeed 2×2 сохраняется"
+        );
+        assert!(!reloaded.theme_dark, "A3: тема сохраняется");
+        assert!(!reloaded.pauses_open, "A3: свёртки сохраняются");
+        assert_eq!(
+            reloaded.extra.get("future_key"),
+            Some(&serde_json::json!({"x": 1})),
+            "A6: неизвестный ключ пережил автосохранение"
+        );
+    }
+
+    /// Сессия без изменений не пишет файл: содержимое байт-в-байт то же,
+    /// временных файлов не появляется.
+    #[test]
+    fn close_without_changes_leaves_file_untouched() {
+        let conf = close_sandbox("untouched");
+        let s = GuiSettings {
+            temperature: 0.4,
+            ..Default::default()
+        };
+        save_settings(&s, &conf).unwrap();
+        let before = std::fs::read(&conf).unwrap();
+        let mut app = ShtormApp::with_conf_path(conf.clone());
+        assert_eq!(app.settings_load, crate::app::SettingsLoadState::Loaded);
+        // пользователь ничего не менял
+        let cmds = close_frame(&mut app, true);
+        assert!(has_cancel_close(&cmds) && has_close(&cmds));
+        assert_eq!(app.close_flow, crate::app::CloseFlow::Closing);
+        assert_eq!(
+            std::fs::read(&conf).unwrap(),
+            before,
+            "файл не переписывался"
+        );
+        let tmps: Vec<_> = std::fs::read_dir(conf.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("tmp."))
+            .collect();
+        assert!(tmps.is_empty(), "лишних tmp-файлов нет");
+    }
+
+    /// A7: повреждённый конфиг не перезаписывается молча — закрытие без
+    /// сохранения, байты сохранены, причина — в журнале.
+    #[test]
+    fn close_never_overwrites_unreadable_config() {
+        let conf = close_sandbox("corrupt");
+        std::fs::write(&conf, b"{ this is not valid json !!!").unwrap();
+        let before = std::fs::read(&conf).unwrap();
+        let mut app = ShtormApp::with_conf_path(conf.clone());
+        assert_eq!(app.settings_load, crate::app::SettingsLoadState::Unreadable);
+        app.settings.temperature = 0.9; // пользователь менял дефолты
+        let cmds = close_frame(&mut app, true);
+        assert!(has_cancel_close(&cmds) && has_close(&cmds));
+        assert_eq!(app.close_flow, crate::app::CloseFlow::Closing);
+        assert_eq!(std::fs::read(&conf).unwrap(), before, "конфиг цел");
+        assert!(
+            app.log.contains("автосохранение"),
+            "решение отражено в журнале: {}",
+            app.log
+        );
+    }
+
+    /// A5: ошибка записи — окно остаётся живым (без Close), существующий
+    /// файл цел; явный выбор «Выйти без сохранения» закрывает.
+    #[cfg(windows)]
+    #[test]
+    fn close_save_failure_keeps_window_and_file_then_explicit_exit() {
+        let conf = close_sandbox("writefail");
+        let s = GuiSettings {
+            temperature: 0.4,
+            ..Default::default()
+        };
+        save_settings(&s, &conf).unwrap();
+        let before = std::fs::read(&conf).unwrap();
+        // read-only у ЦЕЛИ: атомарная замена MoveFileExW REPLACE не может
+        // подменить файл с атрибутом «только чтение»
+        let mut perms = std::fs::metadata(&conf).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&conf, perms).unwrap();
+
+        let mut app = ShtormApp::with_conf_path(conf.clone());
+        app.settings.temperature = 0.8;
+        let cmds = close_frame(&mut app, true);
+        assert!(has_cancel_close(&cmds), "окно удержано");
+        assert!(!has_close(&cmds), "фактического закрытия НЕ было");
+        assert_eq!(app.close_flow, crate::app::CloseFlow::SaveFailed);
+        assert!(app.autosave_error.is_some(), "ошибка зафиксирована");
+        assert_eq!(std::fs::read(&conf).unwrap(), before, "старый JSON цел");
+
+        // повторный крестик в SaveFailed не закрывает молча
+        let cmds = close_frame(&mut app, true);
+        assert!(has_cancel_close(&cmds) && !has_close(&cmds));
+
+        // осознанное решение: выйти без сохранения
+        app.close_flow = crate::app::CloseFlow::Closing;
+        let cmds = close_frame(&mut app, false);
+        assert!(has_close(&cmds) && !has_cancel_close(&cmds));
+        assert_eq!(std::fs::read(&conf).unwrap(), before);
+
+        // восстановить атрибут, чтобы артефакт песочницы не путал следующие
+        // запуски этого теста (FILE_ATTRIBUTE_NORMAL вместо READONLY)
+        {
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                SetFileAttributesW, FILE_ATTRIBUTE_NORMAL,
+            };
+            let wide: Vec<u16> = conf
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            // SAFETY: wide — NUL-терминированный путь; вызов меняет атрибуты
+            // только собственного файла тестовой песочницы.
+            unsafe { SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_NORMAL) };
+        }
+    }
+
+    /// A4: крестик при живом задании — отмена, удержание окна до завершения
+    /// потока, затем автосохранение и закрытие. UI-поток ничего не ждёт
+    /// блокирующе (только флаг cancel + дренаж poll_job).
+    #[test]
+    fn close_during_job_cancels_then_saves_then_closes() {
+        let conf = close_sandbox("duringjob");
+        let mut app = ShtormApp::with_conf_path(conf.clone());
+        app.settings.temperature = 0.55;
+        // мок-задание: фоновый поток жив, пока не увидит cancel
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel2 = Arc::clone(&cancel);
+        let (tx, rx) = std::sync::mpsc::channel::<JobEvent>();
+        let thread = std::thread::Builder::new()
+            .name("mock-synth".into())
+            .spawn(move || {
+                while !cancel2.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                let _ = tx.send(JobEvent::Finished(Box::new(crate::job::JobResult::failed(
+                    "отменено тестом".into(),
+                ))));
+            })
+            .unwrap();
+        app.job = Some(JobHandle {
+            cancel,
+            rx,
+            thread: Some(thread),
+        });
+
+        // крестик: отмена + удержание, сохранения ещё нет
+        let cmds = close_frame(&mut app, true);
+        assert!(has_cancel_close(&cmds) && !has_close(&cmds));
+        assert_eq!(app.close_flow, crate::app::CloseFlow::WaitingForJob);
+        assert!(
+            !conf.exists(),
+            "сохранение до завершения задания не выполнялось"
+        );
+
+        // кадры без close: дренаж событий прибирает завершённое задание,
+        // затем машина сама доходит до сохранения и Close
+        let mut saw_close = false;
+        for _ in 0..2000 {
+            app.poll_job();
+            let cmds = close_frame(&mut app, false);
+            if has_close(&cmds) {
+                saw_close = true;
+            }
+            if app.job.is_none() && app.close_flow == crate::app::CloseFlow::Closing {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.job.is_none(), "задание прибрано");
+        assert_eq!(app.close_flow, crate::app::CloseFlow::Closing);
+        assert!(saw_close || app.close_sent, "Close отправлен");
+        let reloaded = load_settings(&conf).unwrap();
+        assert_eq!(
+            reloaded.temperature, 0.55,
+            "A4: настройки сохранены после отмены"
+        );
+    }
+
+    /// Защита от цикла: после фактического закрытия индуцированный
+    /// close_requested НЕ отменяется (иначе Close↔CancelClose зацикливался
+    /// бы), повторный Close не отправляется.
+    #[test]
+    fn close_after_closing_command_never_cancels_again() {
+        let conf = close_sandbox("noloop");
+        let mut app = ShtormApp::with_conf_path(conf);
+        app.settings.temperature = 0.7;
+        let cmds = close_frame(&mut app, true);
+        assert!(has_cancel_close(&cmds) && has_close(&cmds));
+        assert_eq!(app.close_flow, crate::app::CloseFlow::Closing);
+        // кадры «после Close» (eframe индуцирует close_requested сам)
+        for _ in 0..3 {
+            let cmds = close_frame(&mut app, true);
+            assert!(
+                !has_cancel_close(&cmds),
+                "индуцированный close не отменяется — выхода нет"
+            );
+            assert!(!has_close(&cmds), "Close повторно не отправляется");
+        }
+    }
+
+    /// Страховка on_exit: выход мимо штатного потока (Idle) сохраняет
+    /// изменения; непрочитанный конфиг по-прежнему не трогается.
+    #[test]
+    fn on_exit_fallback_saves_changes_but_respects_policy() {
+        let conf = close_sandbox("onexit");
+        let mut app = ShtormApp::with_conf_path(conf.clone());
+        app.settings.temperature = 0.75;
+        <ShtormApp as eframe::App>::on_exit(&mut app, None);
+        assert_eq!(load_settings(&conf).unwrap().temperature, 0.75);
+
+        // уже закрытое штатным потоком состояние не сохраняет повторно
+        let mut app2 = ShtormApp::with_conf_path(conf.clone());
+        app2.settings.temperature = 0.31;
+        app2.close_flow = crate::app::CloseFlow::Closing;
+        <ShtormApp as eframe::App>::on_exit(&mut app2, None);
+        assert_eq!(
+            load_settings(&conf).unwrap().temperature,
+            0.75,
+            "повторной записи не было"
+        );
+        assert_eq!(app2.settings.temperature, 0.31, "внутреннее состояние цело");
+
+        // повреждённый конфиг on_exit тоже не перезаписывает
+        let conf2 = close_sandbox("onexit_corrupt");
+        std::fs::write(&conf2, b"not json").unwrap();
+        let mut app3 = ShtormApp::with_conf_path(conf2.clone());
+        app3.settings.temperature = 0.9;
+        <ShtormApp as eframe::App>::on_exit(&mut app3, None);
+        assert_eq!(std::fs::read(&conf2).unwrap(), b"not json");
     }
 }

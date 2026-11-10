@@ -190,13 +190,13 @@ pub fn resolve_ffmpeg(explicit: Option<&Path>) -> Result<PathBuf> {
         if cand.components().count() > 1 && !cand.is_file() {
             continue;
         }
-        let ok = Command::new(&cand)
+        let mut probe = Command::new(&cand);
+        probe
             .arg("-version")
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            .stderr(Stdio::null());
+        crate::hide_console(&mut probe);
+        let ok = probe.status().map(|s| s.success()).unwrap_or(false);
         if ok {
             return Ok(cand);
         }
@@ -371,6 +371,8 @@ impl FfmpegSink {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
+        // G6.2.3: из GUI-подсистемы ffmpeg не должен открывать консольное окно
+        crate::hide_console(&mut cmd);
         let mut child = cmd
             .spawn()
             .with_context(|| format!("запуск ffmpeg: {}", program.display()))?;

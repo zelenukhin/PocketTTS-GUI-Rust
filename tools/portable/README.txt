@@ -20,6 +20,13 @@ Important:
   * Relative paths in settings are resolved from the EXE directory, not from
     the current working directory. You can launch the EXE from any folder or
     shortcut.
+  * Settings are saved AUTOMATICALLY when you close the window normally
+    (X button / Alt+F4). The "Сохранить настройки" button is only an
+    immediate manual save. If the settings file cannot be read at startup,
+    it is never overwritten automatically (the reason is shown in the
+    status bar).
+  * The application runs without a console window (Windows GUI subsystem);
+    child CUDA worker processes and ffmpeg also do not open console windows.
   * CPU and CUDA use different ONNX Runtime DLLs. A process can initialize only
     one runtime; after switching CPU <-> CUDA inside one GUI session, restart
     the application.
@@ -40,6 +47,13 @@ Important:
     LICENSES/NVIDIA-CUDA-NOTICE.txt.
 
 Diagnostics:
+  Diagnostic output is written to stdout/stderr. The GUI is a Windows GUI
+  subsystem application (no console window), so redirect the streams to
+  capture the output, e.g. in PowerShell:
+      & .\shtorm-gui.exe --portable-check > check.txt 2>&1
+  or use System.Diagnostics.Process with RedirectStandardOutput/Error.
+  Exit codes are preserved (0 OK, 1 check failed, 2 bad arguments).
+
   shtorm-gui.exe --portable-check
       Print resolved model / ORT / ffmpeg paths and exit.
   shtorm-gui.exe --portable-selftest [--device cpu|cuda] [--format wav|mp3|opus]

@@ -37,4 +37,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Pipes",
     "Win32_System_Threading",
     "Win32_System_JobObjects",
+    # G6.2.3: MessageBoxW для ошибок CLI при запуске без stderr (GUI-подсистема)
+    "Win32_System_Console",
+    "Win32_UI_WindowsAndMessaging",
 ] }

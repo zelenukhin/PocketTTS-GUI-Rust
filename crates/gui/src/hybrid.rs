@@ -1209,9 +1209,13 @@ pub fn spawn_child_process(
 ) -> Result<SpawnedChild> {
     let server = PipeServer::create_unique(&format!("g62c{child_idx}"))
         .map_err(|e| anyhow!("создать канал дочернего процесса: {e}"))?;
-    let mut child = std::process::Command::new(exe)
-        .arg("--internal-batch-worker")
-        .arg(server.name())
+    let mut child_cmd = std::process::Command::new(exe);
+    child_cmd.arg("--internal-batch-worker").arg(server.name());
+    // G6.2.3: явный запрет консольного окна у дочернего процесса —
+    // GUI-подсистема не выделяет консоль сама, флаг закрепляет это и для
+    // любого другого режима запуска этого exe.
+    app_core::hide_console(&mut child_cmd);
+    let mut child = child_cmd
         .spawn()
         .map_err(|e| anyhow!("запустить дочерний процесс {}: {e}", exe.display()))?;
     let pid = child.id();

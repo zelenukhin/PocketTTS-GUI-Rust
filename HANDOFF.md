@@ -1,24 +1,20 @@
 # HANDOFF.md — оперативный снимок проекта (читать первым вместе с AGENTS.md)
 
-- **Дата обновления**: 2026-11-10 (G6.2.1: hardening жизненного цикла
-  гибридного 2×2 — гарантированное завершение при фатальной ошибке init,
-  явные состояния процессов/воркеров, startup timeout, единый порядок
-  завершающих IPC-событий, fail-closed Job Object; отчёт
-  `docs/G6_2_1_LIFECYCLE.md`; ранее G6.2 — гибридный пакетный CUDA 2×2;
-  G6.1.2 — запрет повторных CLI-опций; отчёт `docs/G6_2_HYBRID_POOL.md`).
+- **Дата обновления**: 2026-11-11 (G6.2.3: автосохранение настроек при
+  закрытии окна + запуск GUI без консоли; отчёт
+  `docs/G6_2_3_GUI_AUTOSAVE.md`; ранее G6.2.2a — IPC hardening, G6.2.1 —
+  жизненный цикл гибрида, G6.2 — гибридный пакетный CUDA 2×2; G6.1.2 —
+  запрет повторных CLI-опций).
 - **HEAD**: только из Git (`git log -1 --oneline`), не из этого файла.
-- **Бэкап на NAS (верифицирован, сделан ПЕРЕД изменениями G6.2.1,
-  2026-11-10 21:29)**: полный архив HEAD `40c363c` —
-  `\\DISKSTATION\Ableton 2\Temp2\ShtormTTS-Windows-full-40c363c-20261110-212916.zip`,
-  SHA256 `7B591D5CAFEA0F38863A7180A7742FC0B10C571D0436593C5947EAB8C8C679C0`,
-  165/165 blob совпадают. Прежние архивы не тронуты. Бэкап G6.2 (`fdcc485`)
-  также в силе.
+- **Бэкап на NAS (верифицирован, сделан ПЕРЕД изменениями G6.2.3,
+  2026-11-11 00:58)**: полный архив HEAD `5e53b37` (G6.2.2a) —
+  `\\DISKSTATION\Ableton 2\Temp2\ShtormTTS-Windows-full-5e53b37-20261111-005803.zip`,
+  SHA256 `6E6A374B5FAE88055CB1F7060A498CEDCB531E872C16C11C4AB7191E4812EE10`,
+  166/166 blob совпадают. Прежние архивы не тронуты (G6.2.1 `40c363c`,
+  G6.2 `fdcc485` также в силе).
 - **NAS РАБОТАЕТ.** «SMB error 1702» из G2.1/P2B.1 — ошибка диагностического
-  скрипта: `out/nas_check.ps1` использовал `'\DISKSTATION\...'` с ОДНИМ
-  ведущим слэшем (PowerShell трактует это как путь от `C:`), плюс потеря
-  слэша при двойном экранировании в bash. Скрипт исправлен (UNC строится из
-  байтов); блокер больше не воспроизводится. Выводы P2B.1 по замерам
-  остаются в силе — они не зависели от бэкапа.
+  скрипта (`out/nas_check.ps1` строил UNC с одним ведущим слэшем); скрипт
+  исправлен, блокер не воспроизводится.
 
 ## Текущий функционал
 
@@ -301,6 +297,75 @@ WAV/MP3/Opus без накопления аудио в памяти, одино�
   CUDA-регрессии и portable/визуальная проверка — по итогам этапа
   (см. отчёт и раздел ниже).
 
+## G6.2.2a — что сделано (предыдущий этап; отдельного дока нет)
+
+- **Отчёт**: фрагментов нет — сводка в коммите `5e53b37`; код в
+  `gui/ipc.rs`, `gui/hybrid.rs`, `gui/job.rs`.
+- **Дефект №1 (deadlock disconnect)**: `PipeEnd` — состояния
+  Open/Closing/Disconnected; `disconnect()` переводит в Closing и снимает
+  операции `CancelIoEx` БЕЗ захвата `write_lock` (зависшая запись
+  прерывается отменой, а не освобождением мьютекса); активный writer
+  координируется ограниченным try_lock-ожиданием; новые отправки после
+  Closing отклоняются, затем `DisconnectNamedPipe`. Ни один поток не
+  остаётся заблокированным на write_lock.
+- **Дефект №2 (бесконечное overlapped_wait)**: каждая запись ждёт не
+  дольше `WRITE_WAIT_TIMEOUT` (10 с); по таймауту — адресная отмена своей
+  операции и ПОДТВЕРЖДЕНИЕ завершения; при неподтверждённой отмене буферы
+  передаются фоновому «косильщику» (use-after-free исключён). То же в
+  accept (таймаут подключения). `run_hybrid`: сбой доставки
+  Assign/Cancel завершает СВОЙ дочерний PID, файлы — явный Failed, цикл
+  диспетчера не блокируется.
+- **E2E**: K (зависшая запись + конкурентный disconnect), L (стресс 3
+  отправителя × closing), M1/M2 (зависший читатель), N (разрыв посреди
+  кадра), O (гонка отмены, 40 раундов), P (политика ожидания + реальный
+  косильщик). `cargo test --release`: 248 passed / 30 ignored; CUDA 2×2
+  40.8 с / 1×2 44.2 с, паритет WAV, cancel/overwrite/MP3/Opus зелёные.
+- **Portable g622-final** собран из `5e53b37` (dirty=false) —
+  `C:\PocketTTS-GUI-Rust\dist\ShtormTTS-Portable-2026-11-10-g622-final`;
+  GUI-приёмка 2×2 из комплекта — `out/g622_gui_acceptance.ps1`.
+
+## G6.2.3 — что сделано (текущий этап)
+
+- **Отчёт**: `docs/G6_2_3_GUI_AUTOSAVE.md` (политика сохранения, машина
+  состояний, обработка ошибок, обоснование GUI-подсистемы, тесты,
+  ограничения).
+- **Автосохранение настроек при штатном закрытии** (`gui/app.rs`): явная
+  машина `CloseFlow` — Idle / WaitingForJob / Saving / SaveFailed / Closing
+  (вместо `close_pending`). Крестик при живом задании по-прежнему: отмена →
+  CancelClose → завершение потока (публикация дорабатывает) → автосохранение
+  → Close. В Closing индуцированный собственным Close `close_requested` НЕ
+  отменяется — цикл Close↔CancelClose исключён (юнит-тест). `on_exit` —
+  страховка для выхода мимо штатного потока (та же политика), на Drop не
+  полагаемся.
+- **Политики**: конфиг прочитан — save только при изменениях (снимок при
+  старте; сессия без правок не создаёт tmp-файлов); файла нет (FirstRun) —
+  создание разрешено; конфиг существует, но не читается — автосохранение
+  ЗАПРЕЩЕНО (файл не перезаписывается, причина в статусе при старте и в
+  журнале). Ошибка записи — окно удерживается, диалог «Настройки не
+  сохранены»: «Повторить сохранение» / «Выйти без сохранения», старый JSON
+  цел (атомарная запись прежняя).
+- **Без консоли** (`gui/main.rs`): release-бинарь —
+  `#![cfg_attr(all(target_os="windows", not(debug_assertions)),
+  windows_subsystem="windows")]`; PE subsystem=2 (debug — 3, логи в
+  терминале). Диагностика в том же EXE, вывод — через явные redirects;
+  ошибка аргументов без stderr (двойной клик) — MessageBoxW. Все продакшн-
+  спавны консольных детей (`ffmpeg` probe + sink, `nvidia-smi`×3,
+  дочерние worker-процессы) — `app_core::hide_console()` (CREATE_NO_WINDOW).
+- **Тесты**: +7 юнит app (headless egui: close_requested через
+  RawInput/ViewportEvent::Close, проверка viewport-команд CancelClose/Close)
+  — всего `cargo test`: **255 passed / 0 failed / 30 ignored**; fmt/clippy
+  чисто. E2E на реальном release-exe (`out/g623_gui_e2e.ps1`, UIA):
+  A1–A7 и B1–B5 — ALL PASS (см. отчёт §7; песочница
+  `C:\ShtormG623E2E_*`, скриншоты в `shots/`). Smoke G6.1.1/G6.2 — ALL PASS.
+- **Реальные CUDA-регрессии (RTX 3060)**: single CUDA 9.4 с / CPU 39.2 с,
+  1×2 pool, 2×2 hybrid 12/12 (2 процесса, 4 Pocket, 40.9 с, VRAM к базе),
+  hybrid cancel/overwrite/MP3/Opus, single overwrite WAV, batch CPU —
+  зелёные.
+- **Portable**: новый комплект
+  `ShtormTTS-Portable-2026-11-11-g623-autosave-no-console` (собран из
+  коммита G6.2.3, структура без изменений; проверки — `docs/PORTABLE_BUILD.md`
+  раздел G6.2.3). `g62-final`/`g622-final` не изменялись.
+
 ## G6.1.1 — что сделано (предыдущий этап)
 
 - **Дефект №1 (потеря preflight FileDone)**: `BatchStarted{total, workers:0}`
@@ -416,26 +481,24 @@ WAV/MP3/Opus без накопления аудио в памяти, одино�
 - Проверки: fmt OK, clippy 0, `cargo test --release` — **179 passed /
   0 failed / 18 ignored**, release OK.
 
-## Результаты последних проверок (2026-11-10, Windows, release)
+## Результаты последних проверок (2026-11-11, Windows, release)
 
-- `cargo test --release` — **240 passed / 0 failed / 30 ignored** (было
-  229/30 после G6.2; +11 G6.2.1: E2E-A…I на реальных fake-процессах и
-  Named Pipe, проверки жизненного цикла/Job Object/порядка событий);
-  `cargo clippy --all-targets -- -D warnings` — 0 предупреждений; fmt OK;
-  `cargo build --release` OK. Real G6.2.1 (CUDA, RTX 3060): 1×2 pool
-  12/12 за 43.0 с (VRAM 576→685 МБ); 2×2 hybrid 12/12 за 41.3 с
-  (4 воркера, 4 Pocket, 2 CUDA-процесса; WAV побитово равны 1×2; VRAM
-  544→685 МБ); cancel 1/12 → повтор 11/12; overwrite — зелёный;
-  MP3/Opus 12/12 оба; taskkill одного процесса — 10/12, 2 Failed,
-  частичный успех без зависания. Real G6.2 (CUDA): паритет 2×2
-  12/12 и ctrl6 6/6 побитово; cancel/повтор, overwrite, MP3/Opus,
-  taskkill ребёнка — зелёные; регрессии 1×2 pool / CPU batch / single CUDA /
-  overwrite_wav — зелёные; smoke EXE ALL PASS; VRAM после серии 684 МБ. Real G6.1.1 (CUDA):
-  real_batch_cuda_pool_partial_skip_events — зелёный (ранние Skipped до
-  загрузки пула, счётчики == отчёту); регрессии real_batch_cuda_pool /
-  _cancel / _overwrite, real_matrix_device(cuda), real_overwrite_wav(cuda),
-  real_batch_cpu — зелёные; smoke/headless EXE — ALL PASS; сиротских ffmpeg
-  нет, VRAM после серии 554 МБ (база).
+- **G6.2.3**: `cargo fmt --all -- --check` OK; `cargo clippy --all-targets
+  -- -D warnings` — 0 предупреждений; `cargo test` — **255 passed /
+  0 failed / 30 ignored** (+7 close-flow); `cargo build --release` OK;
+  PE subsystem release=WINDOWS_GUI (debug=CONSOLE). E2E реального EXE
+  (`out/g623_gui_e2e.ps1`): A1/A3 тема+свёртки round-trip, A2 MaxSpeed в
+  JSON (в юнит-тесте), A4 закрытие при активной генерации (cancel+save+
+  exit 0, сирот 0), A5 read-only JSON → диалог+retry+exit без сохранения
+  (файл цел), A6 unknown key, A7 повреждённый конфиг не перезаписан,
+  B1/B2 без новых console-окон, B3 fake 2×2 (2 процесса/4 воркера/6 файлов),
+  B4/B5 диагностика+ExitCode — **ALL PASS**. Smoke `tools/g611_cli_smoke.ps1`
+  и `tools/g62_hybrid_smoke.ps1` — ALL PASS. Real CUDA: single CUDA 9.4 с /
+  CPU 39.2 с, 1×2 pool, 2×2 hybrid 12/12 (2 процесса, 4 Pocket, 40.9 с),
+  hybrid cancel/overwrite/MP3/Opus, overwrite_wav, batch_cpu — зелёные.
+- `cargo test --release` (G6.2.2a, для истории) — **248 passed / 0 failed /
+  30 ignored**; clippy/fmt чисто; CUDA 2×2 40.8 с / 1×2 44.2 с, паритет,
+  cancel/overwrite/MP3/Opus/гибель ребёнка зелёные, сирот нет.
 - **CUDA P2A.1-бенчмарк G5.2** (13 чанков/64.01 с, 1 воркер, bench_clean,
   после прогрева, 3 прогона): 9.37 / 9.42 / 9.50 с, RTF 0.134–0.136,
   wall 9.6–9.8 с. Фон на момент замера: GPU ~17% (DWM/оверлей NVIDIA/
@@ -487,11 +550,22 @@ WAV/MP3/Opus без накопления аудио в памяти, одино�
 - Портативный комплект проверен на машине разработки; чистая Windows VM
   без Python/Torch/ORT/FFmpeg не проверялась. Модели/голос без
   подтверждённой лицензии на редистрибуцию (личное использование).
-- exe — консольной подсистемы (ради `--portable-*` диагностики): рядом с
-  GUI открывается консоль; при полностью раскрытых секциях и окне ~807 px
-  нижние секции уходят за край — свернуть секции или развернуть окно.
-- JSON настроек с BOM (внешний редактор) не читается: честное сообщение
-  и дефолты. Приложение само пишет JSON без BOM.
+- **G6.2.3 — GUI без консоли**: release-exe — Windows GUI-подсистема
+  (консольного окна нет ни у GUI, ни у дочерних worker-процессов,
+  `ffmpeg`/`nvidia-smi` спавнятся с CREATE_NO_WINDOW). Диагностика
+  `--portable-*` в том же EXE; вывод и ExitCode доступны через явно
+  перенаправленные stdout/stderr (System.Diagnostics.Process, PowerShell
+  redirect, pipes). При запуске из интерактивного `cmd.exe` без redirect
+  cmd не ждёт GUI-приложение — для сценариев использовать redirect.
+  MessageBox для ошибок аргументов — только когда stderr отсутствует вовсе.
+- **G6.2.3 — автосохранение настроек**: только при штатном закрытии окна
+  (Диспетчер задач/`taskkill /F`/завершение сеанса — без сохранения);
+  конфиг, не прочитанный при старте (в т.ч. JSON с BOM от внешнего
+  редактора), автоматически НЕ перезаписывается — политика осознанная;
+  ошибка записи требует выбора пользователя (Повторить / Выйти без
+  сохранения).
+- UI: при полностью раскрытых секциях и окне ~807 px нижние секции уходят
+  за край — свернуть секции или развернуть окно.
 - README-PORTABLE.txt комплектов до g52-final включительно содержит
   формулировку «Existing audio files are never overwritten» — с G5
   неточно: перезапись возможна явным чекбоксом (атомарно, после успешного
@@ -560,6 +634,9 @@ G6.2 завершён (отчёт `docs/G6_2_HYBRID_POOL.md`). Осталось 
 ## Подробные документы
 
 - `docs/SAFETY_AUDIT.md` — инцидент и постоянные правила безопасности.
+- `docs/G6_2_3_GUI_AUTOSAVE.md` — автосохранение настроек при закрытии
+  (машина состояний, политики ошибок/повреждённого конфига) и запуск GUI
+  без консоли (GUI-подсистема, сохранение headless-диагностики).
 - `docs/GUI_PLAN.md` — план и фактическое состояние GUI.
 - `docs/G3_BATCH.md` — пакетный режим, оценка переиспользования пула.
 - `docs/G6_PERSISTENT_POOL.md` — постоянный пул CUDA-воркеров в пакете

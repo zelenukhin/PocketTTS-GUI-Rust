@@ -65,8 +65,13 @@ GUI для Pocket-TTS на Rust. Оперативное состояние — *
   импорта Python-настроек, EOS по умолчанию `Fixed(-4.0)`, флаг
   `overwrite_existing`), `app.rs` (форма, валидация, прогресс/Стоп/статусы,
   G5.1 фазы: на Finalizing/Publishing «Стоп» отключён и статус «Сохранение
-  результата…», управляемые свёртки `.open(Some(field))`, закрытие окна с
-  отменой задания), `job.rs` (G2: резолв модели fast/slow, ORT env + init
+  результата…», управляемые свёртки `.open(Some(field))`, G6.2.3 — машина
+  закрытия `CloseFlow` (Idle/WaitingForJob/Saving/SaveFailed/Closing) с
+  автосохранением настроек при штатном закрытии: при живом задании сначала
+  отмена и завершение потока, затем сохранение; ошибка записи — окно
+  удерживается с диалогом Повторить/Выйти без сохранения; непрочитанный
+  при старте конфиг НЕ перезаписывается; `on_exit` — страховка, на Drop не
+  полагаемся), `job.rs` (G2: резолв модели fast/slow, ORT env + init
   один раз на процесс, конвертация GuiSettings→PipelineOptions с паритетом
   CLI, execute_job в фоновом потоке — напрямую app-core, НЕ subprocess;
   G5.1: `ensure_output_path_safe` ДО создания каталогов,
@@ -81,13 +86,17 @@ GUI для Pocket-TTS на Rust. Оперативное состояние — *
   `ipc.rs` (G6.2: локальный IPC диспетчера с дочерними процессами —
   Named Pipes, duplex, OVERLAPPED I/O, кадры u32+JSON, проверка PID
   клиента, PIPE_REJECT_REMOTE_CLIENTS; синхронные handle для duplex-
-  протокола непригодны — взаимная блокировка чтения/записи), `hybrid.rs`
-  (G6.2: гибридный пул 2 процесса × 2 постоянных воркера — протокол,
-  внутренний worker-режим (2 Pocket на процесс), диспетчер с общей
-  очередью и state machine файла, Job Object KILL_ON_JOB_CLOSE, watchdog,
-  контролируемый shutdown), `main.rs`
+  протокола непригодны — взаимная блокировка чтения/записи),
+  `hybrid.rs` (G6.2: гибридный пул 2 процесса × 2 постоянных воркера —
+  протокол, внутренний worker-режим (2 Pocket на процесс), диспетчер с
+  общей очередью и state machine файла, Job Object KILL_ON_JOB_CLOSE,
+  watchdog, контролируемый shutdown; настройки worker НЕ читает/пишет —
+  всё приходит по IPC), `main.rs`
   (шрифты/кириллица + диагностические `--portable-*` режимы через cli.rs;
-  внутренний worker-режим НИКОГДА не открывает окно).
+  G6.2.3: release — `windows_subsystem="windows"` (консольного окна нет;
+  debug остаётся консольным), диагностика в том же EXE через явные
+  redirects, MessageBox только при отсутствии stderr; внутренний
+  worker-режим НИКОГДА не открывает окно).
 - `tools/build-portable.ps1` + `tools/portable/` — G4-сборка комплекта:
   новый каталог вне репозитория, без удалений, проверка размеров/SHA256,
   manifest; лицензии/notices, VC++ runtime, FFmpeg, FP32-модели.
@@ -126,7 +135,16 @@ GUI для Pocket-TTS на Rust. Оперативное состояние — *
   Входные тексты, WAV-голос, модели и настройки замене не подлежат.
 - Другая разрешённая замена — собственный конфиг GUI
   `shtorm_gui_settings.json` (atomic: unique tmp + `MoveFileExW
-  REPLACE_EXISTING|WRITE_THROUGH`).
+  REPLACE_EXISTING|WRITE_THROUGH`; G6.2.3: автосохранение при штатном
+  закрытии окна; непрочитанный при старте конфиг автоматически НЕ
+  перезаписывается).
+- **G6.2.3 — окна консоли**: release-GUI — Windows GUI-подсистема;
+  консольные дочерние процессы (`ffmpeg`, `nvidia-smi`) спавнятся через
+  `app_core::hide_console()` (CREATE_NO_WINDOW), дочерние worker-процессы —
+  тот же GUI-exe. Не возвращать `ShowWindow(SW_HIDE)`/`FreeConsole()` как
+  решение: можно скрыть консоль пользователя или потерять диагностику;
+  вывод диагностики должен оставаться доступным через перенаправленные
+  stdout/stderr и ExitCode.
 - **G6.2 — дочерние процессы синтеза**: GUI-процесс запускает ТОЛЬКО
   собственный exe (`--internal-batch-worker`) и завершает/kill'ит только
   свои дочерние PID (плюс Windows Job Object KILL_ON_JOB_CLOSE — гибель GUI
