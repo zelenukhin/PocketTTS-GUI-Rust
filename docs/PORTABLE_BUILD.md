@@ -430,10 +430,14 @@ audio files are never overwritten» — с G5 неточная (перезапи
 
 ## Результаты проверки G6.2.3 (2026-11-11)
 
-Комплект: `C:\PocketTTS-GUI-Rust\dist\ShtormTTS-Portable-2026-11-11-g623-autosave-no-console`
-— git `9a74f6c` (dirty=false), 54 файла, 3404.1 MiB, exe SHA256
-`0BF311BC7FC6155A6E9E0353A403D1B4DCB0888F87C10FE3C7DCBA7CB19EC08F`.
-Собран из коммита G6.2.3; `g62-final` и `g622-final` не изменялись.
+**Финальный комплект**: `C:\PocketTTS-GUI-Rust\dist\ShtormTTS-Portable-2026-11-11-g623-final`
+— git `4579ca9` (dirty=false), 54 файла, 3404.1 MiB, exe SHA256
+`602F9DCB729BF51E6230296CC55E3D20F479B7852896F3965826941E9803D54B`.
+Промежуточный `...-g623-autosave-no-console` (git `9a74f6c`, exe SHA256
+`0BF311BC7FC6155A6E9E0353A403D1B4DCB0888F87C10FE3C7DCBA7CB19EC08F`)
+собран до тестового коммита стабилизации и оставлен как есть; финальный
+продуктовый код в обоих комплектах одинаков (коммит 4579ca9 меняет только
+`#[cfg(test)]`-часть hybrid.rs). `g62-final` и `g622-final` не изменялись.
 Структура комплекта прежняя (новых exe нет); `tools/portable/README.txt`
 дополнен заметками про автосохранение и перенаправление диагностики.
 

@@ -361,11 +361,13 @@ WAV/MP3/Opus без накопления аудио в памяти, одино�
   1×2 pool, 2×2 hybrid 12/12 (2 процесса, 4 Pocket, 40.9 с, VRAM к базе),
   hybrid cancel/overwrite/MP3/Opus, single overwrite WAV, batch CPU —
   зелёные.
-- **Portable**: новый комплект
-  `C:\PocketTTS-GUI-Rust\dist\ShtormTTS-Portable-2026-11-11-g623-autosave-no-console`
-  — git `9a74f6c` dirty=false, 54 файла, 3404.1 MiB, exe SHA256
-  `0BF311BC7FC6155A6E9E0353A403D1B4DCB0888F87C10FE3C7DCBA7CB19EC08F`
-  (структура без изменений; `tools/portable/README.txt` дополнен).
+- **Portable**: финальный комплект
+  `C:\PocketTTS-GUI-Rust\dist\ShtormTTS-Portable-2026-11-11-g623-final`
+  — git `4579ca9` dirty=false, 54 файла, 3404.1 MiB, exe SHA256
+  `602F9DCB729BF51E6230296CC55E3D20F479B7852896F3965826941E9803D54B`
+  (промежуточный `...-g623-autosave-no-console` от `9a74f6c` оставлен без
+  изменений; продуктовый код одинаков). Структура без изменений;
+  `tools/portable/README.txt` дополнен.
   Проверки из комплекта с CWD `C:\` (`out/g623_portable_acceptance.ps1`):
   portable-check OK (всё exe-relative); автосохранение в комплекте + повторное
   открытие (тема Off), no-change закрытие байт-в-байт; реальные CUDA WAV и
