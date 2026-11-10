@@ -61,6 +61,7 @@ struct ActiveFileUi {
 struct BatchUiState {
     total: usize,
     /// Файлов обрабатывается одновременно (постоянных воркеров пула).
+    /// G6.1.1: 0 — воркеры ещё не готовы (preflight/загрузка пула).
     workers: usize,
     /// Завершено файлов (любым статусом) — K из N.
     finished: usize,
@@ -68,6 +69,9 @@ struct BatchUiState {
     failed: usize,
     skipped: usize,
     cancelled: usize,
+    /// Индексы файлов (K, 1-based), для которых FileDone уже учтён:
+    /// защита от двойного счёта одного файла (G6.1.1, Test E).
+    done_indices: std::collections::HashSet<usize>,
     /// Активные файлы (не более `workers`).
     active: Vec<ActiveFileUi>,
 }
@@ -275,6 +279,20 @@ impl ShtormApp {
                 });
                 self.refresh_batch_status();
             }
+            JobEvent::BatchWorkersReady { workers } => {
+                // G6.1.1: только обновление числа воркеров в УЖЕ созданном
+                // BatchStarted состоянии — счётчики ранних FileDone preflight
+                // не сбрасываются. События до BatchStarted — протокольная
+                // аномалия: диагностируем, а не молча создаём состояние.
+                match self.batch_state.as_mut() {
+                    Some(bs) => bs.workers = workers,
+                    None => self.push_log(
+                        "ВНИМАНИЕ (протокол): BatchWorkersReady до BatchStarted — \
+                         проигнорировано",
+                    ),
+                }
+                self.refresh_batch_status();
+            }
             JobEvent::FileStarted {
                 index,
                 total,
@@ -334,16 +352,33 @@ impl ShtormApp {
                 // K/N и счётчики обновляются на КАЖДОМ завершённом файле,
                 // включая Failed/Skipped; итог пакета считается по реальным
                 // результатам всех файлов, а не последнему событию.
-                if let Some(bs) = self.batch_state.as_mut() {
-                    bs.total = total;
-                    bs.active.retain(|f| f.index != index);
-                    bs.finished += 1;
-                    match report.status {
-                        FileStatus::Completed => bs.completed += 1,
-                        FileStatus::Failed => bs.failed += 1,
-                        FileStatus::Skipped => bs.skipped += 1,
-                        FileStatus::Cancelled => bs.cancelled += 1,
+                // G6.1.1: повторный FileDone того же индекса — протокольная
+                // аномалия: не считаем дважды и честно диагностируем.
+                let duplicate = match self.batch_state.as_mut() {
+                    Some(bs) => {
+                        bs.total = total;
+                        if bs.done_indices.contains(&index) {
+                            true
+                        } else {
+                            bs.done_indices.insert(index);
+                            bs.active.retain(|f| f.index != index);
+                            bs.finished += 1;
+                            match report.status {
+                                FileStatus::Completed => bs.completed += 1,
+                                FileStatus::Failed => bs.failed += 1,
+                                FileStatus::Skipped => bs.skipped += 1,
+                                FileStatus::Cancelled => bs.cancelled += 1,
+                            }
+                            false
+                        }
                     }
+                    None => false,
+                };
+                if duplicate {
+                    self.push_log(&format!(
+                        "ВНИМАНИЕ (протокол): повторное завершение файла {index}/{total} \
+                         не учтено дважды"
+                    ));
                 }
                 self.publishing = false;
                 self.file_progress = (index, total);
@@ -379,7 +414,13 @@ impl ShtormApp {
         if bs.cancelled > 0 {
             s.push_str(&format!(" | отменено {}", bs.cancelled));
         }
-        s.push_str(&format!("; одновременно {}", bs.workers));
+        // G6.1.1: workers=0 — пул ещё не загружен (preflight/загрузка Pocket);
+        // честное «готовятся» вместо ложного «работают N»
+        if bs.workers > 0 {
+            s.push_str(&format!("; одновременно {}", bs.workers));
+        } else {
+            s.push_str("; воркеры готовятся…");
+        }
         self.status = s;
     }
 
@@ -1412,6 +1453,314 @@ mod tests {
         assert!(
             app.stop_available(),
             "активных файлов нет — Стоп (между файлами)"
+        );
+    }
+
+    // ===== G6.1.1: регрессионные тесты пакетного состояния (Test A–F) =====
+
+    fn file_report(idx: usize, status: FileStatus, reason: &str) -> crate::batch::FileReport {
+        let mut r = crate::batch::FileReport::new(
+            &crate::batch::BatchFile {
+                input: PathBuf::from(format!("C:/src/f{idx}.txt")),
+                relative: PathBuf::from(format!("f{idx}.txt")),
+            },
+            Some(PathBuf::from(format!("C:/out/f{idx}.wav"))),
+        );
+        r.status = status;
+        r.reason = Some(reason.into());
+        r
+    }
+
+    fn apply_file_done(app: &mut ShtormApp, index: usize, total: usize, status: FileStatus) {
+        app.apply_event(crate::job::JobEvent::FileDone {
+            index,
+            total,
+            report: Box::new(file_report(index, status, "мок")),
+        });
+    }
+
+    /// Test A — ранние Skipped preflight учитываются до загрузки пула;
+    /// BatchWorkersReady обновляет только число воркеров, БЕЗ сброса
+    /// счётчиков и без повторного создания состояния.
+    #[test]
+    fn batch_early_skipped_survive_workers_ready() {
+        let mut app = ShtormApp::new();
+        app.batch_running = true;
+        // порядок событий — в точности как в задании G6.1.1 §4 (Test A)
+        app.apply_event(crate::job::JobEvent::BatchStarted {
+            total: 5,
+            workers: 0,
+        });
+        apply_file_done(&mut app, 1, 5, FileStatus::Skipped);
+        apply_file_done(&mut app, 3, 5, FileStatus::Skipped);
+        {
+            let bs = app.batch_state.as_ref().expect("состояние пакета");
+            assert_eq!((bs.finished, bs.skipped), (2, 2), "ранние Skipped учтены");
+            assert_eq!(bs.workers, 0, "воркеры ещё не готовы");
+        }
+        app.apply_event(crate::job::JobEvent::BatchWorkersReady { workers: 2 });
+        {
+            let bs = app.batch_state.as_ref().expect("состояние пакета");
+            assert_eq!(bs.workers, 2, "число воркеров обновлено");
+            assert_eq!(
+                (bs.finished, bs.skipped, bs.completed, bs.failed),
+                (2, 2, 0, 0),
+                "обновление воркеров не сбросило счётчики preflight"
+            );
+        }
+        for k in [2, 4] {
+            app.apply_event(crate::job::JobEvent::FileStarted {
+                index: k,
+                total: 5,
+                input: PathBuf::from(format!("C:/src/f{k}.txt")),
+                output: PathBuf::from(format!("C:/out/f{k}.wav")),
+            });
+        }
+        apply_file_done(&mut app, 4, 5, FileStatus::Completed);
+        apply_file_done(&mut app, 2, 5, FileStatus::Completed);
+        apply_file_done(&mut app, 5, 5, FileStatus::Failed);
+        let bs = app.batch_state.as_ref().expect("состояние пакета");
+        assert_eq!(bs.total, 5);
+        assert_eq!(bs.finished, 5);
+        assert_eq!(bs.completed, 2);
+        assert_eq!(bs.skipped, 2);
+        assert_eq!(bs.failed, 1);
+        assert!(bs.active.is_empty());
+        assert_eq!(bs.workers, 2);
+        assert!(
+            app.status.contains("5/5") && app.status.contains("одновременно 2"),
+            "{}",
+            app.status
+        );
+    }
+
+    /// Test B — весь пакет пропущен: все FileDone учтены, пул не загружался
+    /// (workers остаётся 0), итог честно NoWork, а не «воркеры работают».
+    #[test]
+    fn batch_all_skipped_never_shows_running_workers() {
+        let mut app = ShtormApp::new();
+        app.batch_running = true;
+        app.apply_event(crate::job::JobEvent::BatchStarted {
+            total: 3,
+            workers: 0,
+        });
+        for k in 1..=3 {
+            apply_file_done(&mut app, k, 3, FileStatus::Skipped);
+        }
+        let bs = app.batch_state.as_ref().expect("состояние пакета");
+        assert_eq!((bs.finished, bs.skipped), (3, 3), "все FileDone учтены");
+        assert_eq!(
+            bs.workers, 0,
+            "Pocket не загружался — BatchWorkersReady не было"
+        );
+        assert!(
+            app.status.contains("пропущено 3"),
+            "GUI показывает число пропущенных: {}",
+            app.status
+        );
+        assert!(
+            app.status.contains("воркеры готовятся"),
+            "ложного статуса работающих воркеров нет: {}",
+            app.status
+        );
+        // итог NoWork по существующей семантике (не вводит в заблуждение)
+        app.apply_event(crate::job::JobEvent::Finished(Box::new(
+            crate::job::JobResult {
+                status: JobStatus::NoWork,
+                summary: "ПАКЕТ: готово 0 | ошибок 0 | пропущено 3 | всего 3 | НЕЧЕГО ДЕЛАТЬ"
+                    .into(),
+                final_path: None,
+                partial_path: None,
+                diag_path: None,
+                chunk_log_path: None,
+                rtf: None,
+                progress: (3, 3),
+                replaced_existing: false,
+                batch: None,
+            },
+        )));
+        assert!(app.status.starts_with("⚠ Нет работы"), "{}", app.status);
+    }
+
+    /// Test C — сбой загрузки пула: часть файлов пропущена на preflight,
+    /// остальные Failed («пул не запущен»); счётчики UI полностью совпадают
+    /// с BatchReport (сверка обоих наборов счётчиков).
+    #[test]
+    fn batch_pool_load_failure_counters_match_report() {
+        let mut app = ShtormApp::new();
+        app.batch_running = true;
+        app.apply_event(crate::job::JobEvent::BatchStarted {
+            total: 4,
+            workers: 0,
+        });
+        apply_file_done(&mut app, 1, 4, FileStatus::Skipped);
+        apply_file_done(&mut app, 2, 4, FileStatus::Skipped);
+        // пул не запустился — оставшиеся кандидаты честно Failed
+        app.apply_event(crate::job::JobEvent::Log(
+            "ВНИМАНИЕ: пул не запущен: воркер 0: CUDA OOM".into(),
+        ));
+        apply_file_done(&mut app, 3, 4, FileStatus::Failed);
+        apply_file_done(&mut app, 4, 4, FileStatus::Failed);
+        app.apply_event(crate::job::JobEvent::Finished(Box::new(
+            crate::job::JobResult::failed(
+                "ПАКЕТ: готово 0 | ошибок 2 | пропущено 2 | всего 4 | ОШИБКА".into(),
+            ),
+        )));
+        let bs = app.batch_state.as_ref().expect("состояние пакета");
+        assert_eq!(bs.total, 4);
+        assert_eq!(bs.finished, 4);
+        assert_eq!((bs.completed, bs.failed, bs.skipped), (0, 2, 2));
+        assert_eq!(
+            bs.workers, 0,
+            "пул не загрузился — UI не показывает работающих воркеров"
+        );
+        assert!(app.log.contains("пул не запущен"));
+        assert!(app.status.starts_with("Ошибка"), "{}", app.status);
+    }
+
+    /// Test D — отмена до/во время preflight: новые файлы не стартуют,
+    /// уже завершённые результаты сохранены, счётчики не сбрасываются,
+    /// итог — Cancelled.
+    #[test]
+    fn batch_cancel_during_preflight_keeps_counters() {
+        let mut app = ShtormApp::new();
+        app.batch_running = true;
+        app.apply_event(crate::job::JobEvent::BatchStarted {
+            total: 3,
+            workers: 0,
+        });
+        // preflight под отменой помечает всё Skipped «отменено до запуска»
+        for k in 1..=3 {
+            app.apply_event(crate::job::JobEvent::FileDone {
+                index: k,
+                total: 3,
+                report: Box::new(crate::batch::FileReport::skipped(
+                    &crate::batch::BatchFile {
+                        input: PathBuf::from(format!("C:/src/f{k}.txt")),
+                        relative: PathBuf::from(format!("f{k}.txt")),
+                    },
+                    Some(PathBuf::from(format!("C:/out/f{k}.wav"))),
+                    "отменено до запуска",
+                )),
+            });
+        }
+        let bs = app.batch_state.as_ref().expect("состояние пакета");
+        assert_eq!((bs.finished, bs.skipped), (3, 3));
+        assert!(bs.active.is_empty(), "после отмены новые файлы не стартуют");
+        assert_eq!(
+            bs.cancelled, 0,
+            "Skipped-отмена не считается Cancelled-файлом"
+        );
+        app.apply_event(crate::job::JobEvent::Finished(Box::new(
+            crate::job::JobResult {
+                status: JobStatus::Cancelled,
+                summary: "ПАКЕТ: готово 0 | ошибок 0 | пропущено 3 | всего 3 | ОТМЕНЕНО".into(),
+                final_path: None,
+                partial_path: None,
+                diag_path: None,
+                chunk_log_path: None,
+                rtf: None,
+                progress: (3, 3),
+                replaced_existing: false,
+                batch: None,
+            },
+        )));
+        assert!(app.status.starts_with("Отменено"), "{}", app.status);
+        // счётчики уцелели после итога
+        let bs = app.batch_state.as_ref().expect("состояние пакета");
+        assert_eq!(bs.finished, 3, "итог не сбросил счётчики");
+    }
+
+    /// Test E — порядок событий: FileDone до загрузки Pocket не теряются,
+    /// повторный BatchWorkersReady НЕ повторяет инициализацию (состояние и
+    /// счётчики переживают его), а повторный FileDone того же индекса не
+    /// учитывается дважды — с явной диагностикой в журнале (не молча).
+    #[test]
+    fn batch_workers_ready_is_not_reinit_and_duplicate_filedone_diagnosed() {
+        let mut app = ShtormApp::new();
+        app.batch_running = true;
+        app.apply_event(crate::job::JobEvent::BatchStarted {
+            total: 2,
+            workers: 0,
+        });
+        apply_file_done(&mut app, 1, 2, FileStatus::Skipped);
+        // повторное обновление воркеров (например, деградация 2→1) — только
+        // поле workers, состояние то же самое
+        app.apply_event(crate::job::JobEvent::BatchWorkersReady { workers: 2 });
+        app.apply_event(crate::job::JobEvent::BatchWorkersReady { workers: 1 });
+        {
+            let bs = app.batch_state.as_ref().expect("состояние пакета");
+            assert_eq!(bs.workers, 1);
+            assert_eq!(
+                (bs.finished, bs.skipped),
+                (1, 1),
+                "счётчики пережили повторное BatchWorkersReady"
+            );
+            assert_eq!(bs.total, 2);
+        }
+        // протокольная аномалия: тот же индекс завершён дважды — двойного
+        // учёта нет, в журнале явная диагностика
+        app.log.clear();
+        apply_file_done(&mut app, 1, 2, FileStatus::Completed);
+        {
+            let bs = app.batch_state.as_ref().expect("состояние пакета");
+            assert_eq!(bs.finished, 1, "дубль не учтён в finished");
+            assert_eq!(bs.completed, 0, "дубль не учтён в completed");
+            assert_eq!(bs.skipped, 1, "исходный статус файла 1 не изменён");
+        }
+        assert!(
+            app.log.contains("не учтено дважды"),
+            "диагностика дубля в журнале: {}",
+            app.log
+        );
+        // BatchWorkersReady ДО BatchStarted — диагностируется, состояние не
+        // создаётся молча
+        let mut app2 = ShtormApp::new();
+        app2.batch_running = true;
+        app2.log.clear();
+        app2.apply_event(crate::job::JobEvent::BatchWorkersReady { workers: 2 });
+        assert!(
+            app2.batch_state.is_none(),
+            "состояние не создано вне BatchStarted"
+        );
+        assert!(app2.log.contains("протокол"), "{}", app2.log);
+    }
+
+    /// Test F (UI-часть) — последовательный путь: один BatchStarted
+    /// (workers=0) → BatchWorkersReady(1) ДО preflight FileDone; одиночный
+    /// синтез вообще не создаёт пакетного состояния.
+    #[test]
+    fn batch_sequential_single_started_then_single_file_mode() {
+        let mut app = ShtormApp::new();
+        app.batch_running = true;
+        app.apply_event(crate::job::JobEvent::BatchStarted {
+            total: 2,
+            workers: 0,
+        });
+        app.apply_event(crate::job::JobEvent::BatchWorkersReady { workers: 1 });
+        apply_file_done(&mut app, 1, 2, FileStatus::Skipped); // preflight
+        app.apply_event(crate::job::JobEvent::FileStarted {
+            index: 2,
+            total: 2,
+            input: PathBuf::from("C:/src/f2.txt"),
+            output: PathBuf::from("C:/out/f2.wav"),
+        });
+        apply_file_done(&mut app, 2, 2, FileStatus::Completed);
+        let bs = app.batch_state.as_ref().expect("состояние пакета");
+        assert_eq!((bs.finished, bs.skipped, bs.completed), (2, 1, 1));
+        assert_eq!(bs.workers, 1, "последовательный путь — один «воркер»");
+        assert!(app.status.contains("одновременно 1"), "{}", app.status);
+
+        // одиночный синтез (не пакет): пакетное состояние не затрагивается
+        let mut solo = ShtormApp::new();
+        solo.apply_event(crate::job::JobEvent::Progress { done: 1, total: 3 });
+        solo.apply_event(crate::job::JobEvent::Phase(JobPhase::Finalizing));
+        solo.apply_event(crate::job::JobEvent::Finished(Box::new(
+            crate::job::JobResult::failed("тест-одиночный".into()),
+        )));
+        assert!(
+            solo.batch_state.is_none(),
+            "одиночный режим без пакетного состояния"
         );
     }
 

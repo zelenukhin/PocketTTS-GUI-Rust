@@ -74,8 +74,19 @@ pub enum JobEvent {
     Phase(JobPhase),
     /// G6.1: пакет начат: всего файлов и сколько обрабатывается одновременно
     /// (постоянных воркеров пула; 1 — последовательный путь).
+    /// G6.1.1: отправляется ДО preflight (сразу после plan_batch) с
+    /// `workers = 0` — ранние FileDone preflight (пропуски/конфликты/
+    /// unsafe-пути) обязаны попадать в уже инициализированное состояние UI.
+    /// Второй BatchStarted в рамках одного пакета не отправляется.
     BatchStarted {
         total: usize,
+        workers: usize,
+    },
+    /// G6.1.1: постоянные воркеры пула реально загружены и работают.
+    /// Приходит после BatchStarted и только обновляет число воркеров в
+    /// существующем состоянии — счётчики ранних FileDone не сбрасываются.
+    /// Последовательный путь шлёт его с workers=1 до preflight.
+    BatchWorkersReady {
         workers: usize,
     },
     /// G6.1: файл K/N стартовал (в параллельном пакете — из потока воркера).
@@ -685,6 +696,16 @@ pub fn execute_batch(
         };
     }
 
+    // G6.1.1: инициализация пакетного UI ДО любых событий файлов — preflight
+    // обоих путей (пул и последовательный) уже шлёт FileDone для пропущенных/
+    // конфликтных/битых файлов, и они обязаны учитываться в счётчиках.
+    // Воркеров ещё нет (0): реальное число сообщит BatchWorkersReady после
+    // загрузки пула (или сразу в последовательном пути).
+    emit(JobEvent::BatchStarted {
+        total: plan.files.len(),
+        workers: 0,
+    });
+
     let ext = settings.format.extension_str().to_string();
     let overwrite = settings.overwrite_existing;
     let pool = settings.device == DeviceChoice::Cuda
@@ -734,10 +755,9 @@ fn execute_batch_sequential(
     cancel: &Arc<AtomicBool>,
     emit: &Arc<dyn Fn(JobEvent) + Send + Sync>,
 ) -> BatchReport {
-    emit(JobEvent::BatchStarted {
-        total: plan.files.len(),
-        workers: 1,
-    });
+    // G6.1.1: BatchStarted уже отправлен в execute_batch; последовательный
+    // путь обрабатывает файлы по одному — «воркер» готов сразу, до preflight.
+    emit(JobEvent::BatchWorkersReady { workers: 1 });
     let cur_file = std::sync::atomic::AtomicUsize::new(0);
     let emit_batch = |ev: BatchEvent| match ev {
         BatchEvent::Planned { total, warnings } => {
@@ -1087,7 +1107,10 @@ fn execute_batch_persistent_pool(
         load_ms.join("/"),
         to_synth.len()
     )));
-    emit(JobEvent::BatchStarted { total, workers });
+    // G6.1.1: пул загружен — сообщаем число реально работающих воркеров.
+    // Раньше сюда помещался второй BatchStarted, который обнулял счётчики
+    // после preflight FileDone (дефект G6.1.1 №1).
+    emit(JobEvent::BatchWorkersReady { workers });
 
     // --- параллельный прогон на пуле ---
     let settings_c = settings.clone();
@@ -1992,6 +2015,163 @@ mod tests {
         let report = res.batch.expect("отчёт");
         assert!(report.cancelled);
         assert_eq!(report.skipped(), 2);
+    }
+
+    // ===== G6.1.1: порядок пакетных событий (без ORT/CUDA — чистые события) =====
+
+    /// Сбор событий execute_batch в Vec (для проверок порядка).
+    fn collect_events(
+        s: &GuiSettings,
+        src: &Path,
+        cancel: &Arc<AtomicBool>,
+    ) -> (JobResult, Vec<JobEvent>) {
+        let events: Arc<std::sync::Mutex<Vec<JobEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let emit: Arc<dyn Fn(JobEvent) + Send + Sync> = {
+            let events = Arc::clone(&events);
+            Arc::new(move |ev| events.lock().unwrap().push(ev))
+        };
+        let res = execute_batch(s, src, cancel, &emit);
+        let collected = events.lock().unwrap().clone();
+        (res, collected)
+    }
+
+    /// G6.1.1 (Test F): последовательный путь шлёт РОВНО ОДИН BatchStarted
+    /// ДО любых FileDone (включая preflight Skipped) и BatchWorkersReady(1)
+    /// тоже до FileDone. Синтез здесь падает на отсутствии модели — события
+    /// и порядок от этого не зависят.
+    #[test]
+    fn sequential_batch_emits_single_started_before_any_filedone() {
+        let d = tmpdir("g611_seq_events");
+        let src = d.join("src");
+        let out = d.join("out");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(src.join("a.txt"), "Текст.").unwrap();
+        std::fs::write(src.join("b.txt"), "Текст.").unwrap();
+        std::fs::write(out.join("a.wav"), b"exists").unwrap(); // preflight Skipped
+        let s = GuiSettings {
+            onnx_base: d.join("no-models").display().to_string(), // execute_job упадёт
+            out_dir: out.display().to_string(),
+            ..Default::default()
+        };
+        let (res, events) = collect_events(&s, &src, &Arc::new(AtomicBool::new(false)));
+        assert_eq!(res.status, JobStatus::Failed, "{}", res.summary);
+        let started = events
+            .iter()
+            .filter(|e| matches!(e, JobEvent::BatchStarted { .. }))
+            .count();
+        assert_eq!(started, 1, "ровно один BatchStarted: {events:?}");
+        let pos_started = events
+            .iter()
+            .position(|e| matches!(e, JobEvent::BatchStarted { .. }))
+            .unwrap();
+        let first_done = events
+            .iter()
+            .position(|e| matches!(e, JobEvent::FileDone { .. }))
+            .expect("есть хотя бы preflight FileDone");
+        assert!(
+            pos_started < first_done,
+            "BatchStarted строго до первого FileDone: {events:?}"
+        );
+        let ready_pos = events
+            .iter()
+            .position(|e| matches!(e, JobEvent::BatchWorkersReady { .. }))
+            .expect("последовательный путь сообщает BatchWorkersReady(1)");
+        assert!(ready_pos < first_done, "BatchWorkersReady до FileDone");
+        if let JobEvent::BatchStarted { total, workers } = &events[pos_started] {
+            assert_eq!(*total, 2);
+            assert_eq!(*workers, 0, "воркеры изначально не готовы");
+        }
+        if let JobEvent::BatchWorkersReady { workers } = &events[ready_pos] {
+            assert_eq!(*workers, 1);
+        }
+        // preflight-пропуск учтён событием до старта синтезируемого файла
+        let done_skipped = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    JobEvent::FileDone { report, .. }
+                        if report.status == FileStatus::Skipped
+                            && report.reason.as_deref().is_some_and(|r| r.contains("существует"))
+                )
+            })
+            .count();
+        assert_eq!(done_skipped, 1, "существующий результат — ранний Skipped");
+    }
+
+    /// G6.1.1 (Test B/C на уровне execute_batch): весь пакет пропущен —
+    /// NoWork, ровно один BatchStarted, ни одного BatchWorkersReady с
+    /// воркерами пула и ни одного FileStarted (Pocket не нужен).
+    #[test]
+    fn all_skipped_batch_events_have_no_workers_ready() {
+        let d = tmpdir("g611_allskip_events");
+        let src = d.join("src");
+        let out = d.join("out");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        for i in 0..3 {
+            std::fs::write(src.join(format!("f{i}.txt")), "Текст.").unwrap();
+            std::fs::write(out.join(format!("f{i}.wav")), b"done").unwrap();
+        }
+        let s = GuiSettings {
+            out_dir: out.display().to_string(),
+            ..Default::default()
+        };
+        let (res, events) = collect_events(&s, &src, &Arc::new(AtomicBool::new(false)));
+        assert_eq!(res.status, JobStatus::NoWork, "{}", res.summary);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, JobEvent::BatchStarted { .. }))
+                .count(),
+            1
+        );
+        let dones = events
+            .iter()
+            .filter(|e| matches!(e, JobEvent::FileDone { .. }))
+            .count();
+        assert_eq!(dones, 3, "все пропуски дали FileDone");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, JobEvent::FileStarted { .. })),
+            "ни один файл не стартовал"
+        );
+    }
+
+    /// G6.1.1: отмена до preflight — Cancelled; BatchStarted всё равно
+    /// отправляется до FileDone, все файлы «отменено до запуска».
+    #[test]
+    fn cancelled_batch_events_order() {
+        let d = tmpdir("g611_cancel_events");
+        let src = d.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.txt"), "Текст.").unwrap();
+        std::fs::write(src.join("b.txt"), "Текст.").unwrap();
+        let s = GuiSettings {
+            out_dir: d.join("out").display().to_string(),
+            ..Default::default()
+        };
+        let (res, events) = collect_events(&s, &src, &Arc::new(AtomicBool::new(true)));
+        assert_eq!(res.status, JobStatus::Cancelled, "{}", res.summary);
+        let pos_started = events
+            .iter()
+            .position(|e| matches!(e, JobEvent::BatchStarted { .. }))
+            .expect("BatchStarted отправлен");
+        let first_done = events
+            .iter()
+            .position(|e| matches!(e, JobEvent::FileDone { .. }))
+            .expect("FileDone отмены");
+        assert!(pos_started < first_done, "{events:?}");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, JobEvent::FileDone { .. }))
+                .count(),
+            2
+        );
     }
 
     // ============ реальные прогоны (нужны модели + ORT DLL + ffmpeg) ============
@@ -3017,6 +3197,145 @@ mod tests {
             );
             eprintln!("[g61_vram] база {v0:.0} МБ → после пакета {v1:.0} МБ");
         }
+    }
+
+    /// G6.1.1 (§7 приёмки): часть WAV уже существует (overwrite=false) —
+    /// preflight пропускает их ДО загрузки Pocket (FileDone Skipped раньше
+    /// BatchWorkersReady), остальные синтезируются пулом; счётчики событий
+    /// (модель apply_event) полностью совпадают с итоговым BatchReport.
+    #[test]
+    #[ignore = "реальный пакетный синтез CUDA: модели + ORT GPU DLL (2 прогона)"]
+    fn real_batch_cuda_pool_partial_skip_events() {
+        let parts = p2b3_parts();
+        let src_dir = parts[0].parent().unwrap().to_path_buf();
+        let d = tmpdir("g611_partial_skip");
+        let emit: Arc<dyn Fn(JobEvent) + Send + Sync> = Arc::new(|_| {});
+
+        // прогон 1: полный пакет на пуле — все 12 готовы (готовые WAV для копии)
+        let out1 = d.join("out1");
+        let mut s = p2b3_settings(&d, None);
+        s.out_dir = out1.display().to_string();
+        s.clamped();
+        let r1 = execute_batch(&s, &src_dir, &Arc::new(AtomicBool::new(false)), &emit);
+        assert_eq!(r1.status, JobStatus::Completed, "{}", r1.summary);
+        assert_eq!(r1.batch.as_ref().unwrap().pool_loads, Some(2));
+
+        // прогон 2: НОВЫЙ каталог результата с ПОЛОВИНОЙ готовых WAV
+        // (копирование — только создание новых файлов, ничего не удаляем)
+        let out2 = d.join("out2");
+        std::fs::create_dir_all(&out2).unwrap();
+        let mut preexisting = 0usize;
+        for (i, p) in parts.iter().enumerate() {
+            if i % 2 == 0 {
+                let name = p.with_extension("wav").file_name().unwrap().to_os_string();
+                std::fs::copy(out1.join(&name), out2.join(&name)).unwrap();
+                preexisting += 1;
+            }
+        }
+        let events: Arc<std::sync::Mutex<Vec<JobEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let emit2: Arc<dyn Fn(JobEvent) + Send + Sync> = {
+            let events = Arc::clone(&events);
+            Arc::new(move |ev| events.lock().unwrap().push(ev))
+        };
+        let mut s2 = s.clone();
+        s2.out_dir = out2.display().to_string();
+        s2.clamped();
+        let r2 = execute_batch(&s2, &src_dir, &Arc::new(AtomicBool::new(false)), &emit2);
+        eprintln!("[g611_partial] {} | {}", r2.status.label(), r2.summary);
+        assert_eq!(r2.status, JobStatus::Completed, "{}", r2.summary);
+        let rep = r2.batch.expect("отчёт");
+        let expect_synth = parts.len() - preexisting;
+        assert_eq!(rep.skipped(), preexisting, "{}", rep.summary());
+        assert_eq!(rep.completed(), expect_synth, "{}", rep.summary());
+        assert_eq!(rep.pool_loads, Some(2), "пул работает на уцелевших файлах");
+        // копии не тронуты, новые файлы есть
+        for (i, p) in parts.iter().enumerate() {
+            let name = p.with_extension("wav").file_name().unwrap().to_os_string();
+            let f2 = out2.join(&name);
+            assert!(f2.is_file(), "итог {} существует", f2.display());
+            if i % 2 == 0 {
+                assert_eq!(
+                    std::fs::read(&f2).unwrap(),
+                    std::fs::read(out1.join(&name)).unwrap(),
+                    "существующий результат побайтово цел (копия из прогона 1)"
+                );
+            }
+        }
+
+        // --- порядок событий: ранние Skipped ДО загрузки Pocket ---
+        let events = events.lock().unwrap().clone();
+        let pos_started = events
+            .iter()
+            .position(|e| matches!(e, JobEvent::BatchStarted { .. }))
+            .expect("BatchStarted");
+        let pos_ready = events
+            .iter()
+            .position(|e| matches!(e, JobEvent::BatchWorkersReady { .. }))
+            .expect("BatchWorkersReady после загрузки пула");
+        assert!(pos_started < pos_ready, "{events:?}");
+        // «визуальный» счётчик по событиям (та же редукция, что apply_event)
+        let mut finished = 0usize;
+        let mut completed = 0usize;
+        let mut skipped = 0usize;
+        let mut failed = 0usize;
+        let mut early_skip_after_ready = 0usize;
+        for (pos, ev) in events.iter().enumerate() {
+            if let JobEvent::FileDone { report, .. } = ev {
+                match report.status {
+                    FileStatus::Completed => completed += 1,
+                    FileStatus::Failed => failed += 1,
+                    FileStatus::Skipped => {
+                        skipped += 1;
+                        if pos > pos_ready
+                            && report
+                                .reason
+                                .as_deref()
+                                .is_some_and(|r| r.contains("существует"))
+                        {
+                            early_skip_after_ready += 1;
+                        }
+                    }
+                    FileStatus::Cancelled => {}
+                }
+                finished += 1;
+            }
+        }
+        assert_eq!(
+            early_skip_after_ready, 0,
+            "Skipped-«результат существует» решаются ДО загрузки воркеров"
+        );
+        // все предсуществующие пропуски пришли до BatchWorkersReady
+        let skips_before_ready = events
+            .iter()
+            .take(pos_ready)
+            .filter(|e| {
+                matches!(
+                    e,
+                    JobEvent::FileDone { report, .. }
+                        if report.status == FileStatus::Skipped
+                )
+            })
+            .count();
+        assert_eq!(skips_before_ready, preexisting, "{events:?}");
+        if let JobEvent::BatchWorkersReady { workers } = &events[pos_ready] {
+            assert_eq!(*workers, 2);
+        }
+        // счётчики событий == счётчикам отчёта (критерий G6.1.1)
+        assert_eq!(finished, rep.total(), "finished == total отчёта");
+        assert_eq!(completed, rep.completed());
+        assert_eq!(skipped, rep.skipped());
+        assert_eq!(failed, rep.failed());
+        // FileStarted только для синтезированных
+        let started = events
+            .iter()
+            .filter(|e| matches!(e, JobEvent::FileStarted { .. }))
+            .count();
+        assert_eq!(started, expect_synth);
+        eprintln!(
+            "[g611_partial] события: finished={finished} completed={completed} skipped={skipped} \
+             (ранних до пула: {skips_before_ready}) failed={failed}; отчёт согласован"
+        );
     }
 
     /// G6.1: отмена в середине пакета: новые файлы не назначаются, готовые

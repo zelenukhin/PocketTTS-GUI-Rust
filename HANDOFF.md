@@ -1,15 +1,16 @@
 # HANDOFF.md — оперативный снимок проекта (читать первым вместе с AGENTS.md)
 
-- **Дата обновления**: 2026-11-10 (G6.1: постоянный пул CUDA-воркеров в
-  пакетном режиме GUI — Pocket загружается 1 раз на воркера на весь пакет;
-  12 файлов: 69.3 → 43.5 с (−37%), паритет побитовый, отмена/перезапись
-  корректны; отчёт `docs/G6_PERSISTENT_POOL.md`).
+- **Дата обновления**: 2026-11-10 (G6.1.1: исправлена потеря preflight-событий
+  `FileDone` в пакетном GUI — `BatchStarted{workers:0}` теперь до preflight,
+  новое `BatchWorkersReady` обновляет только число воркеров без сброса
+  счётчиков; CLI строго валидируется — неизвестный флаг завершается кодом 2
+  БЕЗ открытия окна, есть `--help`; отчёт `docs/G6_1_1_FIXES.md`).
 - **HEAD**: только из Git (`git log -1 --oneline`), не из этого файла.
-- **Бэкап на NAS (верифицирован, сделан ПЕРЕД изменениями G6.1,
-  2026-11-10 14:25)**: полный архив HEAD `69a96f5` —
-  `\\DISKSTATION\Ableton 2\Temp2\ShtormTTS-Windows-full-69a96f5-20261110-142544.zip`,
-  SHA256 `76C2AD153DDF78EAE12CD3A6CFCB6A3F2F700EDF6D18BA4EC017CC6A3D3E946C`,
-  154/154 blob совпадают. Прежние архивы не тронуты (`8f07d70` — P2B.3).
+- **Бэкап на NAS (верифицирован, сделан ПЕРЕД изменениями G6.1.1,
+  2026-11-10 16:23)**: полный архив HEAD `5658c4f` —
+  `\\DISKSTATION\Ableton 2\Temp2\ShtormTTS-Windows-full-5658c4f-20261110-162255.zip`,
+  SHA256 `24285EB50ED1EC8CCD2969B55C61A845280A21B42A3187482B0C3184C84292D5`,
+  156/156 blob совпадают. Прежние архивы не тронуты (`69a96f5` — до G6.1).
 - **NAS РАБОТАЕТ.** «SMB error 1702» из G2.1/P2B.1 — ошибка диагностического
   скрипта: `out/nas_check.ps1` использовал `'\DISKSTATION\...'` с ОДНИМ
   ведущим слэшем (PowerShell трактует это как путь от `C:`), плюс потеря
@@ -191,7 +192,48 @@ WAV/MP3/Opus без накопления аудио в памяти, одино�
 - Проверки: fmt OK, clippy 0 предупреждений, `cargo test --release` —
   **175 passed / 0 failed / 18 ignored**, release OK.
 
-## G6.1 — что сделано (текущий этап)
+## G6.1.1 — что сделано (текущий этап)
+
+- **Дефект №1 (потеря preflight FileDone)**: `BatchStarted{total, workers:0}`
+  отправляется в `execute_batch` сразу после `plan_batch` — ДО preflight
+  обоих путей; пул после `spawn_workers` шлёт новое
+  `BatchWorkersReady{workers}`, которое обновляет только `batch_state.workers`
+  (без пересоздания состояния и сброса счётчиков); последовательный путь —
+  `BatchWorkersReady{1}` вместо собственного `BatchStarted` (двойного
+  `BatchStarted` больше нет нигде). `app.rs`: дедупликация `FileDone` по
+  `done_indices` с диагностикой в журнале (не молча); при `workers=0` статус
+  честно показывает «воркеры готовятся…». Пакет, завершившийся до загрузки
+  воркеров (всё пропущено / пул не запустился), не показывает работающих
+  воркеров.
+- **Дефект №2 (опечатка флага открывала GUI)**: новый модуль
+  `gui/src/cli.rs` — строгий парсер: без аргументов — GUI; ровно одна
+  диагностическая команда (`--portable-check/-selftest/-selftest-batch/
+  -selftest-cancel`); `--help`/`-h`/`/?` — справка (exit 0); опции
+  `--device cpu|cuda` / `--format wav|mp3|opus` / `--hold-ms <u64>` — только
+  с командой (до или после), значение обязательно и валидно; любые
+  неизвестные/повторные/лишние аргументы — сообщение в stderr + справка,
+  **exit 2, окно не открывается, Pocket не грузится** (выход до
+  `eframe::run_native`). Инцидентный флаг `--portable-batch-selftest`
+  воспроизводится тестом.
+- **Тесты**: +13 юнит (Test A–F пакетного состояния по §4, порядок событий
+  execute_batch, 4 CLI-теста) — итого **207 passed / 0 failed / 23
+  ignored**; smoke EXE в изолированной песочнице (`tools/g611_cli_smoke.ps1`)
+  — ALL PASS (9 ошибочных вариантов exit 2 без окна, help/check, GUI без
+  аргументов жив ≥4 с и закрыт exit 0); headless GPU
+  (`tools/g611_headless_gpu.ps1`) — ALL PASS (пул 2/2, отмена/повтор,
+  сиротских ffmpeg 0). Real CUDA: новый
+  `real_batch_cuda_pool_partial_skip_events` (6 существуют + 6 синтез:
+  ранние Skipped до `BatchWorkersReady`, счётчики событий == BatchReport,
+  Pocket 2 загрузки, существующие побайтово целы) + регрессии
+  pool/cancel/overwrite/matrix/overwrite_wav/batch_cpu — все зелёные;
+  VRAM без утечки (584→722 МБ в тесте, 554 МБ после серии).
+- **Визуальная приёмка**: полным «глазами» на идущем пакете не выполнялась
+  (как и в G6.1); доступными средствами подтверждены открытие/закрытие
+  обычного окна, headless-пакет пула, реальный порядок событий смешанного
+  пакета (соответствует UI-модели Test A) и совпадение счётчиков с отчётом.
+  Подробности и ограничения — `docs/G6_1_1_FIXES.md` §6–7.
+
+## G6.1 — что сделано (предыдущий этап)
 
 - **Постоянный пул в пакетном CUDA**: `app-core/persistent.rs` (слот
   `WorkerSlot`, одалживание `Loaned`+`loaned_real_worker_factory` с per-file
@@ -267,13 +309,15 @@ WAV/MP3/Opus без накопления аудио в памяти, одино�
 
 ## Результаты последних проверок (2026-11-10, Windows, release)
 
-- `cargo test` — **194 passed / 0 failed / 23 ignored** (было 179/18 до
-  G6.1; +15 юнит-тестов persistent/batch-parallel/UI, +5 ignored
-  real-прогонов пула и бенчмарка); `cargo clippy --all-targets --release` —
-  0 предупреждений; fmt OK; release OK. Real G6.1 (CUDA):
-  real_batch_cuda_pool / _cancel / _overwrite / _mp3_opus / real_batch_cuda_bench
-  — все зелёные; регрессии real_matrix_device(cuda), real_overwrite_wav(cuda),
-  real_batch_cpu — зелёные; сиротских ffmpeg нет.
+- `cargo test` — **207 passed / 0 failed / 23 ignored** (было 194/23 до
+  G6.1.1; +13: Test A–F пакетного состояния, порядок событий execute_batch,
+  CLI-диспетчеризация); `cargo clippy --all-targets --release` —
+  0 предупреждений; fmt OK; release OK. Real G6.1.1 (CUDA):
+  real_batch_cuda_pool_partial_skip_events — зелёный (ранние Skipped до
+  загрузки пула, счётчики == отчёту); регрессии real_batch_cuda_pool /
+  _cancel / _overwrite, real_matrix_device(cuda), real_overwrite_wav(cuda),
+  real_batch_cpu — зелёные; smoke/headless EXE — ALL PASS; сиротских ffmpeg
+  нет, VRAM после серии 554 МБ (база).
 - **CUDA P2A.1-бенчмарк G5.2** (13 чанков/64.01 с, 1 воркер, bench_clean,
   после прогрева, 3 прогона): 9.37 / 9.42 / 9.50 с, RTF 0.134–0.136,
   wall 9.6–9.8 с. Фон на момент замера: GPU ~17% (DWM/оверлей NVIDIA/
@@ -354,7 +398,7 @@ bash out/p2a1/bench_clean.sh auto 1 <tag>
 
 ## NEXT TASK (НЕ НАЧИНАТЬ без явного задания)
 
-G6.1 завершён (отчёт `docs/G6_PERSISTENT_POOL.md`). Осталось два основных
+G6.1.1 завершён (отчёт `docs/G6_1_1_FIXES.md`). Осталось два основных
 независимых направления (только по явному заданию):
 
 1. **Гибридный режим 2×2 в пакетном движке/GUI (G6.2)** — по P2B.3: +12% к
@@ -380,6 +424,9 @@ G6.1 завершён (отчёт `docs/G6_PERSISTENT_POOL.md`). Осталос�
 - `docs/G3_BATCH.md` — пакетный режим, оценка переиспользования пула.
 - `docs/G6_PERSISTENT_POOL.md` — постоянный пул CUDA-воркеров в пакете
   (архитектура, семантика отмены/ошибок, паритет, бенчмарки, G6.2).
+- `docs/G6_1_1_FIXES.md` — исправления G6.1.1: порядок batch-событий
+  (BatchStarted до preflight, BatchWorkersReady), CLI-диспетчеризация,
+  таблица тестов, реальный смешанный сценарий skip/synth.
 - `docs/PORTABLE_BUILD.md` — портативные комплекты (g52-final актуален;
   прежние комплекты не перезаписывать без задания).
 - `docs/CUDA_PROFILE_P1.md`, `docs/CUDA_PROFILE_P2A.md`,

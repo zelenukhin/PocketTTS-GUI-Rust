@@ -7,11 +7,17 @@
 //! `--portable-selftest-cancel`. Они используют тот же
 //! `execute_job`/`execute_batch`, что и GUI, и не заменяют интерактивную
 //! проверку окна.
+//!
+//! G6.1.1: диспетчеризация аргументов строго проверяется (`shtorm_gui::cli`)
+//! — неизвестный/повторный/некорректный аргумент завершает процесс с кодом 2
+//! и diagnostic-сообщением, окно НЕ открывается (раньше опечатка во флаге
+//! молча запускала GUI).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use shtorm_gui::cli::{parse_cli_args, usage_text, CliCommand};
 use shtorm_gui::job::{
     execute_batch, execute_job, resolve_model_dir, resolve_ort_dylib, JobConfig, JobEvent,
     JobStatus,
@@ -27,17 +33,26 @@ const FALLBACK_TEXT: &str =
 fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|a| a == "--portable-check") {
-        std::process::exit(portable_check(&args));
-    }
-    if args.iter().any(|a| a == "--portable-selftest-cancel") {
-        std::process::exit(portable_selftest_cancel(&args));
-    }
-    if args.iter().any(|a| a == "--portable-selftest-batch") {
-        std::process::exit(portable_selftest(&args, true));
-    }
-    if args.iter().any(|a| a == "--portable-selftest") {
-        std::process::exit(portable_selftest(&args, false));
+    // G6.1.1: сначала — строгий разбор; при ошибке никаких окон и никакой
+    // загрузки Pocket (выход до eframe::run_native), только диагностика.
+    let command = match parse_cli_args(&args) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("ОШИБКА АРГУМЕНТОВ: {e}");
+            eprint!("{}", usage_text());
+            std::process::exit(2);
+        }
+    };
+    match command {
+        CliCommand::Gui => {}
+        CliCommand::Help => {
+            print!("{}", usage_text());
+            std::process::exit(0);
+        }
+        CliCommand::PortableCheck => std::process::exit(portable_check(&args)),
+        CliCommand::PortableSelftest => std::process::exit(portable_selftest(&args, false)),
+        CliCommand::PortableSelftestBatch => std::process::exit(portable_selftest(&args, true)),
+        CliCommand::PortableSelftestCancel => std::process::exit(portable_selftest_cancel(&args)),
     }
 
     let options = eframe::NativeOptions {

@@ -3,6 +3,7 @@
 
 pub mod app;
 pub mod batch;
+pub mod cli;
 pub mod job;
 pub mod resources;
 pub mod settings;
