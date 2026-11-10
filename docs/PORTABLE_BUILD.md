@@ -1,8 +1,11 @@
 # G4 — портативная сборка Windows x64
 
-Дата: 2026-11-09. Статус: реализовано и проверено на машине разработки
-(Windows 10 x64, NVIDIA RTX 3060). Проверка на чистой Windows VM без
-Python/PyTorch/ORT/FFmpeg **не проводилась** — см. раздел «Результаты».
+Дата: 2026-11-09 (G4); обновлено 2026-11-10 (актуальный комплект —
+`ShtormTTS-Portable-2026-11-10-g52-final`, см. раздел «Результаты
+проверки G5.2» внизу). Статус: реализовано и проверено на машине
+разработки (Windows 10 x64, NVIDIA RTX 3060). Проверка на чистой Windows
+VM без Python/PyTorch/ORT/FFmpeg **не проводилась** — см. раздел
+«Результаты».
 
 ## Цель
 
@@ -377,3 +380,50 @@ SHA256 `156BD8D90AC8AAA92F05770446CE90A987FBEAFDF6AA53534CC69FA631279BB3`.
   `nvcuda.dll` (драйвер NVIDIA) и `msvcp_win.dll` (API-set Windows).
   CPU-прогон загружает только `<dist>\onnxruntime\cpu\onnxruntime.dll`.
   Python/Torch/системный ORT/FFmpeg не используются.
+
+## Результаты проверки G5.2 (2026-11-10)
+
+**Финальный комплект: `ShtormTTS-Portable-2026-11-10-g52-final`** — 54
+файла, 3403.2 MiB, `manifest.json` git `44014e5`, dirty=false; exe SHA256
+`3BE40CA88AAC2F59BE25F6F2B50AB4DAFE7A670EA70765136A2505FAF99BC888`.
+Собран `-HardLinkPayload` (крупные файлы — жёсткие ссылки; при копировании
+на другой том материализуются). Комплект включает фикс применения темы на
+старте (G5.2) и CUDA I/O Binding по умолчанию. Предыдущие комплекты
+(g41-final, p2a1, p2a1-final) не изменялись.
+
+Проверки на КОПИИ комплекта `C:\ShtormG52PortTest` (вне репозитория,
+запуск с рабочим каталогом `C:\`):
+
+- `--portable-check`: model/Slow, CPU ORT и ffmpeg разрешены из
+  относительных путей комплекта — PORTABLE CHECK OK.
+- CPU FP32 WAV selftest: Completed, 6.80 с, 2 чанка, RTF 0.968.
+- CUDA FP32 WAV selftest: Completed, RTF 0.387; в логе `CUDA-P2A: io
+  binding active` — комплект действительно использует новый путь.
+- MP3 (`-V2`) и Opus (`opus 64k`) на CUDA: Completed, RTF 0.404,
+  комплектный `ffmpeg/ffmpeg.exe`.
+- Batch на CUDA: 2/2 готово (подкаталог сохранён).
+- Cancel: Cancelled на 1/6 чанков (итог не создан, `.partial` сохранён),
+  повтор на том же пути → Completed, RTF 0.167.
+- **Зависимости процесса** (модули CUDA-прогона): `onnxruntime.dll`,
+  `onnxruntime_providers_cuda/shared.dll`, `cudart64_12`, `cublas(Lt)64_12`,
+  `cufft64_11`, `cudnn*64_9` — из `<dist>\onnxruntime\cuda\`;
+  `MSVCP140*`/`VCRUNTIME140*` — из корня комплекта; из системы — только
+  драйвер `nvcuda.dll` и API-set `msvcp_win.dll`. Python/Torch/системный
+  ORT/FFmpeg не используются.
+- **GUI из комплекта**: окно открывается с рабочего каталога `C:\`;
+  статус «настройки загружены», «✓ параметры валидны»; тема при старте
+  тёмная (средняя яркость окна 38.9 — фикс G5.2 подтверждён на комплектном
+  exe); «Лог чанков» toggle + «Сохранить настройки» → JSON chunk_log
+  true/false; после теста `shtorm_gui_settings.json` восстановлен из
+  `shtorm_gui_settings.example.json` (SHA256 равен).
+- **Чистая Windows не проверялась** (нет VM): полная автономность на
+  системе без Python/Torch/ORT/FFmpeg/VC++ Redistributable не
+  подтверждена — на машине разработки эти компоненты установлены.
+
+### Известное расхождение комплекта с исходниками после сборки
+
+`README-PORTABLE.txt` внутри g52-final содержит формулировку «Existing
+audio files are never overwritten» — с G5 неточная (перезапись возможна
+явным чекбоксом, атомарно и только после успешного синтеза). Исходник
+`tools/portable/README.txt` исправлен в коммите документации G5.2;
+комплект задним числом не менялся, exe и код в нём точны для `44014e5`.

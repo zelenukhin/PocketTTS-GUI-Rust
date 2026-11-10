@@ -23,7 +23,11 @@ Important:
   * CPU and CUDA use different ONNX Runtime DLLs. A process can initialize only
     one runtime; after switching CPU <-> CUDA inside one GUI session, restart
     the application.
-  * Existing audio files are never overwritten.
+  * Existing audio files are NOT overwritten by default: an existing result
+    is skipped. If you explicitly enable "Перезаписывать существующие
+    файлы" (overwrite existing files), a finished file is replaced
+    atomically ONLY after a successful synthesis; on error/cancel the old
+    file is left intact.
   * The voice reference is NOT included with a known redistribution license.
     Put your own WAV at voice/reference.wav.
   * Model weights have no explicit license file in the source tree. This
