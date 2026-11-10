@@ -43,17 +43,21 @@ mod imp {
         OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
     };
     use windows_sys::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, WaitNamedPipeW,
-        PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
-        PIPE_WAIT,
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
+        WaitNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
+        PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
     use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
-    use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+    use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
     /// ERROR_IO_PENDING: overlapped-операция принята и будет завершена позже.
     const ERROR_IO_PENDING_CODE: i32 = 997;
     /// ERROR_PIPE_CONNECTED: клиент подключился ДО ConnectNamedPipe.
     const ERROR_PIPE_CONNECTED_CODE: i32 = 535;
+    /// ERROR_NOT_FOUND: CancelIoEx вызван без ожидающих операций — не ошибка.
+    const ERROR_NOT_FOUND_CODE: i32 = 1168;
+    /// ERROR_OPERATION_ABORTED: операция снята CancelIoEx.
+    const ERROR_OPERATION_ABORTED_CODE: i32 = 995;
 
     fn wide(s: &str) -> Vec<u16> {
         std::ffi::OsStr::new(s)
@@ -116,6 +120,8 @@ mod imp {
     pub struct PipeEnd {
         handle: HANDLE,
         write_lock: Mutex<()>,
+        /// Серверный конец (accept): поддерживает DisconnectNamedPipe.
+        is_server: bool,
     }
 
     // HANDLE — сырой указатель; отправляем его только в Win32-вызовы этого
@@ -171,6 +177,46 @@ mod imp {
             Ok(pid)
         }
 
+        /// Снять ВСЕ ожидающие overlapped-операции этого handle
+        /// (`CancelIoEx`). Нужно для ограниченного по времени завершения:
+        /// поток чтения может быть заблокирован в `ReadFile` до тех пор,
+        /// пока диспетчер не закроет канал; отмена гарантированно возвращает
+        /// `GetOverlappedResult(ERROR_OPERATION_ABORTED)`. Буферы и OVERLAPPED
+        /// отменённой операции принадлежат ожидающему потоку и не
+        /// освобождаются, пока он не вернулся из вызова.
+        pub fn cancel_io(&self) -> io::Result<()> {
+            let ok = unsafe { CancelIoEx(self.handle, std::ptr::null()) };
+            if ok == 0 {
+                let e = last_err();
+                // нет ожидающих операций — отменять нечего
+                if e.raw_os_error() == Some(ERROR_NOT_FOUND_CODE) {
+                    return Ok(());
+                }
+                return Err(e);
+            }
+            Ok(())
+        }
+
+        /// Принудительно разорвать соединение (серверный конец): снять
+        /// ожидающие операции и перевести канал в disconnected. Клиент
+        /// увидит EOF/ERROR_BROKEN_PIPE. Используется диспетчером, когда
+        /// дочерний процесс обязан завершиться, а канал ещё открыт, и
+        /// тестами «родитель закрыл канал при завершении ребёнка».
+        pub fn disconnect(&self) -> io::Result<()> {
+            let _guard = self
+                .write_lock
+                .lock()
+                .map_err(|_| io::Error::other("мьютекс записи канала отравлен"))?;
+            self.cancel_io()?;
+            if self.is_server {
+                let ok = unsafe { DisconnectNamedPipe(self.handle) };
+                if ok == 0 {
+                    return Err(last_err());
+                }
+            }
+            Ok(())
+        }
+
         fn write_all_raw(&self, mut bytes: &[u8]) -> io::Result<()> {
             while !bytes.is_empty() {
                 let handle = self.handle;
@@ -221,8 +267,13 @@ mod imp {
                     Ok(r) => done += r as usize,
                     Err(e) => {
                         // ERROR_BROKEN_PIPE (109): сторона закрыла канал после
-                        // записи — это EOF, если мы ещё в начале кадра
-                        if e.raw_os_error() == Some(109) && done == 0 {
+                        // записи — это EOF, если мы ещё в начале кадра.
+                        // ERROR_OPERATION_ABORTED (995): операция снята нашим
+                        // cancel_io при завершении — тоже EOF на границе кадра.
+                        let code = e.raw_os_error();
+                        if done == 0
+                            && (code == Some(109) || code == Some(ERROR_OPERATION_ABORTED_CODE))
+                        {
                             return Ok(false);
                         }
                         return Err(e);
@@ -351,6 +402,7 @@ mod imp {
             let end = PipeEnd {
                 handle,
                 write_lock: Mutex::new(()),
+                is_server: true,
             };
             std::mem::forget(self); // HANDLE перешёл к PipeEnd
             Ok(end)
@@ -378,6 +430,7 @@ mod imp {
                 return Ok(PipeEnd {
                     handle,
                     write_lock: Mutex::new(()),
+                    is_server: false,
                 });
             }
             let e = last_err();
@@ -406,6 +459,19 @@ mod imp {
 
     pub struct PipeEnd;
     pub struct PipeServer;
+
+    impl PipeEnd {
+        pub fn cancel_io(&self) -> io::Result<()> {
+            Err(io::Error::other(
+                "гибридный режим поддерживается только на Windows",
+            ))
+        }
+        pub fn disconnect(&self) -> io::Result<()> {
+            Err(io::Error::other(
+                "гибридный режим поддерживается только на Windows",
+            ))
+        }
+    }
 
     impl PipeServer {
         pub fn create_unique(_tag: &str) -> io::Result<Self> {
@@ -571,5 +637,50 @@ mod tests {
             Duration::from_millis(150),
         );
         assert!(r.is_err(), "подключение к несуществующему каналу — ошибка");
+    }
+
+    /// G6.2.1: разрыв канала снимает ЗАБЛОКИРОВАННОЕ overlapped-чтение
+    /// (CancelIoEx + DisconnectNamedPipe) — ограниченное завершение без
+    /// ожидания, пока вторая сторона закроет свой конец. Регрессия дедлока
+    /// `reader.join()` при фатальной ошибке инициализации.
+    #[test]
+    fn disconnect_unblocks_pending_read() {
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let (tx_name, rx_name) = std::sync::mpsc::channel::<String>();
+        let server = std::thread::spawn(move || {
+            let srv = PipeServer::create_unique("cancel").expect("создать");
+            tx_name.send(srv.name().to_string()).unwrap();
+            srv.accept(Duration::from_secs(5)).expect("accept")
+        });
+        let name = rx_name.recv().unwrap();
+        let client = connect(&name, Duration::from_secs(5)).expect("connect");
+        let end = Arc::new(server.join().expect("сервер"));
+
+        let read_end = Arc::clone(&end);
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let reader = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            wire::recv_json(&read_end)
+        });
+        started_rx.recv().unwrap();
+        // дать потоку войти в ReadFile (ожидание overlapped-операции)
+        std::thread::sleep(Duration::from_millis(200));
+
+        let t0 = Instant::now();
+        end.disconnect().expect("разрыв канала");
+        let got = reader.join().expect("поток чтения завершён");
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "чтение снято за {:?}",
+            t0.elapsed()
+        );
+        match got {
+            Ok(None) => {}                                 // EOF на границе кадра
+            Err(e) => assert!(e.raw_os_error().is_some()), // отмена операции
+            Ok(Some(_)) => panic!("после разрыва не должно быть кадра"),
+        }
+        drop(client);
     }
 }

@@ -72,12 +72,46 @@ pub const CHILD_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 /// Ожидание ПОСЛЕ Shutdown, прежде чем принудительно завершить СВОЙ
 /// дочерний процесс (Pocket освобождается не мгновенно).
 pub const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(15);
+/// G6.2.1: ограниченный startup/initialization timeout процесса. Модель и ORT
+/// в дочернем процессе поднимаются за секунды (4 Pocket параллельно max
+/// ~10–20 с на медленном диске); 120 с — щедрый предел, после которого
+/// молчащая инициализация считается зависшей. Процесс без готовых воркеров
+/// завершается (только свой PID), воркеры — Failed-диагностика.
+pub const CHILD_STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+/// G6.2.1: ожидание слива очереди событий единственным writer'ом дочернего
+/// процесса. Сообщения крошечные (килобайты), канал 1 МиБ — 5 с достаточно;
+/// при разорванном IPC writer завершается по ошибке записи.
+const CHILD_WRITER_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+/// G6.2.1: ожидание после CancelIoEx, чтобы поток чтения/записи вернулся из
+/// отменённой overlapped-операции. Не освобождаем буферы, пока поток жив;
+/// если и это не удалось — процесс завершается принудительно (ОС освободит
+/// всё), но НЕ ждёт бесконечно.
+const CHILD_IO_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// Watchdog: нет событий от процесса, у которого есть НАЗНАЧЕННЫЙ файл,
 /// так долго — процесс считается зависшим (kill, файлы — Failed).
 /// Чанк ≈ 0.7–2.4 с; финализация ffmpeg ≈ секунды; 300 с — щедрый запас.
 pub const CHILD_WATCHDOG: Duration = Duration::from_secs(300);
 
 // ================================ протокол ================================
+
+/// G6.2.1: управляемое внедрение сбоев ТОЛЬКО для fake-режима/тестов
+/// (диспетчер передаёт его командой Init). Сам дочерний процесс окружение
+/// не читает: без этого поля все значения нулевые и поведение боевое.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestFaults {
+    /// Фатальная ошибка подготовки движка процесса (build_worker_env) до
+    /// Ready — процесс обязан завершиться ненулевым кодом.
+    #[serde(default)]
+    pub fail_init: bool,
+    /// Задержка инициализации: тест успевает принудительно завершить только
+    /// свой дочерний PID до Ready.
+    #[serde(default)]
+    pub init_delay_ms: u64,
+    /// Воркеры, чья «загрузка Pocket» срывается: WorkerError до Ready,
+    /// процесс продолжает работу остальными воркерами (частичная готовность).
+    #[serde(default)]
+    pub fail_workers: Vec<usize>,
+}
 
 /// Команды диспетчера дочернему процессу.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +129,10 @@ pub enum Cmd {
         /// ТОЛЬКО диспетчер (диагностический флаг SHTORM_G62_FAKE в
         /// GUI-процессе); сам воркер своё окружение не читает.
         fake: bool,
+        /// G6.2.1: управляемое внедрение сбоев жизненного цикла (тестовый
+        /// режим fake; в бою — Default: все поля нулевые).
+        #[serde(default)]
+        test: TestFaults,
     },
     /// Назначение файла конкретному воркеру этого процесса.
     Assign {
@@ -270,12 +308,16 @@ pub fn worker_main(pipe_name: &str) -> i32 {
 
 fn worker_main_impl(pipe_name: &str) -> Result<i32> {
     let end = Arc::new(ipc::connect(pipe_name, Duration::from_secs(30))?);
-    send_ev(
+    if let Err(e) = send_ev(
         &end,
         &Ev::Started {
             pid: std::process::id(),
         },
-    )?;
+    ) {
+        // Диспетчер уже разорвал канал: доставлять события некому.
+        eprintln!("ВНУТРЕННИЙ WORKER: стартовое событие не доставлено: {e:#}");
+        return Ok(1);
+    }
 
     // чтение команд — выделенный поток (блокирующее ReadFile)
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
@@ -293,12 +335,13 @@ fn worker_main_impl(pipe_name: &str) -> Result<i32> {
     });
 
     // первая команда — Init (всё остальное до неё — протокольная ошибка)
-    let (settings, workers, fake) = match cmd_rx.recv_timeout(Duration::from_secs(60)) {
+    let (settings, workers, fake, test) = match cmd_rx.recv_timeout(Duration::from_secs(60)) {
         Ok(Cmd::Init {
             settings,
             workers,
             fake,
-        }) => (settings, workers, fake),
+            test,
+        }) => (settings, workers, fake, test),
         Ok(other) => bail!("первой командой обязан быть init, получено {other:?}"),
         Err(_) => bail!("канал закрыт до init"),
     };
@@ -306,6 +349,11 @@ fn worker_main_impl(pipe_name: &str) -> Result<i32> {
         (1..=8).contains(&workers),
         "некорректное число воркеров {workers}"
     );
+    // тестовый сценарий «процесс убит во время инициализации»: даём
+    // диспетчеру время принудительно завершить ТОЛЬКО свой PID до Ready
+    if test.init_delay_ms > 0 {
+        std::thread::sleep(Duration::from_millis(test.init_delay_ms));
+    }
 
     // события — общий Writer-поток (строго последовательная запись в канал)
     let (ev_tx, ev_rx) = mpsc::channel::<Ev>();
@@ -327,19 +375,27 @@ fn worker_main_impl(pipe_name: &str) -> Result<i32> {
         match build_worker_env(&settings) {
             Ok(env) => Some(Arc::new(env)),
             Err(e) => {
-                // фатально для всего процесса: модель/ORT не поднялись вовсе
+                // фатально для всего процесса: модель/ORT не поднялись вовсе.
+                // Сообщаем ДО Exiting; завершение — ограниченное (finish_child).
                 let _ = ev_tx.send(Ev::WorkerError {
                     worker: usize::MAX,
                     error: format!("подготовка движка процесса: {e:#}"),
                 });
                 let _ = ev_tx.send(Ev::Exiting);
-                drop(ev_tx);
-                let _ = writer.join();
-                let _ = reader.join();
-                return Ok(1);
+                return Ok(finish_child(&end, ev_tx, writer, reader, 1));
             }
         }
     };
+    if test.fail_init {
+        // управляемое внедрение: тот же терминальный путь, что и реальный
+        // сбой build_worker_env (до создания воркеров)
+        let _ = ev_tx.send(Ev::WorkerError {
+            worker: usize::MAX,
+            error: "тестовое внедрение: подготовка движка процесса".into(),
+        });
+        let _ = ev_tx.send(Ev::Exiting);
+        return Ok(finish_child(&end, ev_tx, writer, reader, 1));
+    }
 
     // per-worker каналы назначений; маршрутизация — в главном потоке
     let mut assign_tx = Vec::with_capacity(workers);
@@ -351,10 +407,21 @@ fn worker_main_impl(pipe_name: &str) -> Result<i32> {
         let ev_tx = ev_tx.clone();
         let settings = settings.clone();
         let shared = shared.clone();
+        let test = test.clone();
         handles.push(
             std::thread::Builder::new()
                 .name(format!("hybrid-worker-{wid}"))
-                .spawn(move || worker_loop(wid, rx, &cancel, &ev_tx, &settings, shared.as_deref()))
+                .spawn(move || {
+                    worker_loop(
+                        wid,
+                        rx,
+                        &cancel,
+                        &ev_tx,
+                        &settings,
+                        shared.as_deref(),
+                        &test,
+                    )
+                })
                 .map_err(|e| anyhow!("запуск потока воркера {wid}: {e}"))?,
         );
     }
@@ -409,18 +476,65 @@ fn worker_main_impl(pipe_name: &str) -> Result<i32> {
         }
     }
     drop(assign_tx);
-    drop(ev_tx); // Writer завершится, когда выйдут все воркеры
     for h in handles {
         let _ = h.join();
     }
-    // Последнее событие — Exiting; отправляется напрямую (pipe writes не
-    // буферизуются), после чего процесс завершается НЕМЕДЛЕННО: поток чтения
-    // заблокирован в ReadFile до закрытия канала диспетчером, и его join()
-    // никогда бы не вернулся (дедлок завершения, найден E2E-тестом).
-    let _ = send_ev(&end, &Ev::Exiting);
-    let _ = reader; // не join: заблокирован в ReadFile
-    let _ = writer; // завершается сам по закрытию каналов событий
-    std::process::exit(0);
+    // G6.2.1: Exiting идёт ЧЕРЕЗ ТОТ ЖЕ канал событий и строго ПОСЛЕ всех
+    // FileFinished/WorkerError/Stopped: все клоны ev_tx у воркеров уже
+    // дропнуты, очередь FIFO — writer не может обогнать ранее поставленные
+    // события. Прямая параллельная запись в канал удалена.
+    let _ = ev_tx.send(Ev::Exiting);
+    Ok(finish_child(&end, ev_tx, writer, reader, 0))
+}
+
+/// G6.2.1: ограниченное завершение дочернего IPC. Единственный writer
+/// дописывает очередь событий (включая финальный Exiting), затем ожидающее
+/// чтение снимается `CancelIoEx`: reader не ждёт, пока диспетчер закроет
+/// канал. Буферы и OVERLAPPED освобождаются только после возврата потока;
+/// при невосстановимом зависании процесс выходит принудительно (ОС освободит
+/// ресурсы), но НЕ ждёт бесконечно.
+fn finish_child(
+    end: &Arc<PipeEnd>,
+    ev_tx: mpsc::Sender<Ev>,
+    writer: std::thread::JoinHandle<()>,
+    reader: std::thread::JoinHandle<()>,
+    code: i32,
+) -> i32 {
+    let mut writer = Some(writer);
+    let mut reader = Some(reader);
+    drop(ev_tx); // очередь закрыта: writer дописывает всё и выходит
+    if !join_bounded(&mut writer, CHILD_WRITER_FLUSH_TIMEOUT) {
+        let _ = end.cancel_io(); // канал забит/разорван — снять записи
+        if !join_bounded(&mut writer, CHILD_IO_JOIN_TIMEOUT) {
+            eprintln!("ВНУТРЕННИЙ WORKER: writer не завершился — принудительный выход");
+            std::process::exit(code);
+        }
+    }
+    let _ = end.cancel_io();
+    if !join_bounded(&mut reader, CHILD_IO_JOIN_TIMEOUT) {
+        eprintln!("ВНУТРЕННИЙ WORKER: reader не завершился — принудительный выход");
+        std::process::exit(code);
+    }
+    code
+}
+
+/// Ограниченное ожидание завершения потока. При таймауте handle остаётся
+/// живым (вызывающий решает, что делать), join не вызывается.
+fn join_bounded(h: &mut Option<std::thread::JoinHandle<()>>, timeout: Duration) -> bool {
+    let Some(handle) = h.as_ref() else {
+        return true;
+    };
+    let deadline = Instant::now() + timeout;
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if let Some(h) = h.take() {
+        let _ = h.join();
+    }
+    true
 }
 
 fn build_worker_env(settings: &GuiSettings) -> Result<WorkerEnv> {
@@ -447,7 +561,19 @@ fn worker_loop(
     ev_tx: &mpsc::Sender<Ev>,
     settings: &GuiSettings,
     shared: Option<&WorkerEnv>,
+    test: &TestFaults,
 ) {
+    // G6.2.1: управляемое внедрение «сбой загрузки Pocket» — воркер
+    // терминально мёртв ДО Ready; процесс продолжает работу остальными
+    // воркерами (частично инициализированный процесс). Без внедрения
+    // ветка не выполняется.
+    if test.fail_workers.contains(&wid) {
+        let _ = ev_tx.send(Ev::WorkerError {
+            worker: wid,
+            error: "тестовое внедрение: загрузка Pocket".into(),
+        });
+        return;
+    }
     // --- загрузка постоянного Pocket (один раз на пакет) ---
     let slot: WorkerSlot<RealWorker> = match shared {
         Some(env) => {
@@ -786,8 +912,17 @@ fn fake_engine_run(
 
 /// Windows Job Object с KILL_ON_JOB_CLOSE: если GUI-процесс погиб, ОС
 /// завершит всех ЕГО дочерних процессов — осиротевших CUDA-воркеров нет.
+///
+/// G6.2.1 — FAIL-CLOSED: отсутствие защиты больше не считается «нефатальным».
+/// Гибридный запуск обязан проверить `ready()` до первого процесса и
+/// прервать запуск, если Job Object не создан; `assign()` для неназначенного
+/// процесса возвращает ошибку, и вызывающий обязан завершить уже созданные
+/// собственные процессы, не начиная синтез.
 pub struct ChildJobGuard {
-    handle: Mutex<Option<isize>>, // HANDLE; None — не создан (не фатально)
+    handle: Mutex<Option<isize>>, // HANDLE; None — не создан (запуск запрещён)
+    creation_error: Mutex<Option<String>>,
+    /// Тестовое внедрение: первый assign отвергается (E2E-H).
+    fail_assign_once: AtomicBool,
 }
 
 impl Default for ChildJobGuard {
@@ -798,19 +933,71 @@ impl Default for ChildJobGuard {
 
 impl ChildJobGuard {
     pub fn new() -> Self {
+        Self::create(false, false)
+    }
+
+    /// G6.2.1: управляемое внедрение отказов Job Object (только тесты).
+    #[cfg(test)]
+    pub fn with_faults_for_test(fail_create: bool, fail_assign_once: bool) -> Self {
+        Self::create(fail_create, fail_assign_once)
+    }
+
+    fn create(fail_create: bool, fail_assign_once: bool) -> Self {
+        let (handle, creation_error) = if fail_create {
+            (
+                None,
+                Some("тестовое внедрение: CreateJobObject/SetInformationJobObject".to_string()),
+            )
+        } else {
+            match create_job_object() {
+                Ok(h) => (Some(h), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        };
         Self {
-            handle: Mutex::new(create_job_object()),
+            handle: Mutex::new(handle),
+            creation_error: Mutex::new(creation_error),
+            fail_assign_once: AtomicBool::new(fail_assign_once),
         }
     }
 
-    /// Приписать дочерний процесс к job. Ошибка не фатальна (страховка ОС
-    /// ухудшается, пакет продолжается) — диагностируется вызывающим.
+    /// Проверить, что KILL_ON_JOB_CLOSE реально действует. Ошибка означает,
+    /// что гибридный запуск обязан отказаться от старта.
+    pub fn ready(&self) -> Result<()> {
+        if let Some(e) = self
+            .creation_error
+            .lock()
+            .map_err(|_| anyhow!("мьютекс ошибки Job Object"))?
+            .clone()
+        {
+            bail!("Windows Job Object KILL_ON_JOB_CLOSE не создан: {e}");
+        }
+        if self
+            .handle
+            .lock()
+            .map_err(|_| anyhow!("мьютекс Job Object"))?
+            .is_none()
+        {
+            bail!("Windows Job Object KILL_ON_JOB_CLOSE недоступен");
+        }
+        Ok(())
+    }
+
+    /// Приписать дочерний процесс к job. FAIL-CLOSED: без действующего job
+    /// процесс не запускается; вызывающий обязан завершить уже созданные
+    /// собственные процессы.
     pub fn assign(&self, pid: u32) -> Result<()> {
+        if self.fail_assign_once.swap(false, Ordering::SeqCst) {
+            bail!("тестовое внедрение: AssignProcessToJobObject({pid}) отвергнут");
+        }
         let guard = self
             .handle
             .lock()
             .map_err(|_| anyhow!("мьютекс Job Object"))?;
-        assign_to_job(*guard, pid)
+        let Some(job) = *guard else {
+            bail!("Job Object не создан — дочерний процесс {pid} без KILL_ON_JOB_CLOSE не запускается");
+        };
+        assign_to_job(job, pid)
     }
 }
 
@@ -826,7 +1013,7 @@ impl Drop for ChildJobGuard {
 }
 
 #[cfg(windows)]
-fn create_job_object() -> Option<isize> {
+fn create_job_object() -> Result<isize> {
     use windows_sys::Win32::System::JobObjects::{
         CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -835,7 +1022,7 @@ fn create_job_object() -> Option<isize> {
     unsafe {
         let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
         if job.is_null() {
-            return None;
+            bail!("CreateJobObjectW: {}", std::io::Error::last_os_error());
         }
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -846,24 +1033,22 @@ fn create_job_object() -> Option<isize> {
             std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
         );
         if ok == 0 {
+            let e = std::io::Error::last_os_error();
             windows_sys::Win32::Foundation::CloseHandle(job);
-            return None;
+            bail!("SetInformationJobObject(KILL_ON_JOB_CLOSE): {e}");
         }
-        Some(job as isize)
+        Ok(job as isize)
     }
 }
 
 #[cfg(windows)]
-fn assign_to_job(handle: Option<isize>, pid: u32) -> Result<()> {
+fn assign_to_job(job: isize, pid: u32) -> Result<()> {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
     use windows_sys::Win32::System::Threading::{
         OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
     };
 
-    let Some(job) = handle else {
-        return Ok(()); // job не создан — работаем без страховки ОС
-    };
     unsafe {
         let proc = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
         if proc.is_null() {
@@ -873,25 +1058,23 @@ fn assign_to_job(handle: Option<isize>, pid: u32) -> Result<()> {
             ));
         }
         let ok = AssignProcessToJobObject(job as _, proc);
+        let e = std::io::Error::last_os_error();
         CloseHandle(proc);
         if ok == 0 {
-            return Err(anyhow!(
-                "AssignProcessToJobObject({pid}): {}",
-                std::io::Error::last_os_error()
-            ));
+            return Err(anyhow!("AssignProcessToJobObject({pid}): {e}"));
         }
     }
     Ok(())
 }
 
 #[cfg(not(windows))]
-fn create_job_object() -> Option<isize> {
-    None
+fn create_job_object() -> Result<isize> {
+    bail!("Windows Job Object поддерживается только на Windows")
 }
 
 #[cfg(not(windows))]
-fn assign_to_job(_handle: Option<isize>, _pid: u32) -> Result<()> {
-    Ok(())
+fn assign_to_job(_job: isize, _pid: u32) -> Result<()> {
+    bail!("Windows Job Object поддерживается только на Windows")
 }
 
 // ============================ спавн процессов ============================
@@ -967,8 +1150,18 @@ pub fn connect_child(server: PipeServer, child: std::process::Child) -> Result<S
     });
     let writer = match ready_rx.recv_timeout(CHILD_CONNECT_TIMEOUT + Duration::from_secs(5)) {
         Ok(Ok(w)) => w,
-        Ok(Err(e)) => return Err(anyhow!("дочерний процесс {pid}: {e}")),
-        Err(_) => return Err(anyhow!("подключение дочернего процесса {pid} зависло")),
+        Ok(Err(e)) => {
+            let mut child = child;
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow!("дочерний процесс {pid}: {e}"));
+        }
+        Err(_) => {
+            let mut child = child;
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow!("подключение дочернего процесса {pid} зависло"));
+        }
     };
     Ok(SpawnedChild {
         child,
@@ -985,7 +1178,7 @@ pub fn connect_child(server: PipeServer, child: std::process::Child) -> Result<S
 pub fn spawn_child_via_test_harness(job: &ChildJobGuard, ci: usize) -> Result<SpawnedChild> {
     let server = PipeServer::create_unique(&format!("g62j{ci}"))?;
     let exe = std::env::current_exe()?;
-    let child = std::process::Command::new(&exe)
+    let mut child = std::process::Command::new(&exe)
         .args([
             "--exact",
             "hybrid::tests::hybrid_child_process_entry",
@@ -997,7 +1190,12 @@ pub fn spawn_child_via_test_harness(job: &ChildJobGuard, ci: usize) -> Result<Sp
         .map_err(|e| anyhow!("spawn test child: {e}"))?;
     let pid = child.id();
     if let Err(e) = job.assign(pid) {
-        eprintln!("ГИБРИД: Job Object не назначен (pid {pid}): {e:#}");
+        // FAIL-CLOSED: незащищённый процесс не допускается к синтезу
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(anyhow!(
+            "тестовый дочерний процесс {pid}: Job Object не назначен: {e:#}"
+        ));
     }
     connect_child(server, child)
 }
@@ -1011,17 +1209,22 @@ pub fn spawn_child_process(
 ) -> Result<SpawnedChild> {
     let server = PipeServer::create_unique(&format!("g62c{child_idx}"))
         .map_err(|e| anyhow!("создать канал дочернего процесса: {e}"))?;
-    let child = std::process::Command::new(exe)
+    let mut child = std::process::Command::new(exe)
         .arg("--internal-batch-worker")
         .arg(server.name())
         .spawn()
         .map_err(|e| anyhow!("запустить дочерний процесс {}: {e}", exe.display()))?;
     let pid = child.id();
     if let Err(e) = job.assign(pid) {
-        eprintln!("ГИБРИД: Job Object не назначен (pid {pid}): {e:#}");
+        // G6.2.1 FAIL-CLOSED: процесс без KILL_ON_JOB_CLOSE не допускается
+        // к синтезу; уже созданный СВОЙ процесс сразу завершается.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(anyhow!(
+            "дочерний процесс {pid}: Job Object не назначен: {e:#}"
+        ));
     }
-    let spawned = connect_child(server, child)?;
-    Ok(spawned)
+    connect_child(server, child)
 }
 
 // ============================== диспетчер ==============================
@@ -1046,16 +1249,22 @@ pub struct HybridParams {
     pub children: usize,
     /// Тестовый fake-движок (тишина вместо ONNX).
     pub fake: bool,
+    /// G6.2.1: внедрение сбоев ПО ПРОЦЕССАМ (пусто/короче — Default для
+    /// остальных). В боевом режиме не заполняется.
+    pub test: Vec<TestFaults>,
 }
 
 /// Итог гибридного прогона: отчёты по ПОЗИЦИЯМ jobs (в исходном порядке
 /// плана), число загруженных Pocket и готовых воркеров.
+#[derive(Debug)]
 pub struct HybridOutcome {
     pub reports: Vec<Option<FileReport>>,
     pub pocket_loads: usize,
     pub workers_ready: usize,
     /// Сколько дочерних процессов реально запустилось и работало.
     pub children_spawned: usize,
+    /// G6.2.1: код завершения каждого процесса (None — не запускался).
+    pub child_exit_codes: Vec<Option<i32>>,
 }
 
 /// Действие state machine, выполняемое драйвером (IO у драйвера, решения —
@@ -1093,6 +1302,27 @@ struct WState {
     busy: Option<usize>,
 }
 
+/// G6.2.1: жизненный цикл ДОЧЕРНЕГО ПРОЦЕССА. «PID существует» и «воркер
+/// способен выполнять работу» — разные понятия: процесс может быть жив, но
+/// после фатального WorkerError больше не примет ни одного файла.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcState {
+    /// Процесс создан, но событие Started ещё не пришло.
+    Starting,
+    /// Started получен, не все воркеры сообщили Ready.
+    Initializing,
+    /// Все воркеры процесса готовы, свободных назначений нет.
+    Ready,
+    /// Есть хотя бы один занятый файлом воркер.
+    Busy,
+    /// Shutdown/Exiting/Stopped: процесс завершает работу.
+    Stopping,
+    /// Фатальный WorkerError процесса или все его воркеры погибли.
+    Failed,
+    /// Процесс завершился (PID/канал).
+    Exited,
+}
+
 /// State machine диспетчера: общая очередь, назначения, отмена, гибель
 /// процессов/воркеров, детекция завершения. Не делает IO — только решения.
 struct Dispatch {
@@ -1100,6 +1330,11 @@ struct Dispatch {
     slots: Vec<Slot>,
     workers: Vec<WState>,
     wpc: usize,
+    /// G6.2.1: состояние каждого процесса (Starting…Exited).
+    proc: Vec<ProcState>,
+    /// G6.2.1: предел инициализации процесса без готовых воркеров.
+    startup_timeout: Duration,
+    startup_deadline: Vec<Instant>,
     cancelled: bool,
     pocket_loads: usize,
     workers_ready: usize,
@@ -1131,6 +1366,9 @@ impl Dispatch {
                 .collect(),
             workers,
             wpc,
+            proc: vec![ProcState::Starting; children],
+            startup_timeout: CHILD_STARTUP_TIMEOUT,
+            startup_deadline: vec![Instant::now() + CHILD_STARTUP_TIMEOUT; children],
             cancelled: false,
             pocket_loads: 0,
             workers_ready: 0,
@@ -1138,8 +1376,112 @@ impl Dispatch {
         }
     }
 
+    /// G6.2.1: переопределить startup timeout (тесты / диагностика).
+    fn set_startup_timeout(&mut self, timeout: Duration) {
+        self.startup_timeout = timeout;
+        self.startup_deadline = vec![Instant::now() + timeout; self.proc.len()];
+    }
+
     fn widx(&self, child: usize, wid: usize) -> usize {
         child * self.wpc + wid
+    }
+
+    /// G6.2.1: у процесса есть живой и ещё НЕ готовый воркер, способный
+    /// позже прислать Ready. TERMINAL-состояния процесса — не основание ждать.
+    /// Важно: процесс с ОДНИМ busy-воркером и другим ещё инициализирующимся
+    /// остаётся способным добавить Ready (это не «уже Ready»).
+    fn child_can_initialize(&self, child: usize) -> bool {
+        if matches!(
+            self.proc.get(child),
+            Some(ProcState::Failed | ProcState::Exited | ProcState::Stopping) | None
+        ) {
+            return false;
+        }
+        self.workers
+            .iter()
+            .any(|w| w.child == child && w.alive && !w.ready)
+    }
+
+    /// Хотя бы один воркер готов брать файлы (ready подразумевает alive).
+    fn worker_can_work(&self) -> bool {
+        self.workers.iter().any(|w| w.alive && w.ready)
+    }
+
+    fn child_has_ready(&self, child: usize) -> bool {
+        self.workers
+            .iter()
+            .any(|w| w.child == child && w.alive && w.ready)
+    }
+
+    /// G6.2.1: пересчитать состояние процесса по состояниям его воркеров.
+    /// Терминальные Failed/Exited/Stopping не перетираются.
+    fn refresh_proc_state(&mut self, child: usize) {
+        match self.proc.get(child) {
+            Some(ProcState::Failed | ProcState::Exited | ProcState::Stopping) | None => return,
+            _ => {}
+        }
+        let ws: Vec<&WState> = self.workers.iter().filter(|w| w.child == child).collect();
+        if ws.iter().all(|w| !w.alive) {
+            self.proc[child] = ProcState::Stopping;
+        } else if ws.iter().any(|w| w.alive && w.busy.is_some()) {
+            self.proc[child] = ProcState::Busy;
+        } else if ws.iter().all(|w| !w.alive || w.ready) {
+            self.proc[child] = ProcState::Ready;
+        } else {
+            self.proc[child] = ProcState::Initializing;
+        }
+    }
+
+    /// G6.2.1: startup timeout истёк у процессов БЕЗ готовых воркеров —
+    /// возвращает индексы процессов, которые нужно завершить (только свои).
+    fn startup_timeout_expired(&self, now: Instant) -> Vec<usize> {
+        (0..self.proc.len())
+            .filter(|&ci| {
+                self.child_can_initialize(ci)
+                    && !self.child_has_ready(ci)
+                    && now >= self.startup_deadline[ci]
+            })
+            .collect()
+    }
+
+    /// G6.2.1: инициализация «устоялась» — ни один процесс больше не может
+    /// добавить Ready-воркера (все Ready/Failed/Exited/Stopping). Нужно для
+    /// честного BatchWorkersReady при частичной инициализации.
+    fn init_settled(&self) -> bool {
+        !(0..self.proc.len()).any(|ci| self.child_can_initialize(ci))
+    }
+
+    /// G6.2.1: нет ни готовых воркеров, ни процессов, способных завершить
+    /// инициализацию, а файлы ещё остались → терминальный Failed, пакет
+    /// завершается. Пока инициализация допустима — НЕ спешим.
+    fn fail_if_no_capacity(&mut self) -> bool {
+        if self.all_done() || self.cancelled {
+            return false;
+        }
+        if self.worker_can_work() {
+            return false;
+        }
+        if (0..self.proc.len()).any(|ci| self.child_can_initialize(ci)) {
+            return false;
+        }
+        self.fail_remaining_no_workers();
+        true
+    }
+
+    /// Процесс терминально мёртв до Ready: Failed + незавершённые файлы Failed.
+    fn fail_child(&mut self, child: usize, reason: &str) {
+        if let Some(s) = self.proc.get_mut(child) {
+            *s = ProcState::Failed;
+        }
+        self.child_dead(child, reason);
+    }
+
+    /// Процесс завершился (PID/канал): Exited + незавершённые файлы Failed.
+    fn mark_exited(&mut self, child: usize, reason: &str) {
+        if let Some(s) = self.proc.get_mut(child) {
+            *s = ProcState::Exited;
+        }
+        self.child_dead(child, reason);
     }
 
     fn log(&mut self, msg: impl Into<String>) {
@@ -1195,6 +1537,9 @@ impl Dispatch {
         match ev {
             Ev::Started { pid } => {
                 self.log(format!("процесс {ci}: подключился (pid {pid})"));
+                if self.proc.get(ci) == Some(&ProcState::Starting) {
+                    self.proc[ci] = ProcState::Initializing;
+                }
                 Vec::new()
             }
             Ev::PocketLoaded { worker, load_ms } => {
@@ -1210,7 +1555,9 @@ impl Dispatch {
                     self.workers[i].ready = true;
                     self.workers_ready += 1;
                 }
-                self.try_assign(i).into_iter().collect()
+                let actions: Vec<Action> = self.try_assign(i).into_iter().collect();
+                self.refresh_proc_state(ci);
+                actions
             }
             Ev::FileStarted { worker, pos } => {
                 if let Some(slot) = self.slots.get_mut(*pos) {
@@ -1251,12 +1598,16 @@ impl Dispatch {
                 if self.workers[i].busy == Some(*pos) {
                     self.workers[i].busy = None;
                 }
-                self.try_assign(i).into_iter().collect()
+                let actions: Vec<Action> = self.try_assign(i).into_iter().collect();
+                self.refresh_proc_state(ci);
+                actions
             }
             Ev::Idle { worker } => {
                 let i = self.widx(ci, *worker);
                 if self.workers[i].busy.is_none() {
-                    return self.try_assign(i).into_iter().collect();
+                    let actions: Vec<Action> = self.try_assign(i).into_iter().collect();
+                    self.refresh_proc_state(ci);
+                    return actions;
                 }
                 Vec::new()
             }
@@ -1264,11 +1615,12 @@ impl Dispatch {
                 worker: usize::MAX,
                 error,
             } => {
-                // фатально для всего процесса: ни один Pocket не поднялся
+                // фатально для всего процесса: ни один Pocket не поднялся.
+                // Терминальное состояние протокола — Failed, а не «живой PID».
                 self.log(format!(
                     "ВНИМАНИЕ: процесс {ci}: {error} — его файлы завершатся ошибкой"
                 ));
-                self.child_dead(ci, &format!("процесс {ci}: {error}"));
+                self.fail_child(ci, &format!("процесс {ci}: {error}"));
                 Vec::new()
             }
             Ev::WorkerError { worker, error } => {
@@ -1283,14 +1635,40 @@ impl Dispatch {
                         self.slots[pos].phase = Phase::Done;
                     }
                 }
+                // все воркеры процесса погибли — процесс терминально Failed,
+                // даже если его PID ещё существует
+                if self.workers.iter().all(|w| w.child != ci || !w.alive) {
+                    self.fail_child(ci, &format!("процесс {ci}: погибли все воркеры"));
+                } else {
+                    self.refresh_proc_state(ci);
+                }
                 Vec::new()
             }
             Ev::Stopped { worker } => {
                 let i = self.widx(ci, *worker);
                 self.workers[i].alive = false;
+                self.workers[i].ready = false;
+                if self.workers.iter().all(|w| w.child != ci || !w.alive)
+                    && !matches!(
+                        self.proc.get(ci),
+                        Some(ProcState::Failed | ProcState::Exited)
+                    )
+                {
+                    self.proc[ci] = ProcState::Stopping;
+                } else {
+                    self.refresh_proc_state(ci);
+                }
                 Vec::new()
             }
-            Ev::Exiting => Vec::new(),
+            Ev::Exiting => {
+                if !matches!(
+                    self.proc.get(ci),
+                    Some(ProcState::Failed | ProcState::Exited)
+                ) {
+                    self.proc[ci] = ProcState::Stopping;
+                }
+                Vec::new()
+            }
         }
     }
 
@@ -1301,7 +1679,7 @@ impl Dispatch {
         self.log(format!(
             "ВНИМАНИЕ: дочерний процесс {ci} завершился: {reason}"
         ));
-        self.child_dead(ci, reason);
+        self.mark_exited(ci, reason);
     }
 
     fn child_dead(&mut self, ci: usize, reason: &str) {
@@ -1394,9 +1772,16 @@ pub struct HybridDriver<'a> {
     pub spawn: &'a dyn Fn(usize) -> Result<SpawnedChild>,
     pub log: &'a dyn Fn(String),
     pub event: &'a dyn Fn(&Ev),
+    /// G6.2.1: вызывается ОДИН раз, когда инициализация устоялась, с числом
+    /// реально готовых воркеров (может быть меньше заявленного при частичном
+    /// отказе загрузки). Нужен для честного BatchWorkersReady.
+    pub init_settled: &'a dyn Fn(usize),
     /// Watchdog молчания процесса с назначенным файлом (переопределяется
     /// тестами).
     pub watchdog: Duration,
+    /// G6.2.1: предел инициализации процесса без Ready-воркеров
+    /// (переопределяется тестами).
+    pub startup_timeout: Duration,
 }
 
 pub fn run_hybrid(d: &HybridDriver) -> Result<HybridOutcome> {
@@ -1408,7 +1793,10 @@ pub fn run_hybrid(d: &HybridDriver) -> Result<HybridOutcome> {
     );
 
     // --- запуск процессов (любой сбой — чистый откат уже запущенных) ---
+    // G6.2.1 FAIL-CLOSED: если процесс не запустился/не привязан к Job Object,
+    // синтез не начинается, уже созданные СВОИ процессы завершаются.
     let mut procs: Vec<Option<SpawnedChild>> = Vec::with_capacity(children);
+    let mut spawn_failure: Option<String> = None;
     for ci in 0..children {
         match (d.spawn)(ci) {
             Ok(mut sp) => {
@@ -1416,35 +1804,33 @@ pub fn run_hybrid(d: &HybridDriver) -> Result<HybridOutcome> {
                     settings: d.params.settings.clone(),
                     workers: d.params.workers_per_child,
                     fake: d.params.fake,
+                    test: d.params.test.get(ci).cloned().unwrap_or_default(),
                 };
                 if let Err(e) = send_cmd(&sp.writer, &init) {
                     let _ = sp.child.kill();
                     let _ = sp.child.wait();
-                    procs.push(None);
-                    (d.log)(format!("ВНИМАНИЕ: процесс {ci}: {e:#}"));
-                    continue;
+                    spawn_failure = Some(format!("процесс {ci}: init не доставлен: {e:#}"));
+                    break;
                 }
                 procs.push(Some(sp));
             }
             Err(e) => {
-                (d.log)(format!("ВНИМАНИЕ: запуск процесса {ci}: {e:#}"));
-                procs.push(None);
+                spawn_failure = Some(format!("процесс {ci}: {e:#}"));
+                break;
             }
         }
     }
-    let alive_count = procs.iter().filter(|p| p.is_some()).count();
-    if alive_count == 0 {
-        // ни одного процесса — чистый выход без заданий (файлы пометит вызывающий)
+    if let Some(reason) = spawn_failure {
+        // G6.2.1 FAIL-CLOSED: синтез не начинается; завершаем ТОЛЬКО свои
+        // уже созданные процессы и выходим с внятной причиной.
         for p in procs.iter_mut().flatten() {
             let _ = p.child.kill();
             let _ = p.child.wait();
         }
-        bail!("ни один дочерний процесс не запустился");
+        bail!("гибридный запуск прерван: {reason} — 2×2 не запускается без Job Object");
     }
-    if alive_count < children {
-        (d.log)(format!(
-            "ВНИМАНИЕ: работают {alive_count} из {children} процессов — очередь обработают живые"
-        ));
+    if procs.is_empty() {
+        bail!("ни один дочерний процесс не запустился");
     }
 
     // --- слитие событий всех процессов в один канал ---
@@ -1480,10 +1866,20 @@ pub fn run_hybrid(d: &HybridDriver) -> Result<HybridOutcome> {
 
     // --- основной цикл диспетчеризации ---
     let mut dispatch = Dispatch::new(d.params.jobs.len(), children, d.params.workers_per_child);
+    dispatch.set_startup_timeout(d.startup_timeout);
+    // процесс, который не запустился, не может инициализироваться
+    for (ci, p) in procs_map.iter().enumerate() {
+        if p.is_none() {
+            dispatch.mark_exited(ci, "процесс не запущен");
+        }
+    }
     let mut child_alive: Vec<bool> = (0..children).map(|ci| procs_map[ci].is_some()).collect();
     let mut last_seen: Vec<Instant> = (0..children).map(|_| Instant::now()).collect();
+    let mut exit_seen: Vec<Option<Instant>> = vec![None; children];
+    let mut exit_codes: Vec<Option<i32>> = vec![None; children];
     let watchdog = d.watchdog;
     let mut cancel_sent = false;
+    let mut init_announced = false;
 
     loop {
         if dispatch.complete_for_shutdown() {
@@ -1503,9 +1899,10 @@ pub fn run_hybrid(d: &HybridDriver) -> Result<HybridOutcome> {
                 }
             }
         }
-        // ни одного живого процесса, а файлы остались — честный Failed
-        if !dispatch.all_done() && child_alive.iter().all(|a| !a) {
-            dispatch.fail_remaining_no_workers();
+        // G6.2.1: нет готовых/занятых воркеров и не осталось процессов,
+        // способных завершить инициализацию, — честный Failed остальным.
+        // Пока инициализация допустима, пакет НЕ завершается преждевременно.
+        if dispatch.fail_if_no_capacity() {
             break;
         }
         match rx.recv_timeout(Duration::from_millis(100)) {
@@ -1534,15 +1931,28 @@ pub fn run_hybrid(d: &HybridDriver) -> Result<HybridOutcome> {
                         }
                     }
                 }
+                if !init_announced && dispatch.init_settled() {
+                    init_announced = true;
+                    (d.log)(format!(
+                        "инициализация устоялась: готовы {} воркеров",
+                        dispatch.workers_ready
+                    ));
+                    (d.init_settled)(dispatch.workers_ready);
+                }
+                if dispatch.fail_if_no_capacity() {
+                    break;
+                }
             }
             Ok((ci, ChildEvent::Closed(reason))) => {
                 if child_alive[ci] {
                     child_alive[ci] = false;
+                    exit_seen[ci] = None;
                     // контроль кода завершения: если процесс уже вышел —
                     // приложить его статус к диагнозу
                     let reason = match procs_map[ci].as_mut() {
                         Some(p) => match p.child.try_wait() {
                             Ok(Some(status)) => {
+                                exit_codes[ci] = status.code();
                                 format!("{reason}; код завершения процесса {ci}: {status}")
                             }
                             _ => reason,
@@ -1551,11 +1961,71 @@ pub fn run_hybrid(d: &HybridDriver) -> Result<HybridOutcome> {
                     };
                     dispatch.on_child_dead(ci, &reason);
                 }
+                if !init_announced && dispatch.init_settled() {
+                    init_announced = true;
+                    (d.log)(format!(
+                        "инициализация устоялась: готовы {} воркеров",
+                        dispatch.workers_ready
+                    ));
+                    (d.init_settled)(dispatch.workers_ready);
+                }
+                if dispatch.fail_if_no_capacity() {
+                    break;
+                }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                let now = Instant::now();
+                // G6.2.1: завершение PID проверяется и БЕЗ назначенных файлов
+                // (авария во время загрузки модели). Событиям канала даётся
+                // короткий шанс дойти до диспетчера (Closed/FileFinished).
+                for ci in 0..children {
+                    if !child_alive[ci] {
+                        continue;
+                    }
+                    let status = procs_map[ci]
+                        .as_mut()
+                        .and_then(|p| p.child.try_wait().ok().flatten());
+                    match status {
+                        Some(status) => match exit_seen[ci] {
+                            None => exit_seen[ci] = Some(now),
+                            Some(t) if now.duration_since(t) >= Duration::from_secs(1) => {
+                                exit_seen[ci] = None;
+                                exit_codes[ci] = status.code();
+                                child_alive[ci] = false;
+                                dispatch.on_child_dead(
+                                    ci,
+                                    &format!("процесс завершился (код {status})"),
+                                );
+                            }
+                            _ => {}
+                        },
+                        None => exit_seen[ci] = None,
+                    }
+                }
+                // G6.2.1: отдельный startup/initialization timeout. Процесс
+                // без ЕДИНОГО готового воркера, молчащий дольше предела,
+                // завершается (только свой PID), его файлы — Failed.
+                for ci in dispatch.startup_timeout_expired(now) {
+                    if !child_alive[ci] {
+                        continue;
+                    }
+                    if let Some(p) = procs_map[ci].as_mut() {
+                        let _ = p.child.kill();
+                        if let Ok(st) = p.child.wait() {
+                            exit_codes[ci] = st.code();
+                        }
+                    }
+                    dispatch.fail_child(
+                        ci,
+                        &format!(
+                            "startup timeout {:?}: ни один воркер не сообщил Ready",
+                            dispatch.startup_timeout
+                        ),
+                    );
+                    child_alive[ci] = false;
+                }
                 // watchdog: живой процесс с назначенным файлом молчит дольше
                 // допустимого — kill (только свой процесс) и явный Failed
-                let now = Instant::now();
                 for ci in 0..children {
                     if child_alive[ci]
                         && dispatch.child_has_busy(ci)
@@ -1563,7 +2033,9 @@ pub fn run_hybrid(d: &HybridDriver) -> Result<HybridOutcome> {
                     {
                         if let Some(p) = procs_map[ci].as_mut() {
                             let _ = p.child.kill();
-                            let _ = p.child.wait();
+                            if let Ok(st) = p.child.wait() {
+                                exit_codes[ci] = st.code();
+                            }
                         }
                         dispatch.on_child_dead(
                             ci,
@@ -1571,6 +2043,17 @@ pub fn run_hybrid(d: &HybridDriver) -> Result<HybridOutcome> {
                         );
                         child_alive[ci] = false;
                     }
+                }
+                if !init_announced && dispatch.init_settled() {
+                    init_announced = true;
+                    (d.log)(format!(
+                        "инициализация устоялась: готовы {} воркеров",
+                        dispatch.workers_ready
+                    ));
+                    (d.init_settled)(dispatch.workers_ready);
+                }
+                if dispatch.fail_if_no_capacity() {
+                    break;
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1582,14 +2065,26 @@ pub fn run_hybrid(d: &HybridDriver) -> Result<HybridOutcome> {
     for l in dispatch.drain_logs() {
         (d.log)(l);
     }
+    if !init_announced {
+        // пакет завершился раньше устойчивой инициализации (отмена/ранний
+        // отказ) — сообщаем фактическое число готовых воркеров
+        (d.log)(format!(
+            "инициализация завершилась раньше: готовы {} воркеров",
+            dispatch.workers_ready
+        ));
+        (d.init_settled)(dispatch.workers_ready);
+    }
     dispatch.reconcile();
 
     // --- контролируемое завершение СВОИХ дочерних процессов ---
     for p in procs_map.iter().flatten() {
         let _ = send_cmd(&p.writer, &Cmd::Shutdown);
     }
-    let deadline = Instant::now() + CHILD_EXIT_TIMEOUT;
-    for p in procs_map.iter_mut().flatten() {
+    for (ci, p) in procs_map.iter_mut().enumerate() {
+        let Some(p) = p else { continue };
+        // G6.2.1: ограничение ожидания — НА КАЖДЫЙ процесс, а не общее:
+        // один медленный Pocket не съедает бюджет остальных.
+        let deadline = Instant::now() + CHILD_EXIT_TIMEOUT;
         let mut exited = None;
         while Instant::now() < deadline {
             match p.child.try_wait() {
@@ -1603,27 +2098,34 @@ pub fn run_hybrid(d: &HybridDriver) -> Result<HybridOutcome> {
         }
         match exited {
             Some(st) => {
+                exit_codes[ci] = st.code();
                 if !st.success() {
                     (d.log)(format!(
-                        "ВНИМАНИЕ: дочерний процесс завершился с кодом {st} (не 0)"
+                        "ВНИМАНИЕ: дочерний процесс {ci} завершился с кодом {st} (не 0)"
                     ));
                 }
             }
             None => {
                 // эскалация только для собственных дочерних процессов
-                (d.log)(
-                    "ВНИМАНИЕ: дочерний процесс не завершился за CHILD_EXIT_TIMEOUT — \
+                (d.log)(format!(
+                    "ВНИМАНИЕ: дочерний процесс {ci} не завершился за CHILD_EXIT_TIMEOUT — \
                      принудительное завершение"
-                        .into(),
-                );
+                ));
                 let _ = p.child.kill();
-                let _ = p.child.wait();
+                if let Ok(st) = p.child.wait() {
+                    exit_codes[ci] = st.code();
+                }
             }
         }
     }
     for p in procs_map.iter_mut().flatten() {
         if let Some(f) = p.fwd.take() {
-            let _ = f.join();
+            // ограниченное ожидание: forwarder завершается по EOF/ошибке;
+            // зависать на нём нельзя (дочерние процессы уже завершены/убиты)
+            let mut f = Some(f);
+            if !join_bounded(&mut f, CHILD_IO_JOIN_TIMEOUT) {
+                (d.log)("ВНИМАНИЕ: forwarder событий не завершился — поток отсоединён".into());
+            }
         }
     }
 
@@ -1632,6 +2134,7 @@ pub fn run_hybrid(d: &HybridDriver) -> Result<HybridOutcome> {
         pocket_loads: dispatch.pocket_loads,
         workers_ready: dispatch.workers_ready,
         children_spawned: procs_map.iter().filter(|p| p.is_some()).count(),
+        child_exit_codes: exit_codes,
     })
 }
 
@@ -1739,6 +2242,7 @@ mod tests {
             settings: GuiSettings::default(),
             workers: 2,
             fake: true,
+            test: TestFaults::default(),
         };
         let back: Cmd = serde_json::from_value(cmd_to_value(&init).unwrap()).unwrap();
         assert!(matches!(back, Cmd::Init { fake: true, .. }));
@@ -2071,7 +2575,15 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let s2 = settings.clone();
         let handle = std::thread::spawn(move || {
-            worker_loop(0, cmd_rx, &cancel, &ev_tx, &s2, None);
+            worker_loop(
+                0,
+                cmd_rx,
+                &cancel,
+                &ev_tx,
+                &s2,
+                None,
+                &TestFaults::default(),
+            );
         });
         match ev_rx.recv_timeout(Duration::from_secs(5)).unwrap() {
             Ev::Ready { worker: 0 } => {}
@@ -2140,7 +2652,15 @@ mod tests {
         let cancel = AtomicBool::new(true); // уже отменено
         let s2 = settings.clone();
         std::thread::spawn(move || {
-            worker_loop(1, cmd_rx, &cancel, &ev_tx, &s2, None);
+            worker_loop(
+                1,
+                cmd_rx,
+                &cancel,
+                &ev_tx,
+                &s2,
+                None,
+                &TestFaults::default(),
+            );
         });
         match ev_rx.recv_timeout(Duration::from_secs(5)).unwrap() {
             Ev::Ready { worker: 1 } => {}
@@ -2181,7 +2701,11 @@ mod tests {
             Err(_) => return, // обычный прогон тестов — не child-режим
         };
         let code = worker_main(&pipe);
-        assert_eq!(code, 0, "child-процесс обязан завершаться кодом 0");
+        // В дочернем режиме КОД ПРОЦЕССА обязан быть кодом worker_main:
+        // 0 — штатно, 1 — инжектированный фатальный сбой инициализации.
+        // exit() завершает именно child-процесс (тестовый харнесс запускает
+        // этот «тест» как единственную точку входа ребёнка).
+        std::process::exit(code);
     }
 
     fn fake_settings(out_dir: &Path) -> GuiSettings {
@@ -2235,6 +2759,7 @@ mod tests {
             workers_per_child: 2,
             children: 2,
             fake: true,
+            test: Vec::new(),
         };
         let logs: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
         let log = |m: String| {
@@ -2255,7 +2780,9 @@ mod tests {
             spawn: &spawn,
             log: &log,
             event: &event,
+            init_settled: &|_n| {},
             watchdog: Duration::from_secs(60),
+            startup_timeout: Duration::from_secs(60),
         };
         let outcome = run_hybrid(&driver).expect("гибридный прогон");
         assert_eq!(outcome.reports.len(), 5);
@@ -2293,6 +2820,7 @@ mod tests {
             workers_per_child: 2,
             children: 2,
             fake: true,
+            test: Vec::new(),
         };
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_c = Arc::clone(&cancel);
@@ -2317,7 +2845,9 @@ mod tests {
             spawn: &spawn,
             log: &log,
             event: &event,
+            init_settled: &|_n| {},
             watchdog: Duration::from_secs(60),
+            startup_timeout: Duration::from_secs(60),
         };
         let outcome = run_hybrid(&driver).expect("прогон с отменой");
         let completed = outcome
@@ -2375,6 +2905,7 @@ mod tests {
             workers_per_child: 2,
             children: 2,
             fake: true,
+            test: Vec::new(),
         };
         let pids: Arc<std::sync::Mutex<Vec<u32>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let log_all: Arc<std::sync::Mutex<Vec<String>>> =
@@ -2413,7 +2944,9 @@ mod tests {
                 spawn: &spawn,
                 log: &log,
                 event: &event,
+                init_settled: &|_n| {},
                 watchdog: Duration::from_secs(60),
+                startup_timeout: Duration::from_secs(60),
             };
             run_hybrid(&driver)
         });
@@ -2454,6 +2987,642 @@ mod tests {
             if job.out.exists() {
                 assert!(std::fs::read(&job.out).unwrap().starts_with(b"RIFF"));
             }
+        }
+    }
+
+    // ================= G6.2.1: E2E жизненного цикла (A–I) =================
+
+    /// Ограниченное ожидание E2E-прогона: при зависании убивает ТОЛЬКО
+    /// собственные дочерние PID и возвращает флаг «таймаут». Тест после
+    /// возврата run_hybrid обязан проверить флаг и упасть.
+    fn watchdog(
+        timeout: Duration,
+        pids: Arc<Mutex<Vec<u32>>>,
+        done: Arc<AtomicBool>,
+    ) -> Arc<AtomicBool> {
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&timed_out);
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                if done.load(Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if !done.load(Ordering::SeqCst) {
+                flag.store(true, Ordering::SeqCst);
+                for pid in pids.lock().unwrap().iter() {
+                    let _ = std::process::Command::new("taskkill")
+                        .args(["/PID", &pid.to_string(), "/F"])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                }
+            }
+        });
+        timed_out
+    }
+
+    fn process_alive(pid: u32) -> bool {
+        match std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+        {
+            Ok(out) => String::from_utf8_lossy(&out.stdout).contains(&pid.to_string()),
+            Err(_) => false,
+        }
+    }
+
+    /// E2E-A: injected failure `build_worker_env` ПЕРВОГО процесса. Второй
+    /// загружает fake-воркеры и обрабатывает все файлы; первый завершается
+    /// ненулевым кодом; программа не зависает; все файлы терминальны.
+    #[test]
+    fn hybrid_e2e_a_init_failure_first_child() {
+        let d = sandbox("e2eA");
+        let out_root = d.join("out");
+        std::fs::create_dir_all(&out_root).unwrap();
+        let jobs = make_jobs(&d, &out_root, 6);
+        let params = HybridParams {
+            settings: fake_settings(&out_root),
+            jobs: jobs.clone(),
+            workers_per_child: 2,
+            children: 2,
+            fake: true,
+            test: vec![
+                TestFaults {
+                    fail_init: true,
+                    ..Default::default()
+                },
+                TestFaults::default(),
+            ],
+        };
+        let pids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        let done = Arc::new(AtomicBool::new(false));
+        let timed_out = watchdog(
+            Duration::from_secs(120),
+            Arc::clone(&pids),
+            Arc::clone(&done),
+        );
+        let pids_c = Arc::clone(&pids);
+        let job_guard = ChildJobGuard::new();
+        let spawn = |ci: usize| {
+            let sp = spawn_test_child(&job_guard, ci)?;
+            pids_c.lock().unwrap().push(sp.child.id());
+            Ok(sp)
+        };
+        let log = |_m: String| {};
+        let event = |_e: &Ev| {};
+        let init_settled = |_n: usize| {};
+        let driver = HybridDriver {
+            params: &params,
+            cancel: Arc::new(AtomicBool::new(false)),
+            spawn: &spawn,
+            log: &log,
+            event: &event,
+            init_settled: &init_settled,
+            watchdog: Duration::from_secs(60),
+            startup_timeout: Duration::from_secs(60),
+        };
+        let outcome = run_hybrid(&driver).expect("E2E-A");
+        done.store(true, Ordering::SeqCst);
+        assert!(!timed_out.load(Ordering::SeqCst), "прогон не завис");
+        assert_eq!(outcome.reports.len(), 6);
+        assert!(outcome.reports.iter().all(|r| r.is_some()));
+        assert!(
+            outcome
+                .reports
+                .iter()
+                .all(|r| r.as_ref().unwrap().status == FileStatus::Completed),
+            "второй процесс обработал все файлы"
+        );
+        assert_eq!(
+            outcome.workers_ready, 2,
+            "готовы воркеры выжившего процесса"
+        );
+        assert_ne!(
+            outcome.child_exit_codes[0],
+            Some(0),
+            "первый процесс завершился ненулевым кодом"
+        );
+        assert_eq!(outcome.child_exit_codes[1], Some(0));
+    }
+
+    /// E2E-B: оба процесса не смогли инициализироваться. Pending-файлы
+    /// получают Failed; диспетчер выходит за ограниченное время; оба PID
+    /// завершены; живых дочерних процессов не остаётся.
+    #[test]
+    fn hybrid_e2e_b_both_init_fail() {
+        let d = sandbox("e2eB");
+        let out_root = d.join("out");
+        std::fs::create_dir_all(&out_root).unwrap();
+        let jobs = make_jobs(&d, &out_root, 4);
+        let params = HybridParams {
+            settings: fake_settings(&out_root),
+            jobs: jobs.clone(),
+            workers_per_child: 2,
+            children: 2,
+            fake: true,
+            test: vec![
+                TestFaults {
+                    fail_init: true,
+                    ..Default::default()
+                },
+                TestFaults {
+                    fail_init: true,
+                    ..Default::default()
+                },
+            ],
+        };
+        let pids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        let done = Arc::new(AtomicBool::new(false));
+        let timed_out = watchdog(
+            Duration::from_secs(60),
+            Arc::clone(&pids),
+            Arc::clone(&done),
+        );
+        let pids_c = Arc::clone(&pids);
+        let job_guard = ChildJobGuard::new();
+        let spawn = |ci: usize| {
+            let sp = spawn_test_child(&job_guard, ci)?;
+            pids_c.lock().unwrap().push(sp.child.id());
+            Ok(sp)
+        };
+        let log = |_m: String| {};
+        let event = |_e: &Ev| {};
+        let init_settled = |_n: usize| {};
+        let driver = HybridDriver {
+            params: &params,
+            cancel: Arc::new(AtomicBool::new(false)),
+            spawn: &spawn,
+            log: &log,
+            event: &event,
+            init_settled: &init_settled,
+            watchdog: Duration::from_secs(60),
+            startup_timeout: Duration::from_secs(60),
+        };
+        let outcome = run_hybrid(&driver).expect("E2E-B");
+        done.store(true, Ordering::SeqCst);
+        assert!(
+            !timed_out.load(Ordering::SeqCst),
+            "диспетчер вышел ограниченно"
+        );
+        assert_eq!(outcome.reports.len(), 4);
+        assert!(
+            outcome
+                .reports
+                .iter()
+                .all(|r| r.as_ref().unwrap().status == FileStatus::Failed),
+            "все оставшиеся файлы — Failed"
+        );
+        assert_eq!(outcome.workers_ready, 0);
+        assert!(
+            outcome
+                .child_exit_codes
+                .iter()
+                .all(|c| c.is_some() && *c != Some(0)),
+            "оба процесса завершились ненулевым кодом: {:?}",
+            outcome.child_exit_codes
+        );
+        let alive: Vec<u32> = pids
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .filter(|pid| process_alive(*pid))
+            .collect();
+        assert!(alive.is_empty(), "нет живых дочерних PID: {alive:?}");
+    }
+
+    /// E2E-C: процесс убит ДО Ready. IPC-разрыв обнаружен, выживший процесс
+    /// продолжает работу, ожидающие задания не теряются, бесконечного
+    /// ожидания Ready нет.
+    #[test]
+    fn hybrid_e2e_c_process_died_before_ready() {
+        let d = sandbox("e2eC");
+        let out_root = d.join("out");
+        std::fs::create_dir_all(&out_root).unwrap();
+        let jobs = make_jobs(&d, &out_root, 6);
+        let params = HybridParams {
+            settings: fake_settings(&out_root),
+            jobs: jobs.clone(),
+            workers_per_child: 2,
+            children: 2,
+            fake: true,
+            test: vec![
+                TestFaults {
+                    init_delay_ms: 5_000,
+                    ..Default::default()
+                },
+                TestFaults::default(),
+            ],
+        };
+        let pids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        let pids_k = Arc::clone(&pids);
+        let kill_done = Arc::new(AtomicBool::new(false));
+        let kill_c = Arc::clone(&kill_done);
+        let event = move |ev: &Ev| {
+            if matches!(ev, Ev::Started { .. }) && !kill_c.swap(true, Ordering::SeqCst) {
+                if let Some(&victim) = pids_k.lock().unwrap().first() {
+                    let _ = std::process::Command::new("taskkill")
+                        .args(["/PID", &victim.to_string(), "/F"])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                }
+            }
+        };
+        let done = Arc::new(AtomicBool::new(false));
+        let timed_out = watchdog(
+            Duration::from_secs(120),
+            Arc::clone(&pids),
+            Arc::clone(&done),
+        );
+        let pids_c = Arc::clone(&pids);
+        let job_guard = ChildJobGuard::new();
+        let spawn = |ci: usize| {
+            let sp = spawn_test_child(&job_guard, ci)?;
+            pids_c.lock().unwrap().push(sp.child.id());
+            Ok(sp)
+        };
+        let log = |_m: String| {};
+        let init_settled = |_n: usize| {};
+        let driver = HybridDriver {
+            params: &params,
+            cancel: Arc::new(AtomicBool::new(false)),
+            spawn: &spawn,
+            log: &log,
+            event: &event,
+            init_settled: &init_settled,
+            watchdog: Duration::from_secs(60),
+            startup_timeout: Duration::from_secs(60),
+        };
+        let outcome = run_hybrid(&driver).expect("E2E-C");
+        done.store(true, Ordering::SeqCst);
+        assert!(
+            !timed_out.load(Ordering::SeqCst),
+            "ожидание Ready не бесконечно"
+        );
+        assert!(
+            kill_done.load(Ordering::SeqCst),
+            "сбой внедрён во время init"
+        );
+        assert_eq!(outcome.reports.len(), 6);
+        assert!(
+            outcome
+                .reports
+                .iter()
+                .all(|r| r.as_ref().unwrap().status == FileStatus::Completed),
+            "выживший процесс доделал все файлы"
+        );
+        assert_eq!(outcome.workers_ready, 2);
+        assert_ne!(outcome.child_exit_codes[0], Some(0));
+    }
+
+    /// E2E-D: Ready одного воркера, второй не загрузился. Частично
+    /// инициализированный процесс не считается полностью готовым (3 из 4).
+    #[test]
+    fn hybrid_e2e_d_partial_init() {
+        let d = sandbox("e2eD");
+        let out_root = d.join("out");
+        std::fs::create_dir_all(&out_root).unwrap();
+        let jobs = make_jobs(&d, &out_root, 6);
+        let params = HybridParams {
+            settings: fake_settings(&out_root),
+            jobs: jobs.clone(),
+            workers_per_child: 2,
+            children: 2,
+            fake: true,
+            test: vec![
+                TestFaults {
+                    fail_workers: vec![1],
+                    ..Default::default()
+                },
+                TestFaults::default(),
+            ],
+        };
+        let settled: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
+        let settled_c = Arc::clone(&settled);
+        let init_settled = move |n: usize| {
+            *settled_c.lock().unwrap() = Some(n);
+        };
+        let pids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        let done = Arc::new(AtomicBool::new(false));
+        let timed_out = watchdog(
+            Duration::from_secs(120),
+            Arc::clone(&pids),
+            Arc::clone(&done),
+        );
+        let pids_c = Arc::clone(&pids);
+        let job_guard = ChildJobGuard::new();
+        let spawn = |ci: usize| {
+            let sp = spawn_test_child(&job_guard, ci)?;
+            pids_c.lock().unwrap().push(sp.child.id());
+            Ok(sp)
+        };
+        let logs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let logs_c = Arc::clone(&logs);
+        let log = move |m: String| logs_c.lock().unwrap().push(m);
+        let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_c = Arc::clone(&events);
+        let event = move |ev: &Ev| events_c.lock().unwrap().push(format!("{ev:?}"));
+        let driver = HybridDriver {
+            params: &params,
+            cancel: Arc::new(AtomicBool::new(false)),
+            spawn: &spawn,
+            log: &log,
+            event: &event,
+            init_settled: &init_settled,
+            watchdog: Duration::from_secs(60),
+            startup_timeout: Duration::from_secs(60),
+        };
+        let outcome = run_hybrid(&driver).expect("E2E-D");
+        done.store(true, Ordering::SeqCst);
+        if *settled.lock().unwrap() != Some(3) {
+            eprintln!("E2E-D logs:\n{}", logs.lock().unwrap().join("\n"));
+            eprintln!("E2E-D events:\n{}", events.lock().unwrap().join("\n"));
+        }
+        assert!(!timed_out.load(Ordering::SeqCst));
+        assert_eq!(outcome.workers_ready, 3, "3 из 4 воркеров реально готовы");
+        assert_eq!(
+            *settled.lock().unwrap(),
+            Some(3),
+            "BatchWorkersReady с фактическим числом"
+        );
+        assert!(
+            outcome
+                .reports
+                .iter()
+                .all(|r| r.as_ref().unwrap().status == FileStatus::Completed),
+            "частичный процесс и второй процесс доделали файлы"
+        );
+    }
+
+    /// E2E-E: порядок финальных сообщений FileFinished → Stopped → Exiting →
+    /// EOF; без потерь и дубликатов, Exiting — последнее сообщение.
+    #[test]
+    fn hybrid_e2e_e_final_event_order() {
+        let d = sandbox("e2eE");
+        let out_root = d.join("out");
+        std::fs::create_dir_all(&out_root).unwrap();
+        let jobs = make_jobs(&d, &out_root, 1);
+        let job_guard = ChildJobGuard::new();
+        let mut sp = spawn_test_child(&job_guard, 0).expect("spawn E");
+        let init = Cmd::Init {
+            settings: fake_settings(&out_root),
+            workers: 1,
+            fake: true,
+            test: TestFaults::default(),
+        };
+        send_cmd(&sp.writer, &init).expect("init");
+        let assign = Cmd::Assign {
+            worker: 0,
+            pos: 0,
+            input: jobs[0].input.clone(),
+            relative: jobs[0].relative.clone(),
+            out: jobs[0].out.clone(),
+            seed: 42,
+        };
+        send_cmd(&sp.writer, &assign).expect("assign");
+        send_cmd(&sp.writer, &Cmd::Shutdown).expect("shutdown");
+
+        let mut evs: Vec<Ev> = Vec::new();
+        let mut closed = false;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            match sp.events.recv_timeout(Duration::from_millis(100)) {
+                Ok(ChildEvent::Msg(ev)) => evs.push(ev),
+                Ok(ChildEvent::Closed(_)) => {
+                    closed = true;
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        let _ = sp.child.wait();
+        assert!(closed, "EOF после Exiting");
+        let fi = evs
+            .iter()
+            .position(|e| matches!(e, Ev::FileFinished { .. }))
+            .expect("FileFinished");
+        let st = evs
+            .iter()
+            .position(|e| matches!(e, Ev::Stopped { .. }))
+            .expect("Stopped");
+        let ex = evs
+            .iter()
+            .position(|e| matches!(e, Ev::Exiting))
+            .expect("Exiting");
+        assert!(fi < st && st < ex, "порядок нарушен: {evs:?}");
+        assert_eq!(
+            evs.iter()
+                .filter(|e| matches!(e, Ev::FileFinished { .. }))
+                .count(),
+            1,
+            "ровно одно FileFinished"
+        );
+        assert_eq!(
+            evs.iter()
+                .filter(|e| matches!(e, Ev::Stopped { .. }))
+                .count(),
+            1,
+            "ровно одно Stopped"
+        );
+        assert!(matches!(evs.last(), Some(Ev::Exiting)), "Exiting последнее");
+    }
+
+    /// E2E-F: родитель разрывает IPC, пока ребёнок завершается. Нет deadlock:
+    /// ребёнок выходит за ограниченное время, writer не остаётся заблокирован.
+    #[test]
+    fn hybrid_e2e_f_ipc_break_during_finish() {
+        let d = sandbox("e2eF");
+        let out_root = d.join("out");
+        std::fs::create_dir_all(&out_root).unwrap();
+        let job_guard = ChildJobGuard::new();
+        let mut sp = spawn_test_child(&job_guard, 0).expect("spawn F");
+        let init = Cmd::Init {
+            settings: fake_settings(&out_root),
+            workers: 1,
+            fake: true,
+            test: TestFaults::default(),
+        };
+        send_cmd(&sp.writer, &init).expect("init");
+        std::thread::sleep(Duration::from_millis(200));
+        sp.writer.disconnect().expect("разрыв канала");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut exited = false;
+        while Instant::now() < deadline {
+            match sp.child.try_wait() {
+                Ok(Some(_)) => {
+                    exited = true;
+                    break;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(_) => break,
+            }
+        }
+        if !exited {
+            let _ = sp.child.kill();
+            let _ = sp.child.wait();
+        }
+        assert!(
+            exited,
+            "дочерний процесс завершился за ограниченное время после разрыва IPC"
+        );
+    }
+
+    /// E2E-G: отказ создания Job Object — fail-closed. 2×2 не запускается,
+    /// ошибка понятна; никаких процессов не создаётся.
+    #[test]
+    fn hybrid_e2e_g_job_creation_failure() {
+        let guard = ChildJobGuard::with_faults_for_test(true, false);
+        let err = guard.ready().expect_err("Job Object не создан");
+        assert!(format!("{err:#}").contains("Job Object"));
+
+        let d = sandbox("e2eG");
+        let out_root = d.join("out");
+        std::fs::create_dir_all(&out_root).unwrap();
+        let jobs = make_jobs(&d, &out_root, 2);
+        let params = HybridParams {
+            settings: fake_settings(&out_root),
+            jobs: jobs.clone(),
+            workers_per_child: 2,
+            children: 2,
+            fake: true,
+            test: Vec::new(),
+        };
+        let spawn = |_ci: usize| -> Result<SpawnedChild> {
+            anyhow::bail!("Job Object недоступен — 2×2 запрещён")
+        };
+        let log = |_m: String| {};
+        let event = |_e: &Ev| {};
+        let init_settled = |_n: usize| {};
+        let driver = HybridDriver {
+            params: &params,
+            cancel: Arc::new(AtomicBool::new(false)),
+            spawn: &spawn,
+            log: &log,
+            event: &event,
+            init_settled: &init_settled,
+            watchdog: Duration::from_secs(10),
+            startup_timeout: Duration::from_secs(10),
+        };
+        let err = run_hybrid(&driver).expect_err("2×2 не должен стартовать");
+        assert!(format!("{err:#}").contains("Job Object"));
+    }
+
+    /// E2E-H: отказ AssignProcessToJobObject — процесс не допускается к
+    /// синтезу и сразу завершается; ошибка не скрывается.
+    #[test]
+    fn hybrid_e2e_h_assign_failure() {
+        let guard = ChildJobGuard::with_faults_for_test(false, true);
+        match spawn_test_child(&guard, 0) {
+            Ok(_) => panic!("AssignProcessToJobObject обязан отказать"),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                assert!(
+                    msg.contains("Job Object") || msg.contains("AssignProcessToJobObject"),
+                    "{msg}"
+                );
+            }
+        }
+    }
+
+    /// E2E-I: аварийная гибель изолированного тестового диспетчера — Job
+    /// Object обязан завершить собственные дочерние fake-worker PID.
+    #[test]
+    fn hybrid_e2e_i_dispatcher_crash() {
+        let d = sandbox("e2eI");
+        let pid_file = d.join("pids.txt");
+        let exe = std::env::current_exe().unwrap();
+        let mut dispatcher = std::process::Command::new(&exe)
+            .args([
+                "--exact",
+                "hybrid::tests::hybrid_e2e_dispatcher_entry",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env("SHTORM_G62_DISPATCHER_PID_FILE", &pid_file)
+            .spawn()
+            .expect("spawn dispatcher");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut pids: Vec<u32> = Vec::new();
+        while Instant::now() < deadline {
+            if let Ok(s) = std::fs::read_to_string(&pid_file) {
+                let parsed: Vec<u32> = s.lines().filter_map(|l| l.trim().parse().ok()).collect();
+                if parsed.len() >= 2 {
+                    pids = parsed;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(pids.len(), 2, "диспетчер сообщил PID двух детей");
+        // аварийно завершаем ТОЛЬКО собственный тестовый диспетчер
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &dispatcher.id().to_string(), "/F"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let _ = dispatcher.wait();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut alive: Vec<u32> = Vec::new();
+        while Instant::now() < deadline {
+            alive = pids
+                .iter()
+                .copied()
+                .filter(|pid| process_alive(*pid))
+                .collect();
+            if alive.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if !alive.is_empty() {
+            // страховка теста: свои процессы, не чужие
+            for pid in &alive {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/F"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+        }
+        assert!(
+            alive.is_empty(),
+            "KILL_ON_JOB_CLOSE завершил дочерние PID: {alive:?}"
+        );
+    }
+
+    /// Child-entry E2E-I: изолированный диспетчер. Создаёт Job Object,
+    /// запускает двух fake-воркеров, публикует их PID и ждёт гибели от
+    /// родителя. Запускается ТОЛЬКО при заданном PID-файле.
+    #[test]
+    fn hybrid_e2e_dispatcher_entry() {
+        let pid_file = match std::env::var("SHTORM_G62_DISPATCHER_PID_FILE") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let guard = ChildJobGuard::new();
+        let mut kids = Vec::new();
+        for ci in 0..2 {
+            let sp = spawn_child_via_test_harness(&guard, ci).expect("spawn child");
+            let init = Cmd::Init {
+                settings: GuiSettings::default(),
+                workers: 1,
+                fake: true,
+                test: TestFaults::default(),
+            };
+            let _ = send_cmd(&sp.writer, &init);
+            kids.push(sp);
+        }
+        let pids: Vec<String> = kids.iter().map(|k| k.child.id().to_string()).collect();
+        std::fs::write(&pid_file, pids.join("\n")).expect("pid file");
+        std::thread::sleep(Duration::from_secs(120));
+        for mut k in kids {
+            let _ = k.child.kill();
+            let _ = k.child.wait();
         }
     }
 }

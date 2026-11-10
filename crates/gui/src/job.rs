@@ -1091,26 +1091,29 @@ fn execute_batch_hybrid(
     let jobs_by_pos: std::collections::HashMap<usize, &HybridJob> =
         jobs.iter().map(|j| (j.pos, j)).collect();
 
-    // --- ожидание событий UI: готовность всех воркеров сообщается ОДИН раз ---
-    let ready_seen = std::sync::atomic::AtomicUsize::new(0);
-    let announce = std::sync::atomic::AtomicBool::new(false);
+    // --- ожидание событий UI ---
+    // G6.2.1: BatchWorkersReady сообщается ОДИН раз, когда инициализация
+    // УСТОЯЛАСЬ — с ФАКТИЧЕСКИМ числом Ready-воркеров. При частичном отказе
+    // (E2E-D) это 3 из 4, а не номинальные 4: частично инициализированный
+    // процесс нельзя считать полностью готовым.
+    let init_settled = {
+        let emit = Arc::clone(emit);
+        move |n: usize| {
+            if n > 0 {
+                emit(JobEvent::Log(format!(
+                    "гибрид 2×2: {n} воркеров готовы к работе"
+                )));
+                emit(JobEvent::BatchWorkersReady { workers: n });
+            } else {
+                emit(JobEvent::Log(
+                    "ВНИМАНИЕ: гибрид 2×2: ни один воркер не сообщил Ready".into(),
+                ));
+            }
+        }
+    };
     let ui_event = {
         let emit = Arc::clone(emit);
-        let ready_seen = &ready_seen;
-        let announce = &announce;
         move |ev: &Ev| match ev {
-            Ev::Ready { .. } => {
-                let n = ready_seen.fetch_add(1, Ordering::SeqCst) + 1;
-                if n == HYBRID_TOTAL_WORKERS && !announce.swap(true, Ordering::SeqCst) {
-                    emit(JobEvent::Log(format!(
-                        "гибрид 2×2: {HYBRID_CHILDREN} процесса × {HYBRID_WORKERS_PER_CHILD} \
-                         воркера готовы"
-                    )));
-                    emit(JobEvent::BatchWorkersReady {
-                        workers: HYBRID_TOTAL_WORKERS,
-                    });
-                }
-            }
             Ev::FileStarted { pos, .. } => {
                 if let Some(j) = jobs_by_pos.get(pos) {
                     emit(JobEvent::FileStarted {
@@ -1170,7 +1173,35 @@ fn execute_batch_hybrid(
     };
 
     // --- запуск дочерних процессов и диспетчеризация ---
+    let log_emit = Arc::clone(emit);
+    // G6.2.1 FAIL-CLOSED: без действующего KILL_ON_JOB_CLOSE 2×2 не стартует.
+    // Проверка ДО первого процесса: CUDA-загрузок и сирот не возникает.
     let job_guard = ChildJobGuard::new();
+    if let Err(e) = job_guard.ready() {
+        let msg = format!(
+            "режим «Максимальная скорость» (2×2) не запущен: защита процессов \
+             Windows Job Object недоступна ({e:#}). Выберите экономичный режим 1×2"
+        );
+        log_emit(JobEvent::Log(format!("ВНИМАНИЕ: {msg}")));
+        for pf in &to_synth {
+            let file = &plan.files[pf.index];
+            let r = FileReport::failed(file, Some(pf.out.clone()), msg.clone());
+            emit_batch(BatchEvent::FileFinished {
+                index: pf.index + 1,
+                total,
+                report: Box::new(r.clone()),
+            });
+            reports[pf.index] = r;
+        }
+        return Ok(BatchReport {
+            files: reports,
+            conflicts: prepared.conflicts,
+            cancelled: cancel.load(Ordering::SeqCst),
+            pool_loads: Some(0),
+            pool_workers: Some(0),
+            pool_processes: Some(0),
+        });
+    }
     #[cfg(not(test))]
     let exe = std::env::current_exe()?;
     #[cfg(not(test))]
@@ -1179,7 +1210,6 @@ fn execute_batch_hybrid(
     // запускаются через его child-entry (та же реализация worker_main).
     #[cfg(test)]
     let spawn = |ci: usize| hybrid::spawn_child_via_test_harness(&job_guard, ci);
-    let log_emit = Arc::clone(emit);
     let log = |m: String| log_emit(JobEvent::Log(m));
     let fake = std::env::var("SHTORM_G62_FAKE").as_deref() == Ok("1");
     let params = HybridParams {
@@ -1188,6 +1218,7 @@ fn execute_batch_hybrid(
         workers_per_child: HYBRID_WORKERS_PER_CHILD,
         children: HYBRID_CHILDREN,
         fake,
+        test: Vec::new(),
     };
     let driver = HybridDriver {
         params: &params,
@@ -1195,7 +1226,9 @@ fn execute_batch_hybrid(
         spawn: &spawn,
         log: &log,
         event: &ui_event,
+        init_settled: &init_settled,
         watchdog: hybrid::CHILD_WATCHDOG,
+        startup_timeout: hybrid::CHILD_STARTUP_TIMEOUT,
     };
     emit(JobEvent::Log(format!(
         "гибрид 2×2: запуск {HYBRID_CHILDREN} процессов CUDA-инференса ({} Pocket на процесс; \
@@ -1264,7 +1297,8 @@ fn execute_batch_hybrid(
         conflicts: prepared.conflicts,
         cancelled,
         pool_loads: Some(outcome.pocket_loads),
-        pool_workers: Some(outcome.workers_ready.max(HYBRID_WORKERS_PER_CHILD)),
+        // G6.2.1: фактическое число готовых воркеров, без «дотягивания» до 2.
+        pool_workers: Some(outcome.workers_ready),
         pool_processes: Some(outcome.children_spawned),
     };
     if report.pool_workers == Some(0) {
