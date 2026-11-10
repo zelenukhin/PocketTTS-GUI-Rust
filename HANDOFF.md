@@ -1,16 +1,15 @@
 # HANDOFF.md — оперативный снимок проекта (читать первым вместе с AGENTS.md)
 
-- **Дата обновления**: 2026-11-10 (G6.1.1: исправлена потеря preflight-событий
-  `FileDone` в пакетном GUI — `BatchStarted{workers:0}` теперь до preflight,
-  новое `BatchWorkersReady` обновляет только число воркеров без сброса
-  счётчиков; CLI строго валидируется — неизвестный флаг завершается кодом 2
-  БЕЗ открытия окна, есть `--help`; отчёт `docs/G6_1_1_FIXES.md`).
+- **Дата обновления**: 2026-11-10 (G6.2: гибридный пакетный CUDA 2×2 —
+  два дочерних процесса синтеза по два постоянных Pocket, Named Pipe IPC,
+  пакетный GUI-выбор «Экономичный 1×2 / Максимальная скорость 2×2»;
+  G6.1.2 — запрет повторных CLI-опций; отчёт `docs/G6_2_HYBRID_POOL.md`).
 - **HEAD**: только из Git (`git log -1 --oneline`), не из этого файла.
-- **Бэкап на NAS (верифицирован, сделан ПЕРЕД изменениями G6.1.1,
-  2026-11-10 16:23)**: полный архив HEAD `5658c4f` —
-  `\\DISKSTATION\Ableton 2\Temp2\ShtormTTS-Windows-full-5658c4f-20261110-162255.zip`,
-  SHA256 `24285EB50ED1EC8CCD2969B55C61A845280A21B42A3187482B0C3184C84292D5`,
-  156/156 blob совпадают. Прежние архивы не тронуты (`69a96f5` — до G6.1).
+- **Бэкап на NAS (верифицирован, сделан ПЕРЕД изменениями G6.1.2/G6.2,
+  2026-11-10 17:25)**: полный архив HEAD `fdcc485` —
+  `\\DISKSTATION\Ableton 2\Temp2\ShtormTTS-Windows-full-fdcc485-20261110-172531.zip`,
+  SHA256 `F2F7E942744A80AE850FFC8891C92DB28A32ECDFB1AD4BFC7B9058997C81A7AA`,
+  160/160 blob совпадают. Прежние архивы не тронуты.
 - **NAS РАБОТАЕТ.** «SMB error 1702» из G2.1/P2B.1 — ошибка диагностического
   скрипта: `out/nas_check.ps1` использовал `'\DISKSTATION\...'` с ОДНИМ
   ведущим слэшем (PowerShell трактует это как путь от `C:`), плюс потеря
@@ -192,7 +191,60 @@ WAV/MP3/Opus без накопления аудио в памяти, одино�
 - Проверки: fmt OK, clippy 0 предупреждений, `cargo test --release` —
   **175 passed / 0 failed / 18 ignored**, release OK.
 
-## G6.1.1 — что сделано (текущий этап)
+## G6.2 — что сделано (текущий этап)
+
+- **Архитектура 2×2**: GUI-процесс — диспетчер (preflight, общая очередь,
+  прогресс; ONNX в нём НЕ грузится), два ДОЧЕРНИХ процесса того же exe во
+  внутреннем режиме `--internal-batch-worker <канал>` — по 2 постоянных
+  `Pocket` (всего 4 Pocket / 20 ONNX-сессий). IPC — Windows Named Pipes
+  (duplex, OVERLAPPED I/O, кадры u32+JSON, проверка PID клиента,
+  PIPE_REJECT_REMOTE_CLIENTS); дочерние процессы в Job Object
+  KILL_ON_JOB_CLOSE. Новые модули `gui/ipc.rs`, `gui/hybrid.rs`.
+- **Диспетчер**: общая очередь — освободившийся воркер ЛЮБОГО процесса берёт
+  следующий файл; state machine Pending→Assigned→Generating→Finalizing/
+  Publishing→Completed/Skipped/Failed/Cancelled; ровно один терминальный
+  результат на файл (дубль `file_finished` игнорируется с диагностикой);
+  отчёт в порядке плана. Per-file seed разрешает диспетчер, воркер ставит на
+  постоянный Pocket (паритет G6.1).
+- **Отказоустойчивость**: гибель процесса (в т.ч. CUDA OOM) — разрыв IPC +
+  код выхода; его незавершённые файлы Failed с диагнозом, очередь доделывает
+  выживший, автоповтора нет; watchdog 300 с на молчащий процесс с назначенным
+  файлом; гонка «assign между FileFinished и WorkerError» закрыта (воркер
+  отвергает накопленные назначения, диспетчер закрывает busy-файл);
+  shutdown с эскалацией kill только своих детей (15 с).
+- **Отмена/закрытие**: стоп → нет новых назначений, cancel обоим процессам,
+  генерация рвётся между чанками, Finalizing/Publishing дорабатывают
+  (G5.1), незапущенные — Skipped «отменено до запуска», затем shutdown и
+  выход процессов. Повторный пакет штатный.
+- **VRAM**: выбор режима в GUI (`BatchCudaMode`, дефолт Economy — гибрид НЕ
+  включается молча). Префлайт 2×2: 4×2355+1500 МБ; при нехватке — откат на
+  1×2 с явным объяснением в журнале; <4 кандидатов — тоже экономичный.
+- **Sink**: `STDIN_STALL_TIMEOUT` 1 с → 5 с — 4 одновременных ffmpeg под
+  CUDA-нагрузкой давали ложные «ffmpeg не читает stdin» на Opus-старте
+  (реальные Opus-сбои воспроизводились 2–4 файла из 12; после повышения —
+  12/12). Обнаружение зависшего энкодера сохраняется (тесты sink зелёные).
+- **Проверки**: real CUDA — 12/12 WAV побитово = 1×2 (и 6/6 на ctrl6),
+  MP3/Opus 12+12, overwrite, cancel+повтор (11 доделано), taskkill PID
+  ребёнка (10 готово / 2 Failed, без зависаний и сирот), VRAM возвращается к
+  базе; headless EXE `--portable-selftest-hybrid` (fake-движок, 2 процесса ×
+  2 воркера, 6/6, сирот 0); smoke `tools/g62_hybrid_smoke.ps1` ALL PASS;
+  unit/E2E — реальные дочерние процессы через Named Pipe без GPU.
+  `cargo test --release` — **229 passed / 0 failed / 30 ignored**; clippy 0;
+  fmt OK; release OK.
+- **Бенчмарк реального GUI (main12, прогрев + 3 повтора)**: 1×2 t4 warm
+  **43.64 с** (10.41 реч-с/с), 2×2 t4 warm **38.79 с** (11.70; **−11.1%**,
+  cold −7.1%), 2×2 t2 warm 39.32 с (+1.4% к t4 — в пределах дрейфа сессии,
+  в P2B.3 было −2.7%); VRAM 4.9 / 9.3 ГБ. Оверхед GUI/IPC ≈ 0: совпадение с
+  диагностическим H22 P2B.3 (38.88) в пределах 0.2%.
+- **Portable**: полный комплект НЕ собран — **C: заполнен (0 байт свободно)**;
+  частичный каталог `dist\ShtormTTS-Portable-2026-11-10-g62` (1.2 ГБ)
+  оставлен для инспекции по политике скрипта, `g52-final` не тронут.
+  Переносимость проверена обходным путём (exe вне репозитория, CWD `C:\`):
+  PORTABLE CHECK OK (ORT явным путём), одиночный CUDA RTF 0.531,
+  `--portable-selftest-hybrid` 6/6, сирот 0. Самодостаточный комплект с
+  моделями/DLL рядом с exe и чистая VM — НЕ проверены (блокер: диск).
+
+## G6.1.1 — что сделано (предыдущий этап)
 
 - **Дефект №1 (потеря preflight FileDone)**: `BatchStarted{total, workers:0}`
   отправляется в `execute_batch` сразу после `plan_batch` — ДО preflight
@@ -309,10 +361,14 @@ WAV/MP3/Opus без накопления аудио в памяти, одино�
 
 ## Результаты последних проверок (2026-11-10, Windows, release)
 
-- `cargo test` — **207 passed / 0 failed / 23 ignored** (было 194/23 до
-  G6.1.1; +13: Test A–F пакетного состояния, порядок событий execute_batch,
-  CLI-диспетчеризация); `cargo clippy --all-targets --release` —
-  0 предупреждений; fmt OK; release OK. Real G6.1.1 (CUDA):
+- `cargo test` — **229 passed / 0 failed / 30 ignored** (было 209/23 после
+  G6.1.2; +20 G6.2: IPC, state machine, worker-loop, E2E реальных процессов
+  на fake-движке, CLI внутреннего режима; +7 ignored — real-тесты гибрида и
+  бенчмарк); `cargo clippy --all-targets --release` —
+  0 предупреждений; fmt OK; release OK. Real G6.2 (CUDA): паритет 2×2
+  12/12 и ctrl6 6/6 побитово; cancel/повтор, overwrite, MP3/Opus,
+  taskkill ребёнка — зелёные; регрессии 1×2 pool / CPU batch / single CUDA /
+  overwrite_wav — зелёные; smoke EXE ALL PASS; VRAM после серии 684 МБ. Real G6.1.1 (CUDA):
   real_batch_cuda_pool_partial_skip_events — зелёный (ранние Skipped до
   загрузки пула, счётчики == отчёту); регрессии real_batch_cuda_pool /
   _cancel / _overwrite, real_matrix_device(cuda), real_overwrite_wav(cuda),
@@ -351,6 +407,12 @@ WAV/MP3/Opus без накопления аудио в памяти, одино�
   файлами-кандидатами; CPU-пакеты и пакеты из 1 файла — прежний
   пофайловый путь; полный список ограничений — `docs/G6_PERSISTENT_POOL.md` §12
   (в т.ч. визуальная проверка живого окна на идущем пакете не выполнялась).
+- Гибрид 2×2 (G6.2): только пакетный CUDA, только осознанный выбор, ≥4
+  файлов-кандидатов и префлайт свободной VRAM (иначе экономичный 1×2 с
+  записью в журнал); автоповтора файлов после гибели процесса НЕТ (Failed с
+  диагнозом); watchdog 300 с; `SHTORM_G62_FAKE=1` — тестовый fake-движок без
+  ONNX; portable-комплект g62 не собран (C: заполнен); полный список —
+  `docs/G6_2_HYBRID_POOL.md` §13.
 - Денойз DPDFNet не прогонялся с реальной моделью; decode_steps>1 не мерили.
 - WAV > ~4 ГиБ — явная ошибка (RF64/разбиение — будущая функция).
 - RTF GUI включает загрузку моделей (короткие тексты: RTF>1 — норма).
@@ -384,6 +446,16 @@ cargo test -p shtorm-gui --release --lib real_ffmpeg_error_existing_result -- --
 cargo test -p shtorm-gui --release --lib real_batch_overwrite_mixed -- --ignored --nocapture
 cargo test -p shtorm-gui --release --lib real_batch_cpu -- --ignored --nocapture
 cargo test -p shtorm-gui --release --lib real_eos_parity -- --ignored --nocapture
+# unit/E2E G6.2 (без GPU: реальные дочерние процессы + fake-движок)
+cargo test -p shtorm-gui --lib hybrid::
+cargo test -p shtorm-gui --lib ipc::
+# smoke реального EXE (fake-гибрид + CLI внутреннего режима)
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/g62_hybrid_smoke.ps1
+# real-тесты гибрида G6.2 (по одному на процесс)
+SHTORM_GUI_TEST_DEVICE=cuda cargo test -p shtorm-gui --release --lib \
+  job::tests::real_batch_cuda_hybrid -- --exact --ignored --nocapture --test-threads=1
+# ... real_batch_cuda_hybrid_cancel / _overwrite / _mp3_opus / _child_killed
+#   и бенчмарк real_batch_cuda_hybrid_bench (~15 мин)
 # real-тесты пула G6.1 (по одному на процесс; набор P2B.3 main12 в out/cuda_p2b3):
 SHTORM_GUI_TEST_DEVICE=cuda cargo test -p shtorm-gui --release --lib \
   job::tests::real_batch_cuda_pool -- --exact job::tests::real_batch_cuda_pool --ignored --nocapture --test-threads=1
@@ -398,7 +470,7 @@ bash out/p2a1/bench_clean.sh auto 1 <tag>
 
 ## NEXT TASK (НЕ НАЧИНАТЬ без явного задания)
 
-G6.1.1 завершён (отчёт `docs/G6_1_1_FIXES.md`). Осталось два основных
+G6.2 завершён (отчёт `docs/G6_2_HYBRID_POOL.md`). Осталось два основных
 независимых направления (только по явному заданию):
 
 1. **Гибридный режим 2×2 в пакетном движке/GUI (G6.2)** — по P2B.3: +12% к

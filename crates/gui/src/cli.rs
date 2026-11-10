@@ -22,7 +22,7 @@
 //! правил экранирования не требуется; `std::env::args` отдаёт Unicode как есть.
 
 /// Диагностическая команда или обычный GUI (решение по аргументам).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliCommand {
     /// Без аргументов — интерактивное окно.
     Gui,
@@ -32,6 +32,13 @@ pub enum CliCommand {
     PortableSelftest,
     PortableSelftestBatch,
     PortableSelftestCancel,
+    /// G6.2: headless-проверка гибридного пула 2×2 на fake-движке (тишина):
+    /// шесть файлов через два дочерних worker-процесса, без ONNX/CUDA.
+    PortableSelftestHybrid,
+    /// G6.2: ВНУТРЕННИЙ режим worker-процесса гибридного пула (запускает
+    /// только диспетчер GUI): имя Named Pipe, к которому подключиться.
+    /// Окно не открывается никогда; опечатка во флаге — ошибка с кодом 2.
+    InternalBatchWorker(String),
 }
 
 impl CliCommand {
@@ -43,6 +50,8 @@ impl CliCommand {
             CliCommand::PortableSelftest => Some("--portable-selftest"),
             CliCommand::PortableSelftestBatch => Some("--portable-selftest-batch"),
             CliCommand::PortableSelftestCancel => Some("--portable-selftest-cancel"),
+            CliCommand::PortableSelftestHybrid => Some("--portable-selftest-hybrid"),
+            CliCommand::InternalBatchWorker(_) => Some("--internal-batch-worker"),
         }
     }
 }
@@ -55,6 +64,9 @@ pub fn usage_text() -> String {
      \x20 --portable-selftest         headless-синтез одного файла\n\
      \x20 --portable-selftest-batch   headless-пакет из двух файлов\n\
      \x20 --portable-selftest-cancel  headless-проверка отмены и повторного запуска\n\
+     \x20 --portable-selftest-hybrid headless-проверка гибрида 2×2 (fake-движок)\n\
+     \x20 --internal-batch-worker <канал>  ВНУТРЕННИЙ режим дочернего процесса\n\
+     \x20                            гибридного пула (запускается приложением)\n\
      \x20 --help | -h                 эта справка (окно не открывается)\n\
      Опции диагностических режимов (только вместе с командой выше,\n\
      каждая опция — ровно один раз):\n\
@@ -84,6 +96,33 @@ pub fn parse_cli_args(args: &[String]) -> Result<CliCommand, String> {
             "--portable-selftest" => Some(CliCommand::PortableSelftest),
             "--portable-selftest-batch" => Some(CliCommand::PortableSelftestBatch),
             "--portable-selftest-cancel" => Some(CliCommand::PortableSelftestCancel),
+            "--portable-selftest-hybrid" => Some(CliCommand::PortableSelftestHybrid),
+            "--internal-batch-worker" => {
+                // G6.2: значение обязательно; режим внутренний — окно не
+                // открывается ни при каких условиях (опечатка флага выше —
+                // «неизвестный аргумент», код 2).
+                if command.is_some() {
+                    let a = command.as_ref().and_then(|c| c.flag_name()).unwrap_or("?");
+                    return Err(format!(
+                        "диагностические команды несовместимы: {a} и --internal-batch-worker \
+                         — укажите ровно одну"
+                    ));
+                }
+                let value = args.get(i + 1).ok_or_else(|| {
+                    "отсутствует значение параметра --internal-batch-worker \
+                     (имя канала IPC: после него ничего нет)"
+                        .to_string()
+                })?;
+                if value.starts_with('-') || value.trim().is_empty() {
+                    return Err(format!(
+                        "отсутствует значение параметра --internal-batch-worker: \
+                         «{value}» — это не имя канала"
+                    ));
+                }
+                command = Some(CliCommand::InternalBatchWorker(value.clone()));
+                i += 2;
+                continue;
+            }
             "--device" | "--format" | "--hold-ms" => {
                 // значение обязательно; значение-опция — ошибка (не принимать
                 // ошибочное значение за самостоятельную опцию)
@@ -113,7 +152,7 @@ pub fn parse_cli_args(args: &[String]) -> Result<CliCommand, String> {
             }
         };
         if let Some(cmd) = cmd {
-            if let Some(prev) = command {
+            if let Some(prev) = command.as_ref() {
                 let (a, b) = (
                     prev.flag_name().unwrap_or("?"),
                     cmd.flag_name().unwrap_or("?"),
@@ -128,12 +167,13 @@ pub fn parse_cli_args(args: &[String]) -> Result<CliCommand, String> {
     }
     if saw_option
         && !matches!(
-            command,
+            command.as_ref(),
             Some(
                 CliCommand::PortableCheck
                     | CliCommand::PortableSelftest
                     | CliCommand::PortableSelftestBatch
                     | CliCommand::PortableSelftestCancel
+                    | CliCommand::PortableSelftestHybrid
             )
         )
     {
@@ -222,6 +262,10 @@ mod tests {
         assert_eq!(
             parse_cli_args(&args(&["--portable-selftest-cancel"])),
             Ok(CliCommand::PortableSelftestCancel)
+        );
+        assert_eq!(
+            parse_cli_args(&args(&["--portable-selftest-hybrid"])),
+            Ok(CliCommand::PortableSelftestHybrid)
         );
         // инцидент G6.1: перепутанное имя НЕ открывает GUI
         assert!(parse_cli_args(&args(&["--portable-batch-selftest"])).is_err());
@@ -364,6 +408,41 @@ mod tests {
         ] {
             assert!(parse_cli_args(&args(&dup)).is_err(), "{dup:?}");
         }
+    }
+
+    /// G6.2: внутренний worker-режим — валидная команда со значением;
+    /// опечатка флага/отсутствие значения/смешение с другими командами и
+    /// опциями — ошибка (окно не открывается).
+    #[test]
+    fn internal_worker_command() {
+        assert_eq!(
+            parse_cli_args(&args(&[
+                "--internal-batch-worker",
+                r"\\.\pipe\shtorm_tts_x"
+            ])),
+            Ok(CliCommand::InternalBatchWorker(
+                r"\\.\pipe\shtorm_tts_x".to_string()
+            ))
+        );
+        // опечатка имени — «неизвестный аргумент», НЕ GUI
+        assert!(parse_cli_args(&args(&["--internal-batch-worker-typo"])).is_err());
+        assert!(parse_cli_args(&args(&["--internal-batch-worker"])).is_err());
+        assert!(parse_cli_args(&args(&["--internal-batch-worker", "--device"])).is_err());
+        assert!(parse_cli_args(&args(&["--internal-batch-worker", "--portable-check"])).is_err());
+        assert!(parse_cli_args(&args(&[
+            "--portable-check",
+            "--internal-batch-worker",
+            r"\\.\pipe\x"
+        ]))
+        .is_err());
+        // опции диагностических режимов с внутренним режимом несовместимы
+        assert!(parse_cli_args(&args(&[
+            "--internal-batch-worker",
+            r"\\.\pipe\x",
+            "--device",
+            "cuda"
+        ]))
+        .is_err());
     }
 
     /// Сообщения об ошибках понятны и ведут к --help: упоминают сам аргумент.

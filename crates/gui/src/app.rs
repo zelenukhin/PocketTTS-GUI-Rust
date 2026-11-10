@@ -1037,6 +1037,36 @@ impl eframe::App for ShtormApp {
                         ui.add(egui::DragValue::new(&mut s.threads).range(1..=16));
                         ui.weak("(паритет с CLI --threads, по умолчанию 4)");
                     });
+                    // G6.2: режим пакетного CUDA. Гибрид 2×2 включается ТОЛЬКО
+                    // осознанным выбором (дефолт — экономичный 1×2); выбор
+                    // сохраняется в настройках.
+                    if s.batch && s.device == DeviceChoice::Cuda {
+                        ui.horizontal(|ui| {
+                            ui.label("Пакетный CUDA:");
+                            egui::ComboBox::from_id_salt("batch_cuda_mode")
+                                .selected_text(s.batch_cuda_mode.label())
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut s.batch_cuda_mode,
+                                        crate::settings::BatchCudaMode::Economy,
+                                        crate::settings::BatchCudaMode::Economy.label(),
+                                    );
+                                    ui.selectable_value(
+                                        &mut s.batch_cuda_mode,
+                                        crate::settings::BatchCudaMode::MaxSpeed,
+                                        crate::settings::BatchCudaMode::MaxSpeed.label(),
+                                    );
+                                });
+                        });
+                        ui.weak(match s.batch_cuda_mode {
+                            crate::settings::BatchCudaMode::Economy => {
+                                "1 процесс × 2 постоянных воркера, ~4.9 ГБ VRAM — проверенный режим"
+                            }
+                            crate::settings::BatchCudaMode::MaxSpeed => {
+                                "2 процесса × 2 постоянных воркера, ~9.2 ГБ VRAM: быстрее, но нужен                                  запас свободной VRAM (префлайт; иначе — экономичный режим)"
+                            }
+                        });
+                    }
                 });
             header_clicked(&resp, &mut s.pauses_open);
             ui.add_space(4.0);

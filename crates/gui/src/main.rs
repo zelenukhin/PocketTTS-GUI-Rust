@@ -53,6 +53,18 @@ fn main() -> eframe::Result<()> {
         CliCommand::PortableSelftest => std::process::exit(portable_selftest(&args, false)),
         CliCommand::PortableSelftestBatch => std::process::exit(portable_selftest(&args, true)),
         CliCommand::PortableSelftestCancel => std::process::exit(portable_selftest_cancel(&args)),
+        CliCommand::PortableSelftestHybrid => std::process::exit(portable_selftest_hybrid(&args)),
+        // G6.2: внутренний worker-процесс гибридного пула. Окно НЕ
+        // открывается: выход до eframe::run_native, конфигурация — по IPC.
+        #[cfg(windows)]
+        CliCommand::InternalBatchWorker(pipe) => {
+            std::process::exit(shtorm_gui::hybrid::worker_main(&pipe))
+        }
+        #[cfg(not(windows))]
+        CliCommand::InternalBatchWorker(_) => {
+            eprintln!("ВНУТРЕННИЙ WORKER: поддерживается только на Windows");
+            std::process::exit(2);
+        }
     }
 
     let options = eframe::NativeOptions {
@@ -251,6 +263,91 @@ fn portable_selftest(args: &[String], batch: bool) -> i32 {
     if result.status == JobStatus::Completed {
         0
     } else {
+        1
+    }
+}
+
+/// G6.2: headless-проверка гибридного пула 2×2 на fake-движке. Создаёт шесть
+/// файлов, принудительно включает режим «Максимальная скорость» и
+/// движок-заглушку (`SHTORM_G62_FAKE=1`): настоящие два дочерних процесса и
+/// Named Pipe IPC, НО без загрузки ONNX/CUDA (на любой машине). Проверяет:
+/// все 6 WAV готовы, процессов CUDA 2, воркеров 4, дочерние процессы
+/// завершились (execute_batch не возвращается раньше).
+fn portable_selftest_hybrid(args: &[String]) -> i32 {
+    let mut s = match load_portable_settings() {
+        Ok(s) => s,
+        Err(e) => {
+            println!("SETTINGS ERROR: {e}");
+            return 2;
+        }
+    };
+    apply_overrides(&mut s, args);
+    // Путь гибрида включается для пакетного CUDA; fake-движок GPU не трогает.
+    s.device = DeviceChoice::Cuda;
+    s.device_id = 0;
+    s.batch_cuda_mode = shtorm_gui::settings::BatchCudaMode::MaxSpeed;
+    s.clamped();
+    let text = std::fs::read_to_string(resources::resolve_user_path(&s.text_file))
+        .unwrap_or_else(|_| FALLBACK_TEXT.to_string());
+    let stamp = format!("{}-{}", std::process::id(), nanos());
+    let out_root = resources::resolve_user_path(&s.out_dir);
+    if let Err(e) = std::fs::create_dir_all(&out_root) {
+        println!("OUTPUT DIR ERROR: {}: {e}", out_root.display());
+        return 2;
+    }
+    let src = std::env::temp_dir().join(format!("shtorm_portable_hybrid_{stamp}"));
+    if let Err(e) = std::fs::create_dir_all(src.join("sub")) {
+        println!("HYBRID SOURCE ERROR: {}: {e}", src.display());
+        return 2;
+    }
+    for i in 0..6 {
+        let p = if i == 5 {
+            src.join("sub").join(format!("h{i}.txt"))
+        } else {
+            src.join(format!("h{i}.txt"))
+        };
+        if let Err(e) = std::fs::write(&p, &text) {
+            println!("HYBRID SOURCE WRITE ERROR: {}: {e}", p.display());
+            return 2;
+        }
+    }
+    s.out_dir = out_root
+        .join(format!("hybrid-selftest-{stamp}"))
+        .display()
+        .to_string();
+    println!("HYBRID SOURCE: {}", src.display());
+    println!("HYBRID OUT: {}", s.out_dir);
+    // fake-движок: тишина через настоящий sink, без ONNX/CUDA
+    std::env::set_var("SHTORM_G62_FAKE", "1");
+    let cancel = Arc::new(AtomicBool::new(false));
+    let emit: Arc<dyn Fn(JobEvent) + Send + Sync> = Arc::new(|ev| {
+        if let JobEvent::Log(line) = ev {
+            println!("LOG: {line}");
+        }
+    });
+    let result = execute_batch(&s, &src, &cancel, &emit);
+    println!("STATUS: {}", result.status.label());
+    println!("SUMMARY: {}", result.summary);
+    let (mut ok, mut procs, mut workers, mut completed, mut total) = (false, 0usize, 0usize, 0, 0);
+    if let Some(r) = &result.batch {
+        println!("BATCH: {}", r.summary());
+        for line in r.detail_lines() {
+            println!("FILE: {line}");
+        }
+        procs = r.pool_processes.unwrap_or(0);
+        workers = r.pool_workers.unwrap_or(0);
+        completed = r.completed();
+        total = r.total();
+        ok = result.status == JobStatus::Completed && completed == 6 && procs == 2 && workers == 4;
+    }
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    hold_ms(args);
+    println!("HYBRID COUNTERS: процессов {procs}, воркеров {workers}, готово {completed}/{total}");
+    if ok {
+        println!("HYBRID SELFTEST OK");
+        0
+    } else {
+        println!("HYBRID SELFTEST FAILED");
         1
     }
 }

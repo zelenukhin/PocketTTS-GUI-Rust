@@ -259,6 +259,8 @@ fn wait_with_timeout(
 
 /// Сколько байт ХВОСТА stderr держим для диагностики (читаем всегда до EOF —
 /// ограничение касается только памяти, не дренирования pipe).
+const STDIN_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 const STDERR_TAIL: usize = 8192;
 
 impl FfmpegSink {
@@ -461,19 +463,20 @@ impl FfmpegSink {
             self.buf
                 .extend_from_slice(&((v * 32767.0) as i16).to_le_bytes());
         }
-        // отправка писателю с таймаутом: полный канал дольше секунды =
-        // ffmpeg перестал читать stdin (завис) — диагностируемая ошибка,
-        // а не вечная блокировка потока задания
+        // отправка писателю с таймаутом: полный канал дольше STDIN_STALL_TIMEOUT
+        // = ffmpeg перестал читать stdin (завис) — диагностируемая ошибка,
+        // а не вечная блокировка потока задания. G6.2: 1 с было мало при
+        // ЧЕТЫРЁХ одновременных ffmpeg под полной CUDA-нагрузкой (Opus-энкодер
+        // не успевал стартовать за 1 с — ложные сбои sink); 5 с сохраняют
+        // обнаружение реально зависшего энкодера.
         let tx = self.writer_tx.as_ref().expect("писатель жив до finalize");
-        match tx.send_timeout(
-            std::mem::take(&mut self.buf),
-            std::time::Duration::from_secs(1),
-        ) {
+        match tx.send_timeout(std::mem::take(&mut self.buf), STDIN_STALL_TIMEOUT) {
             Ok(()) => Ok(()),
             Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => {
                 let err = self.collect_stderr();
                 bail!(
-                    "ffmpeg не читает stdin дольше 1 с (подано {} байт): {}",
+                    "ffmpeg не читает stdin дольше {} с (подано {} байт): {}",
+                    STDIN_STALL_TIMEOUT.as_secs(),
                     self.bytes_fed.load(std::sync::atomic::Ordering::Relaxed),
                     err.trim()
                 )
@@ -566,7 +569,7 @@ impl AudioSink for FfmpegSink {
             while left > 0 {
                 let k = left.min(zero.len());
                 let tx = self.writer_tx.as_ref().expect("писатель жив");
-                match tx.send_timeout(zero[..k].to_vec(), std::time::Duration::from_secs(1)) {
+                match tx.send_timeout(zero[..k].to_vec(), STDIN_STALL_TIMEOUT) {
                     Ok(()) => {}
                     Err(_) => {
                         let err = self.collect_stderr();

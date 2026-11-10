@@ -50,7 +50,7 @@ pub struct BatchPlan {
     pub conflicts: Vec<OutputConflict>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FileStatus {
     Completed,
     Failed,
@@ -70,7 +70,9 @@ impl FileStatus {
 }
 
 /// Итог по одному файлу: статус, причина и все пути для диагностики.
-#[derive(Debug, Clone)]
+/// G6.2: сериализуется для пересылки по IPC дочерним процессом синтеза
+/// (serde-поля — те же, что в JSON настроек: пути/строки/числа).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FileReport {
     pub input: PathBuf,
     pub relative: PathBuf,
@@ -170,6 +172,9 @@ pub struct BatchReport {
     /// G6.1: число постоянных воркеров пула (файлов обрабатывается
     /// одновременно столько же).
     pub pool_workers: Option<usize>,
+    /// G6.2: гибридный режим — число ДОЧЕРНИХ ПРОЦЕССОВ CUDA-инференса
+    /// (None — однопроцессные пути G6.1/G3).
+    pub pool_processes: Option<usize>,
 }
 
 impl BatchReport {
@@ -180,6 +185,7 @@ impl BatchReport {
             cancelled: false,
             pool_loads: None,
             pool_workers: None,
+            pool_processes: None,
         }
     }
 
@@ -245,6 +251,9 @@ impl BatchReport {
             s.push_str(&format!(
                 " | пул: {w} воркер(ов), Pocket загружен {l} раз(а)"
             ));
+        }
+        if let Some(p) = self.pool_processes {
+            s.push_str(&format!(" | процессов CUDA: {p}"));
         }
         match self.status() {
             BatchStatus::Cancelled => s.push_str(" | ОТМЕНЕНО"),
@@ -841,6 +850,7 @@ fn assemble_report(prepared: PreparedBatch, cancelled: bool) -> BatchReport {
         cancelled,
         pool_loads: None,
         pool_workers: None,
+        pool_processes: None,
     }
 }
 

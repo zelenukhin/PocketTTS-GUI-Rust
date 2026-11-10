@@ -161,6 +161,8 @@ pub struct GuiSettings {
     /// None = автомат по устройству (CPU 2 / CUDA 1), ручной выбор не
     /// перезаписывается при смене устройства.
     pub workers: Option<u32>,
+    /// G6.2: режим пакетного CUDA (экономичный 1×2 / гибрид 2×2).
+    pub batch_cuda_mode: BatchCudaMode,
     // Вывод
     pub format: OutputFormatChoice,
     pub mp3_preset: String,
@@ -205,6 +207,28 @@ pub enum OutputFormatChoice {
     Wav,
     Mp3,
     Opus,
+}
+
+/// G6.2: режим пакетного синтеза CUDA. Экономичный — проверенный G6.1 пул
+/// 1 процесс × 2 воркера (~4.9 ГБ VRAM); «Максимум скорости» — гибрид
+/// 2 процесса × 2 постоянных воркера (~9.2 ГБ, по CUDA-P2B.3 быстрее всех).
+/// Выбор осознанный: по умолчанию экономичный, гибрид молча не включается.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum BatchCudaMode {
+    /// 1 процесс × 2 воркера (постоянный пул G6.1).
+    #[default]
+    Economy,
+    /// 2 процесса × 2 воркера (гибрид H22 из P2B.3; нужен префлайт VRAM).
+    MaxSpeed,
+}
+
+impl BatchCudaMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Economy => "Экономичный (1×2)",
+            Self::MaxSpeed => "Максимальная скорость (2×2)",
+        }
+    }
 }
 
 impl OutputFormatChoice {
@@ -272,6 +296,7 @@ impl Default for GuiSettings {
             paragraph_pause_s: 0.9,
             max_tokens: 50,
             workers: None,
+            batch_cuda_mode: BatchCudaMode::Economy,
             format: OutputFormatChoice::Wav,
             mp3_preset: "-V2 (Высокое)".into(),
             opus_preset: "opus 64k".into(),
@@ -688,6 +713,35 @@ mod tests {
         assert!(
             !load_settings(&p).unwrap().overwrite_existing,
             "старый конфиг без ключа — защита включена"
+        );
+    }
+
+    /// G6.2: режим пакетного CUDA по умолчанию экономичный (гибрид — только
+    /// осознанный выбор), переживает round-trip, старый конфиг без ключа
+    /// читается как Economy.
+    #[test]
+    fn batch_cuda_mode_default_economy_and_round_trip() {
+        assert_eq!(
+            GuiSettings::default().batch_cuda_mode,
+            BatchCudaMode::Economy,
+            "гибрид 2×2 НЕ включается молча"
+        );
+        let d = tmpdir("hybrid_mode");
+        let p = d.join("s.json");
+        let s = GuiSettings {
+            batch_cuda_mode: BatchCudaMode::MaxSpeed,
+            ..Default::default()
+        };
+        save_settings(&s, &p).unwrap();
+        assert_eq!(
+            load_settings(&p).unwrap().batch_cuda_mode,
+            BatchCudaMode::MaxSpeed
+        );
+        std::fs::write(&p, r#"{"temperature": 0.4}"#).unwrap();
+        assert_eq!(
+            load_settings(&p).unwrap().batch_cuda_mode,
+            BatchCudaMode::Economy,
+            "старый конфиг без ключа — экономичный режим"
         );
     }
 

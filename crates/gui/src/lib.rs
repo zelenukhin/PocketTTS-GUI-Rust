@@ -4,6 +4,9 @@
 pub mod app;
 pub mod batch;
 pub mod cli;
+#[cfg(windows)]
+pub mod hybrid;
+pub mod ipc;
 pub mod job;
 pub mod resources;
 pub mod settings;

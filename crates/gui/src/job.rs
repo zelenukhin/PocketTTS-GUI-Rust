@@ -11,11 +11,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::hybrid::{self, ChildJobGuard, Ev, HybridDriver, HybridJob, HybridParams, PhaseMsg};
 use app_core::persistent::{loaned_real_worker_factory, spawn_workers, WorkerSlot};
 use app_core::pipeline::{
     log_path_for, synthesize_stream, synthesize_stream_with_worker_factory, write_chunk_log,
     write_diag_log, ChunkLogMeta, DiagMeta, PipelineOptions, RunPhase, RunStatus, StreamError,
 };
+use app_core::pool::SeedPolicy;
 use app_core::sink::{make_sink_with_overwrite, OutputFormat};
 use app_core::worker::{real_worker_factory, RealWorker};
 use shtorm_engine::Device;
@@ -27,7 +29,7 @@ use crate::batch::{
     PreparedFile,
 };
 use crate::resources;
-use crate::settings::{DeviceChoice, GuiSettings, ModelChoice, OutputFormatChoice};
+use crate::settings::{BatchCudaMode, DeviceChoice, GuiSettings, ModelChoice, OutputFormatChoice};
 
 // G4: единый резолвер ресурсов; реэкспорт сохраняет существующий API/тесты.
 pub use crate::resources::{find_project_root, resolve_ort_dylib, resolve_ort_dylib_in};
@@ -674,6 +676,7 @@ pub fn execute_batch(
             cancelled,
             pool_loads: None,
             pool_workers: None,
+            pool_processes: None,
         };
         return JobResult {
             status: if cancelled {
@@ -708,10 +711,44 @@ pub fn execute_batch(
 
     let ext = settings.format.extension_str().to_string();
     let overwrite = settings.overwrite_existing;
-    let pool = settings.device == DeviceChoice::Cuda
-        && std::env::var("SHTORM_GUI_BATCH_POOL").as_deref() != Ok("0")
-        && count_actionable(&plan, &ext, overwrite) >= 2;
-    let report = if pool {
+    let pool_enabled = settings.device == DeviceChoice::Cuda
+        && std::env::var("SHTORM_GUI_BATCH_POOL").as_deref() != Ok("0");
+    let actionable = if pool_enabled {
+        count_actionable(&plan, &ext, overwrite)
+    } else {
+        0
+    };
+    let pool = pool_enabled && actionable >= 2;
+    // G6.2: «Максимальная скорость» — гибрид 2 процесса × 2 воркера. Только
+    // осознанный выбор пользователя (не дефолт), только при ≥4 кандидатах и
+    // после VRAM-префлайта; иначе — проверенный экономичный режим 1×2 с
+    // ЯВНОЙ записью в журнал (молчаливого игнорирования выбора нет).
+    let hybrid = pool_enabled && settings.batch_cuda_mode == BatchCudaMode::MaxSpeed;
+    let report = if hybrid && actionable < HYBRID_TOTAL_WORKERS {
+        emit(JobEvent::Log(format!(
+            "режим «Максимальная скорость»: файлов к синтезу {actionable} < {HYBRID_TOTAL_WORKERS} —              используется экономичный режим (постоянный пул 1×2)"
+        )));
+        match execute_batch_persistent_pool(settings, &plan, &ext, overwrite, cancel, emit) {
+            Ok(r) => r,
+            Err(e) => return JobResult::failed(format!("пакетный режим: {e:#}")),
+        }
+    } else if hybrid {
+        match decide_hybrid_or_fallback(settings, actionable, emit) {
+            HybridChoice::Hybrid => {
+                match execute_batch_hybrid(settings, &plan, &ext, overwrite, cancel, emit) {
+                    Ok(r) => r,
+                    Err(e) => return JobResult::failed(format!("пакетный режим (2×2): {e:#}")),
+                }
+            }
+            HybridChoice::EconomyFallback => {
+                match execute_batch_persistent_pool(settings, &plan, &ext, overwrite, cancel, emit)
+                {
+                    Ok(r) => r,
+                    Err(e) => return JobResult::failed(format!("пакетный режим: {e:#}")),
+                }
+            }
+        }
+    } else if pool {
         match execute_batch_persistent_pool(settings, &plan, &ext, overwrite, cancel, emit) {
             Ok(r) => r,
             Err(e) => return JobResult::failed(format!("пакетный режим: {e:#}")),
@@ -920,6 +957,386 @@ fn decide_batch_pool_workers(
     w
 }
 
+/// G6.2: топология «максимальной скорости» — 2 процесса × 2 воркера
+/// (H22 из CUDA-P2B.3: 38.88 с warm против 43.57 с у 1×2 на main12).
+const HYBRID_CHILDREN: usize = 2;
+const HYBRID_WORKERS_PER_CHILD: usize = 2;
+const HYBRID_TOTAL_WORKERS: usize = HYBRID_CHILDREN * HYBRID_WORKERS_PER_CHILD;
+/// Ориентировочная VRAM одного CUDA-воркера (Pocket + арены ORT), МБ — те же
+/// замеры P2B.3 (≈2.1 ГБ на Pocket + база).
+const HYBRID_VRAM_PER_WORKER_MB: f64 = 2355.0;
+/// Консервативный запас поверх четырёх Pocket. P2B.3: пик 9.2–9.4 ГБ;
+/// B4 (4 контекста) словил CUDA OOM при ~11.5 ГБ свободных — 9.2 ГБ НЕ
+/// гарантированный максимум. 1.5 ГБ (против 0.9 ГБ у 1×2) покрывает фон,
+/// фрагментацию и промежуточные тензоры декодера.
+const HYBRID_VRAM_RESERVE_MB: f64 = 1500.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HybridChoice {
+    Hybrid,
+    EconomyFallback,
+}
+
+/// Префлайт режима 2×2: свободная VRAM с консервативным запасом. При явно
+/// недостаточной памяти четыре Pocket НЕ загружаются: режим откатывается на
+/// экономичный 1×2 с понятным объяснением (выбор пользователя не
+/// игнорируется молча). Fake-режим (тесты IPC без GPU) префлайт пропускает.
+fn decide_hybrid_or_fallback(
+    settings: &GuiSettings,
+    actionable: usize,
+    emit: &Arc<dyn Fn(JobEvent) + Send + Sync>,
+) -> HybridChoice {
+    if std::env::var("SHTORM_G62_FAKE").as_deref() == Ok("1") {
+        emit(JobEvent::Log(
+            "ВНИМАНИЕ: SHTORM_G62_FAKE=1 — движок-заглушка без ONNX (диагностика IPC); \
+             VRAM-префлайт пропущен"
+                .into(),
+        ));
+        return HybridChoice::Hybrid;
+    }
+    let need = HYBRID_TOTAL_WORKERS as f64 * HYBRID_VRAM_PER_WORKER_MB + HYBRID_VRAM_RESERVE_MB;
+    match app_core::diagnostics::gpu_free_mb(settings.device_id) {
+        Some(free) if free >= need => {
+            emit(JobEvent::Log(format!(
+                "VRAM-префлайт 2×2: свободно {free:.0} МБ ≥ {need:.0} МБ — запуск четырёх Pocket \
+                 (2 процесса × 2 воркера), файлов к синтезу {actionable}"
+            )));
+            HybridChoice::Hybrid
+        }
+        Some(free) => {
+            emit(JobEvent::Log(format!(
+                "ВНИМАНИЕ: режим «Максимальная скорость» (2×2) требует ~{need:.0} МБ свободной \
+                 VRAM (4 Pocket × {HYBRID_VRAM_PER_WORKER_MB:.0} МБ + запас \
+                 {HYBRID_VRAM_RESERVE_MB:.0} МБ), свободно {free:.0} МБ — четыре Pocket НЕ \
+                 загружаются, используется экономичный режим 1×2. Освободите VRAM и запустите \
+                 пакет снова для максимальной скорости"
+            )));
+            HybridChoice::EconomyFallback
+        }
+        None => {
+            emit(JobEvent::Log(
+                "ВНИМАНИЕ: режим «Максимальная скорость»: свободную VRAM проверить не удалось \
+                 (nvidia-smi недоступен) — используется экономичный режим 1×2"
+                    .into(),
+            ));
+            HybridChoice::EconomyFallback
+        }
+    }
+}
+
+/// G6.2: пакет на гибридном пуле 2 процесса × 2 постоянных воркера.
+/// Диспетчер (этот процесс) владеет preflight и общей очередью; ONNX грузится
+/// ТОЛЬКО в дочерних процессах (см. hybrid.rs). События воркеров
+/// транслируются в существующие JobEvent — UI-модель G6.1.1 не меняется.
+fn execute_batch_hybrid(
+    settings: &GuiSettings,
+    plan: &BatchPlan,
+    extension: &str,
+    overwrite: bool,
+    cancel: &Arc<AtomicBool>,
+    emit: &Arc<dyn Fn(JobEvent) + Send + Sync>,
+) -> Result<BatchReport> {
+    let total = plan.files.len();
+
+    // --- подготовка движка без ORT в этом процессе: только резолв модели ---
+    let model_dir = resolve_model_dir(settings)?;
+    emit(JobEvent::Log(format!("модель: {}", model_dir.display())));
+    if let CharRulesLoad::Warning(w) = load_char_rules(&model_dir) {
+        emit(JobEvent::Log(format!("ВНИМАНИЕ: {w}")));
+    }
+    let opts = pipeline_options(settings, model_dir.clone(), None);
+
+    // --- предзапусковые проверки ДО процессов (те же, что у пула) ---
+    let emit_batch = batch_event_forwarder(emit);
+    let prepared = preflight_batch(plan, extension, overwrite, cancel, &|ev| emit_batch(ev));
+    let mut reports = prepared.reports;
+    let mut to_synth = Vec::with_capacity(prepared.to_synth.len());
+    for pf in prepared.to_synth {
+        match batch_file_prepare_paths(settings, &pf.out, &model_dir) {
+            Ok(()) => to_synth.push(pf),
+            Err(e) => {
+                let file = &plan.files[pf.index];
+                let r = FileReport::failed(file, Some(pf.out.clone()), format!("{e:#}"));
+                emit_batch(BatchEvent::FileFinished {
+                    index: pf.index + 1,
+                    total,
+                    report: Box::new(r.clone()),
+                });
+                reports[pf.index] = r;
+            }
+        }
+    }
+    if to_synth.is_empty() {
+        return Ok(BatchReport {
+            files: reports,
+            conflicts: prepared.conflicts,
+            cancelled: cancel.load(Ordering::SeqCst),
+            pool_loads: None,
+            pool_workers: None,
+            pool_processes: None,
+        });
+    }
+
+    // --- задания: per-file seed по тому же правилу, что пути G6.1 ---
+    let jobs: Vec<HybridJob> = to_synth
+        .iter()
+        .map(|pf| HybridJob {
+            pos: pf.index,
+            input: pf.input.clone(),
+            relative: pf.relative.clone(),
+            out: pf.out.clone(),
+            seed: opts.seed.unwrap_or_else(|| SeedPolicy::Random.resolve()),
+        })
+        .collect();
+    let jobs_by_pos: std::collections::HashMap<usize, &HybridJob> =
+        jobs.iter().map(|j| (j.pos, j)).collect();
+
+    // --- ожидание событий UI: готовность всех воркеров сообщается ОДИН раз ---
+    let ready_seen = std::sync::atomic::AtomicUsize::new(0);
+    let announce = std::sync::atomic::AtomicBool::new(false);
+    let ui_event = {
+        let emit = Arc::clone(emit);
+        let ready_seen = &ready_seen;
+        let announce = &announce;
+        move |ev: &Ev| match ev {
+            Ev::Ready { .. } => {
+                let n = ready_seen.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == HYBRID_TOTAL_WORKERS && !announce.swap(true, Ordering::SeqCst) {
+                    emit(JobEvent::Log(format!(
+                        "гибрид 2×2: {HYBRID_CHILDREN} процесса × {HYBRID_WORKERS_PER_CHILD} \
+                         воркера готовы"
+                    )));
+                    emit(JobEvent::BatchWorkersReady {
+                        workers: HYBRID_TOTAL_WORKERS,
+                    });
+                }
+            }
+            Ev::FileStarted { pos, .. } => {
+                if let Some(j) = jobs_by_pos.get(pos) {
+                    emit(JobEvent::FileStarted {
+                        index: pos + 1,
+                        total,
+                        input: j.input.clone(),
+                        output: j.out.clone(),
+                    });
+                    emit(JobEvent::Log(format!(
+                        "[{}/{}] старт: {} → {}",
+                        pos + 1,
+                        total,
+                        j.input.display(),
+                        j.out.display()
+                    )));
+                }
+            }
+            Ev::FileProgress {
+                pos,
+                done,
+                total: chunks,
+                ..
+            } => {
+                emit(JobEvent::FileProgress {
+                    index: pos + 1,
+                    total,
+                    done: *done,
+                    chunks_total: *chunks,
+                });
+            }
+            Ev::FilePhase { pos, phase, .. } => {
+                let ph = match phase {
+                    PhaseMsg::Generating => JobPhase::Generating,
+                    PhaseMsg::Finalizing => JobPhase::Finalizing,
+                    PhaseMsg::Publishing => JobPhase::Publishing,
+                };
+                emit(JobEvent::FilePhase {
+                    index: pos + 1,
+                    phase: ph,
+                });
+            }
+            Ev::FileFinished { pos, report, .. } => {
+                emit(JobEvent::Log(format!(
+                    "[{}/{}] {}",
+                    pos + 1,
+                    total,
+                    report.line()
+                )));
+                emit(JobEvent::FileDone {
+                    index: pos + 1,
+                    total,
+                    report: Box::new(report.clone()),
+                });
+            }
+            _ => {}
+        }
+    };
+
+    // --- запуск дочерних процессов и диспетчеризация ---
+    let job_guard = ChildJobGuard::new();
+    #[cfg(not(test))]
+    let exe = std::env::current_exe()?;
+    #[cfg(not(test))]
+    let spawn = |ci: usize| hybrid::spawn_child_process(&job_guard, &exe, ci);
+    // В lib-тестах current_exe — тестовый харнесс: дочерние worker-процессы
+    // запускаются через его child-entry (та же реализация worker_main).
+    #[cfg(test)]
+    let spawn = |ci: usize| hybrid::spawn_child_via_test_harness(&job_guard, ci);
+    let log_emit = Arc::clone(emit);
+    let log = |m: String| log_emit(JobEvent::Log(m));
+    let fake = std::env::var("SHTORM_G62_FAKE").as_deref() == Ok("1");
+    let params = HybridParams {
+        settings: settings.clone(),
+        jobs: jobs.clone(),
+        workers_per_child: HYBRID_WORKERS_PER_CHILD,
+        children: HYBRID_CHILDREN,
+        fake,
+    };
+    let driver = HybridDriver {
+        params: &params,
+        cancel: Arc::clone(cancel),
+        spawn: &spawn,
+        log: &log,
+        event: &ui_event,
+        watchdog: hybrid::CHILD_WATCHDOG,
+    };
+    emit(JobEvent::Log(format!(
+        "гибрид 2×2: запуск {HYBRID_CHILDREN} процессов CUDA-инференса ({} Pocket на процесс; \
+         файлов к синтезу {})",
+        HYBRID_WORKERS_PER_CHILD,
+        jobs.len()
+    )));
+    let t_spawn = Instant::now();
+    let outcome = match hybrid::run_hybrid(&driver) {
+        Ok(o) => o,
+        Err(e) => {
+            // ни один дочерний процесс не поднялся — файлы-кандидаты Failed
+            let msg = format!("гибридный пул не запущен: {e:#}");
+            emit(JobEvent::Log(format!("ВНИМАНИЕ: {msg}")));
+            for pf in &to_synth {
+                let file = &plan.files[pf.index];
+                let r = FileReport::failed(file, Some(pf.out.clone()), msg.clone());
+                emit_batch(BatchEvent::FileFinished {
+                    index: pf.index + 1,
+                    total,
+                    report: Box::new(r.clone()),
+                });
+                reports[pf.index] = r;
+            }
+            return Ok(BatchReport {
+                files: reports,
+                conflicts: prepared.conflicts,
+                cancelled: false,
+                pool_loads: Some(0),
+                pool_workers: Some(0),
+                pool_processes: Some(0),
+            });
+        }
+    };
+    emit(JobEvent::Log(format!(
+        "гибрид 2×2: процессы/воркеры готовы за {:.1} с; Pocket загружен {} раз(а); \
+         процессов: {}",
+        t_spawn.elapsed().as_secs_f32(),
+        outcome.pocket_loads,
+        outcome.children_spawned
+    )));
+
+    // --- сборка отчёта по позициям плана (исходный порядок) ---
+    for (i, pf) in to_synth.iter().enumerate() {
+        let mut rep = match outcome.reports.get(i).and_then(|r| r.clone()) {
+            Some(r) => r,
+            None => FileReport::failed(
+                &plan.files[pf.index],
+                Some(pf.out.clone()),
+                "файл не получил результата (внутренняя ошибка диспетчера)",
+            ),
+        };
+        // заполнить поля у placeholder-отчётов (Failed диспетчера)
+        if rep.input.as_os_str().is_empty() {
+            rep.input = pf.input.clone();
+            rep.relative = pf.relative.clone();
+            rep.output = Some(pf.out.clone());
+        }
+        reports[pf.index] = rep;
+    }
+
+    let cancelled =
+        cancel.load(Ordering::SeqCst) || reports.iter().any(|r| r.status == FileStatus::Cancelled);
+    let mut report = BatchReport {
+        files: reports,
+        conflicts: prepared.conflicts,
+        cancelled,
+        pool_loads: Some(outcome.pocket_loads),
+        pool_workers: Some(outcome.workers_ready.max(HYBRID_WORKERS_PER_CHILD)),
+        pool_processes: Some(outcome.children_spawned),
+    };
+    if report.pool_workers == Some(0) {
+        report.pool_workers = None;
+    }
+    Ok(report)
+}
+
+/// Общий переводчик BatchEvent → JobEvent (последовательный путь, пул,
+/// гибрид): журнал K/N, per-file прогресс/фазы и FileDone.
+fn batch_event_forwarder(
+    emit: &Arc<dyn Fn(JobEvent) + Send + Sync>,
+) -> Arc<dyn Fn(BatchEvent) + Send + Sync> {
+    let emit = Arc::clone(emit);
+    Arc::new(move |ev: BatchEvent| match ev {
+        BatchEvent::Planned { total, warnings } => {
+            emit(JobEvent::Log(format!(
+                "пакет: план зафиксирован — {total} файлов, предупреждений: {}",
+                warnings.len()
+            )));
+        }
+        BatchEvent::FileStarted {
+            index,
+            total,
+            input,
+            output,
+        } => {
+            let msg = format!(
+                "[{index}/{total}] старт: {} → {}",
+                input.display(),
+                output.display()
+            );
+            emit(JobEvent::FileStarted {
+                index,
+                total,
+                input,
+                output,
+            });
+            emit(JobEvent::Log(msg));
+        }
+        BatchEvent::FileProgress {
+            index,
+            total,
+            done,
+            chunks_total,
+        } => {
+            emit(JobEvent::FileProgress {
+                index,
+                total,
+                done,
+                chunks_total,
+            });
+        }
+        BatchEvent::FileFinished {
+            index,
+            total,
+            report,
+        } => {
+            emit(JobEvent::Log(format!(
+                "[{index}/{total}] {}",
+                report.line()
+            )));
+            emit(JobEvent::FileDone {
+                index,
+                total,
+                report,
+            });
+        }
+        BatchEvent::Log(line) => emit(JobEvent::Log(line)),
+    })
+}
+
 /// G5.1-подготовка пути результата одного файла пакета (в последовательном
 /// пути её делает execute_job; в пуле — ДО запуска воркеров, чтобы конфликт
 /// путей не всплывал посреди параллельного прогона): проверка безопасности
@@ -1049,6 +1466,7 @@ fn execute_batch_persistent_pool(
             cancelled: cancel.load(Ordering::SeqCst),
             pool_loads: None,
             pool_workers: None,
+            pool_processes: None,
         });
     }
 
@@ -1097,6 +1515,7 @@ fn execute_batch_persistent_pool(
             cancelled: false,
             pool_loads: Some(spawned.loaded),
             pool_workers: Some(workers),
+            pool_processes: None,
         });
     }
     let load_ms: Vec<_> = spawned.load_ms.iter().map(|ms| format!("{ms}")).collect();
@@ -1267,7 +1686,7 @@ fn batch_file_of(pf: &PreparedFile) -> BatchFile {
 
 /// Преобразование JobResult одного файла в FileReport пакета — единая
 /// семантика статусов/причин последовательного пути и постоянного пула.
-fn file_report_from_job_result(
+pub(crate) fn file_report_from_job_result(
     input: &Path,
     relative: &Path,
     out_path: &Path,
@@ -1333,7 +1752,7 @@ fn attach_warning(mut r: JobResult, warning: &Option<String>) -> JobResult {
 /// `existed_before` — существовал ли готовый файл до запуска: отделяет
 /// «создан новый файл» от «обновлён существующий» и в отмене уточняет,
 /// что старый файл сохранён.
-fn finish_from_outcome(
+pub(crate) fn finish_from_outcome(
     cfg: &JobConfig,
     o: app_core::pipeline::StreamOutcome,
     elapsed: f32,
@@ -1442,7 +1861,7 @@ fn finish_from_outcome(
 /// черновик уже внутри) + диагностический журнал рядом с итогом.
 /// G5.1: сбой собственно публикации (кодирование прошло успешно) выделен
 /// отдельным статусом сообщения — старый готовый файл не изменён.
-fn finish_from_error(cfg: &JobConfig, e: &anyhow::Error, elapsed: f32) -> JobResult {
+pub(crate) fn finish_from_error(cfg: &JobConfig, e: &anyhow::Error, elapsed: f32) -> JobResult {
     let _ = elapsed;
     if let Some(se) = e.downcast_ref::<StreamError>() {
         let diag = write_diag_log(
@@ -3486,6 +3905,360 @@ mod tests {
         assert_eq!(ffmpeg_process_count(), ffmpeg0, "сиротских ffmpeg нет");
     }
 
+    // ===== G6.2: реальный гибридный пакет 2×2 (2 процесса × 2 воркера) =====
+
+    /// Настройки гибрида: эталон P2B.3 + осознанный режим «Максимальная
+    /// скорость». threads — по умолчанию 4 (серия t4 P2B.3).
+    fn hybrid_settings(out_dir: &Path, threads: u32) -> GuiSettings {
+        let mut s = p2b3_settings(out_dir, None);
+        s.batch_cuda_mode = BatchCudaMode::MaxSpeed;
+        s.threads = threads;
+        s.clamped();
+        s
+    }
+
+    /// G6.2: главный тест — пакет на гибриде 2×2: четырежды загруженный
+    /// Pocket, два процесса, все WAV ПОБИТОВО равны экономичному пулу 1×2
+    /// (который в G6.1 сверен с пофайловым путём), 77/77 чанков, VRAM
+    /// возвращается к базе, ffmpeg не осиротел.
+    #[test]
+    #[ignore = "реальный гибридный синтез CUDA: модели + ORT GPU DLL (~100 с)"]
+    fn real_batch_cuda_hybrid() {
+        let parts = p2b3_parts();
+        let src_dir = parts[0].parent().unwrap().to_path_buf();
+        let ffmpeg0 = ffmpeg_process_count();
+        let vram0 = app_core::diagnostics::gpu_total_used_mb();
+        let no_cancel = || Arc::new(AtomicBool::new(false));
+        let emit: Arc<dyn Fn(JobEvent) + Send + Sync> = Arc::new(|_| {});
+
+        // 1) эталон: экономичный постоянный пул 1×2 (проверен G6.1 побитово)
+        let d_ref = tmpdir("g62_ref12");
+        let mut s_ref = p2b3_settings(&d_ref, None);
+        s_ref.out_dir = d_ref.join("out").display().to_string();
+        s_ref.clamped();
+        let ref_res = execute_batch(&s_ref, &src_dir, &no_cancel(), &emit);
+        eprintln!("[g62_ref] {} | {}", ref_res.status.label(), ref_res.summary);
+        assert_eq!(ref_res.status, JobStatus::Completed, "{}", ref_res.summary);
+        let ref_rep = ref_res.batch.expect("отчёт эталона");
+        assert_eq!(ref_rep.pool_loads, Some(2));
+
+        // 2) гибрид 2×2
+        let d = tmpdir("g62_hybrid");
+        let mut s = hybrid_settings(&d, 4);
+        s.out_dir = d.join("out").display().to_string();
+        s.clamped();
+        let logs: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let emit2: Arc<dyn Fn(JobEvent) + Send + Sync> = {
+            let logs = Arc::clone(&logs);
+            Arc::new(move |ev| {
+                if let JobEvent::Log(line) = ev {
+                    logs.lock().unwrap().push(line);
+                }
+            })
+        };
+        let res = execute_batch(&s, &src_dir, &no_cancel(), &emit2);
+        eprintln!("[g62_hybrid] {} | {}", res.status.label(), res.summary);
+        let logs = logs.lock().unwrap().join("\n");
+        if !logs.contains("VPAM-PREFLIGHT-SENTINEL") && !logs.contains("VRAM-префлайт 2×2")
+        {
+            // префлайт не прошёл — экономичный откат; тест бесполезен
+            panic!("2×2 не запущен (VRAM-префлайт/фолбэк): {logs}");
+        }
+        assert_eq!(res.status, JobStatus::Completed, "{}", res.summary);
+        let rep = res.batch.expect("отчёт гибрида");
+        // ГЛАВНЫЙ КРИТЕРИЙ: 4 Pocket в 2 процессах
+        assert_eq!(rep.pool_loads, Some(4), "{}", rep.summary());
+        assert_eq!(rep.pool_processes, Some(2), "{}", rep.summary());
+        assert_eq!(rep.pool_workers, Some(4), "{}", rep.summary());
+        assert_eq!(rep.completed(), parts.len());
+        // 3) побитовый паритет всех WAV гибрид == экономичный пул
+        for f in &rep.files {
+            let out_h = f.final_path.as_ref().expect("итог гибрида");
+            let out_ref = d_ref.join("out").join(f.relative.with_extension("wav"));
+            let a = std::fs::read(out_h).expect("WAV гибрида");
+            let b = std::fs::read(&out_ref).expect("WAV эталона");
+            assert_eq!(
+                a,
+                b,
+                "{}: WAV гибрида обязан быть побитово равен пулу 1×2",
+                f.relative.display()
+            );
+            assert!(a.starts_with(b"RIFF"));
+        }
+        // 4) чанки: 77 на main12 (или весь набор ctrl6)
+        let chunks: usize = rep.files.iter().map(|f| f.chunks_total).sum();
+        assert_eq!(chunks, 77, "сумма чанков набора");
+        assert!(rep.files.iter().all(|f| f.chunks_done == f.chunks_total));
+        // 5) без осиротевших ffmpeg/процессов; VRAM вернулась к базе
+        assert_eq!(ffmpeg_process_count(), ffmpeg0, "сиротских ffmpeg нет");
+        let vram1 = app_core::diagnostics::gpu_total_used_mb();
+        if let (Some(v0), Some(v1)) = (vram0, vram1) {
+            assert!(
+                v1 < v0 + 2500.0,
+                "VRAM после гибрида {v1:.0} МБ против базы {v0:.0} МБ — утечка"
+            );
+            eprintln!("[g62_vram] база {v0:.0} МБ → после гибрида {v1:.0} МБ");
+        }
+    }
+
+    /// G6.2: отмена гибрида в середине пакета: новые файлы не назначаются,
+    /// готовое до отмены цело, повторный запуск доделывает остальное.
+    #[test]
+    #[ignore = "реальный гибридный синтез CUDA (~120 с, два прогона)"]
+    fn real_batch_cuda_hybrid_cancel() {
+        let parts = p2b3_parts();
+        let src_dir = parts[0].parent().unwrap().to_path_buf();
+        let d = tmpdir("g62_hybrid_cancel");
+        let out = d.join("out");
+        let mut s = hybrid_settings(&d, 4);
+        s.out_dir = out.display().to_string();
+        s.clamped();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_c = Arc::clone(&cancel);
+        // отмена после ПЕРВОГО готового файла (пакет уже идёт)
+        let emit: Arc<dyn Fn(JobEvent) + Send + Sync> = Arc::new(move |ev| {
+            if let JobEvent::FileDone { report, .. } = &ev {
+                if report.status == crate::batch::FileStatus::Completed {
+                    cancel_c.store(true, Ordering::SeqCst);
+                }
+            }
+        });
+        let r1 = execute_batch(&s, &src_dir, &cancel, &emit);
+        eprintln!("[g62_cancel] {} | {}", r1.status.label(), r1.summary);
+        assert_eq!(r1.status, JobStatus::Cancelled, "{}", r1.summary);
+        let rep1 = r1.batch.expect("отчёт отмены");
+        let completed1 = rep1.completed();
+        assert!(completed1 >= 1, "готовое до отмены сохранено");
+        assert!(rep1.is_cancelled());
+        // каждый файл имеет терминальный результат
+        assert_eq!(
+            rep1.completed()
+                + rep1.failed()
+                + rep1.skipped()
+                + rep1.count(crate::batch::FileStatus::Cancelled),
+            parts.len()
+        );
+        // опубликованные до отмены WAV целы (RIFF)
+        for f in &rep1.files {
+            if let Some(p) = &f.final_path {
+                assert!(std::fs::read(p).unwrap().starts_with(b"RIFF"));
+            }
+        }
+        // повтор: готовое пропускается, остальное доделывается
+        let noop: Arc<dyn Fn(JobEvent) + Send + Sync> = Arc::new(|_| {});
+        let r2 = execute_batch(&s, &src_dir, &Arc::new(AtomicBool::new(false)), &noop);
+        eprintln!("[g62_cancel_rerun] {} | {}", r2.status.label(), r2.summary);
+        assert_eq!(r2.status, JobStatus::Completed, "{}", r2.summary);
+        let rep2 = r2.batch.expect("отчёт повтора");
+        assert_eq!(rep2.completed(), parts.len() - completed1);
+        assert_eq!(rep2.skipped(), completed1);
+        // политика проекта: .partial отменённых файлов СОХРАНЯЮТСЯ для
+        // диагностики и не удаляются автоматически — их наличие ожидаемо
+        assert!(
+            std::fs::read_dir(&out)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .any(|e| e.file_name().to_string_lossy().contains(".partial")),
+            "черновики отмены сохранены для диагностики"
+        );
+        assert_eq!(ffmpeg_process_count(), 0, "сиротских ffmpeg нет");
+    }
+
+    /// G6.2: перезапись на гибриде — skip без изменений, overwrite=true
+    /// атомарная замена после синтеза, без .partial.
+    #[test]
+    #[ignore = "реальный гибридный синтез CUDA (~120 с, три прогона)"]
+    fn real_batch_cuda_hybrid_overwrite() {
+        let parts = p2b3_parts();
+        let src_dir = parts[0].parent().unwrap().to_path_buf();
+        let d = tmpdir("g62_hybrid_ow");
+        let out = d.join("out");
+        let mut s = hybrid_settings(&d, 4);
+        s.out_dir = out.display().to_string();
+        s.clamped();
+        let no_cancel = || Arc::new(AtomicBool::new(false));
+        let emit: Arc<dyn Fn(JobEvent) + Send + Sync> = Arc::new(|_| {});
+
+        let r1 = execute_batch(&s, &src_dir, &no_cancel(), &emit);
+        assert_eq!(r1.status, JobStatus::Completed, "{}", r1.summary);
+        let before: Vec<Vec<u8>> = parts
+            .iter()
+            .map(|p| {
+                let name = p.file_name().unwrap();
+                std::fs::read(out.join(name).with_extension("wav")).unwrap()
+            })
+            .collect();
+
+        let r2 = execute_batch(&s, &src_dir, &no_cancel(), &emit);
+        assert_eq!(r2.status, JobStatus::NoWork, "{}", r2.summary);
+        for (i, p) in parts.iter().enumerate() {
+            let name = p.file_name().unwrap();
+            assert_eq!(
+                std::fs::read(out.join(name).with_extension("wav")).unwrap(),
+                before[i],
+                "старые байты целы при выключенной перезаписи"
+            );
+        }
+
+        let mut s3 = s.clone();
+        s3.overwrite_existing = true;
+        s3.clamped();
+        let r3 = execute_batch(&s3, &src_dir, &no_cancel(), &emit);
+        assert_eq!(r3.status, JobStatus::Completed, "{}", r3.summary);
+        let rep3 = r3.batch.expect("отчёт");
+        assert_eq!(rep3.completed(), parts.len());
+        assert!(rep3
+            .files
+            .iter()
+            .all(|f| f.reason.as_deref().is_some_and(|r| r.contains("обновлён"))));
+        assert!(!std::fs::read_dir(&out)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".partial")));
+        assert_eq!(ffmpeg_process_count(), 0, "сиротских ffmpeg нет");
+    }
+
+    /// G6.2: MP3/Opus на гибриде — корректные контейнеры, без сирот.
+    #[test]
+    #[ignore = "реальный гибридный синтез CUDA + ffmpeg (~150 с, две серии)"]
+    fn real_batch_cuda_hybrid_mp3_opus() {
+        let parts = p2b3_parts();
+        let src_dir = parts[0].parent().unwrap().to_path_buf();
+        let ffmpeg0 = ffmpeg_process_count();
+        for (fmt, magic) in [
+            (OutputFormatChoice::Mp3, &b"ID3"[..]),
+            (OutputFormatChoice::Opus, &b"OggS"[..]),
+        ] {
+            let d = tmpdir(&format!("g62_hybrid_{fmt:?}"));
+            let mut s = hybrid_settings(&d, 4);
+            s.out_dir = d.join("out").display().to_string();
+            s.format = fmt;
+            s.clamped();
+            let emit: Arc<dyn Fn(JobEvent) + Send + Sync> = Arc::new(|_| {});
+            let res = execute_batch(&s, &src_dir, &Arc::new(AtomicBool::new(false)), &emit);
+            eprintln!("[g62_{fmt:?}] {} | {}", res.status.label(), res.summary);
+            if let Some(rep) = res.batch.as_ref() {
+                for line in rep.detail_lines() {
+                    eprintln!("[g62_{fmt:?}] {line}");
+                }
+            }
+            assert_eq!(res.status, JobStatus::Completed, "{}", res.summary);
+            let rep = res.batch.expect("отчёт");
+            assert_eq!(rep.completed(), parts.len(), "{}", rep.summary());
+            assert_eq!(rep.pool_processes, Some(2), "{}", rep.summary());
+            for f in &rep.files {
+                let p = f.final_path.as_ref().expect("итог");
+                assert!(
+                    std::fs::read(p).unwrap().starts_with(magic),
+                    "контейнер {}: {}",
+                    fmt.label(),
+                    p.display()
+                );
+            }
+        }
+        assert_eq!(ffmpeg_process_count(), ffmpeg0, "сиротских ffmpeg нет");
+    }
+
+    /// G6.2: принудительная гибель дочернего PID во время реального пакета:
+    /// его незавершённые файлы получают Failed с диагнозом, выживший процесс
+    /// доделывает очередь, пакет завершается (не висит), процессов не остаётся.
+    #[test]
+    #[ignore = "реальный гибридный синтез CUDA с внедрённым сбоем (~60 с)"]
+    fn real_batch_cuda_hybrid_child_killed() {
+        let parts = p2b3_parts();
+        let src_dir = parts[0].parent().unwrap().to_path_buf();
+        let d = tmpdir("g62_hybrid_kill");
+        let mut s = hybrid_settings(&d, 4);
+        s.out_dir = d.join("out").display().to_string();
+        s.clamped();
+        // гибельный PID получаем из лога диспетчера (процесс 1 подключается
+        // вторым: «процесс 1: подключился (pid N)») и завершаем его на первом
+        // старте файла — пакет уже идёт.
+        let killed = Arc::new(AtomicBool::new(false));
+        let killed_c = Arc::clone(&killed);
+        let pid_cell: Arc<std::sync::Mutex<Option<u32>>> = Arc::new(std::sync::Mutex::new(None));
+        let pid_parse = Arc::clone(&pid_cell);
+        let emit: Arc<dyn Fn(JobEvent) + Send + Sync> = {
+            let killed_c = Arc::clone(&killed_c);
+            let pid_parse = Arc::clone(&pid_parse);
+            Arc::new(move |ev| match &ev {
+                JobEvent::Log(line) => {
+                    if let Some(rest) = line.strip_prefix("процесс 1: подключился (pid ")
+                    {
+                        if let Some(pid) =
+                            rest.split(')').next().and_then(|v| v.parse::<u32>().ok())
+                        {
+                            *pid_parse.lock().unwrap() = Some(pid);
+                        }
+                    }
+                }
+                JobEvent::FileStarted { .. } => {
+                    // одноразовое управляемое внедрение сбоя: первый FileStarted
+                    let first = !killed_c.swap(true, Ordering::SeqCst);
+                    let Some(pid) = first.then(|| *pid_parse.lock().unwrap()).flatten() else {
+                        return;
+                    };
+                    let _ = std::process::Command::new("taskkill")
+                        .args(["/PID", &pid.to_string(), "/F"])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                }
+                _ => {}
+            })
+        };
+        let logs: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let emit2: Arc<dyn Fn(JobEvent) + Send + Sync> = {
+            let logs = Arc::clone(&logs);
+            let inner = Arc::clone(&emit);
+            Arc::new(move |ev| {
+                if let JobEvent::Log(l) = &ev {
+                    logs.lock().unwrap().push(l.clone());
+                }
+                inner(ev);
+            })
+        };
+        let res = execute_batch(&s, &src_dir, &Arc::new(AtomicBool::new(false)), &emit2);
+        eprintln!("[g62_kill] {} | {}", res.status.label(), res.summary);
+        assert!(killed.load(Ordering::SeqCst) && pid_cell.lock().unwrap().is_some());
+        let rep = res.batch.expect("отчёт");
+        assert_eq!(rep.total(), parts.len());
+        // каждый файл терминален; часть — Failed, часть — Completed
+        let completed = rep.completed();
+        let failed = rep.failed();
+        assert!(
+            completed >= 1,
+            "выживший процесс доделал часть: {}",
+            rep.summary()
+        );
+        assert!(
+            failed >= 1,
+            "файлы убитого процесса Failed: {}",
+            rep.summary()
+        );
+        assert_eq!(
+            completed + failed + rep.skipped() + rep.count(crate::batch::FileStatus::Cancelled),
+            parts.len()
+        );
+        let logs = logs.lock().unwrap().join("\n");
+        assert!(
+            logs.contains("дочерний процесс 1"),
+            "диагностика гибели в журнале"
+        );
+        // терминальные Failed обязаны нести диагноз гибели
+        for f in &rep.files {
+            if f.status == crate::batch::FileStatus::Failed {
+                let r = f.reason.as_deref().unwrap_or_default();
+                assert!(
+                    r.contains("процесс") || r.contains("воркер") || r.contains("заверш"),
+                    "диагноз: {r}"
+                );
+            }
+        }
+        // ни один дочерний процесс не остался (tasklist по имени exe не растёт)
+        assert_eq!(ffmpeg_process_count(), 0, "сиротских ffmpeg нет");
+    }
+
     /// G6.1: замеры производительности пакетного CUDA на наборе main12 —
     /// прежний пофайловый путь (модель на каждый файл) против постоянного
     /// пула 1/2 воркера. Прогрев + 3 измеренных повтора на режим; в процессе
@@ -3631,5 +4404,218 @@ mod tests {
         }
         stop.store(true, Ordering::Relaxed);
         std::env::remove_var("SHTORM_GUI_BATCH_POOL");
+    }
+
+    /// G6.2 §16: бенчмарк РЕАЛЬНОГО GUI-пути — штатный экономичный режим
+    /// 1×2 против гибрида 2×2 (threads=4 и threads=2) на наборе main12.
+    /// Прогрев + 3 измеренных повтора на режим, каждый — новый каталог.
+    /// Cold wall — полный `execute_batch` (включая загрузки Pocket);
+    /// Warm wall — от `BatchWorkersReady` (все воркеры готовы) до последнего
+    /// `FileDone`: ни загрузок моделей, ни preflight в окне (методика P2B.3,
+    /// но в событиях GUI, а не в межпроцессном гейте). Побитовая сверка всех
+    /// WAV каждого прогона с эталоном экономичного режима.
+    #[test]
+    #[ignore = "длительный бенчмарк CUDA (~15 мин): 3 режима × (прогрев + 3 повтора)"]
+    fn real_batch_cuda_hybrid_bench() {
+        fn gpu_sample() -> Option<(u64, u64)> {
+            let out = std::process::Command::new("nvidia-smi")
+                .args([
+                    "--query-gpu=utilization.gpu,memory.used",
+                    "--format=csv,noheader,nounits",
+                ])
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            let t = String::from_utf8_lossy(&out.stdout);
+            let mut it = t.lines().next()?.trim().split(',');
+            Some((
+                it.next()?.trim().parse().ok()?,
+                it.next()?.trim().parse().ok()?,
+            ))
+        }
+        fn cpu_sample() -> Option<u64> {
+            let out = std::process::Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-Command",
+                    "(Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter \"Name='_Total'\" -Property PercentProcessorTime).PercentProcessorTime",
+                ])
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+        }
+
+        let parts = p2b3_parts();
+        let src_dir = parts[0].parent().unwrap().to_path_buf();
+        let base = tmpdir("g62_bench");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(std::sync::Mutex::new((0u64, 0u64, 0u64, 0u64, 0u64)));
+        // (max_vram_mb, sum_util, n_util, sum_cpu, n_cpu)
+        {
+            let stop = Arc::clone(&stop);
+            let stats = Arc::clone(&stats);
+            std::thread::spawn(move || {
+                let mut i = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    if let Some((util, used)) = gpu_sample() {
+                        let mut s = stats.lock().unwrap();
+                        s.0 = s.0.max(used);
+                        s.1 += util;
+                        s.2 += 1;
+                    }
+                    if i.is_multiple_of(4) {
+                        if let Some(cpu) = cpu_sample() {
+                            let mut s = stats.lock().unwrap();
+                            s.3 += cpu;
+                            s.4 += 1;
+                        }
+                    }
+                    i += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                }
+            });
+        }
+
+        // (имя, режим, threads): экономичный 1×2 и гибрид 2×2 в двух профилях
+        let modes: [(&str, BatchCudaMode, u32); 3] = [
+            ("gui1x2_t4", BatchCudaMode::Economy, 4),
+            ("gui2x2_t4", BatchCudaMode::MaxSpeed, 4),
+            ("gui2x2_t2", BatchCudaMode::MaxSpeed, 2),
+        ];
+        // эталон байтов: первый успешный прогон экономичного режима
+        let mut reference: Option<Vec<(PathBuf, Vec<u8>)>> = None;
+        let mut table: Vec<String> = Vec::new();
+        for (name, mode, threads) in modes {
+            for rep in 0..=3u32 {
+                let d = base.join(format!("{name}_r{rep}"));
+                let mut s = p2b3_settings(&d, None);
+                s.out_dir = d.join("out").display().to_string();
+                s.batch_cuda_mode = mode;
+                s.threads = threads;
+                s.clamped();
+                {
+                    let mut st = stats.lock().unwrap();
+                    *st = (0, 0, 0, 0, 0);
+                }
+                // warm-окно: готовность всех воркеров → последний FileDone
+                let ready_at: Arc<std::sync::Mutex<Option<Instant>>> =
+                    Arc::new(std::sync::Mutex::new(None));
+                let last_done: Arc<std::sync::Mutex<Option<Instant>>> =
+                    Arc::new(std::sync::Mutex::new(None));
+                let emit: Arc<dyn Fn(JobEvent) + Send + Sync> = {
+                    let ready_at = Arc::clone(&ready_at);
+                    let last_done = Arc::clone(&last_done);
+                    Arc::new(move |ev| match &ev {
+                        JobEvent::BatchWorkersReady { .. } => {
+                            let mut g = ready_at.lock().unwrap();
+                            if g.is_none() {
+                                *g = Some(Instant::now());
+                            }
+                        }
+                        JobEvent::FileDone { .. } => {
+                            *last_done.lock().unwrap() = Some(Instant::now());
+                        }
+                        _ => {}
+                    })
+                };
+                let t0 = Instant::now();
+                let res = execute_batch(&s, &src_dir, &Arc::new(AtomicBool::new(false)), &emit);
+                let cold = t0.elapsed().as_secs_f32();
+                assert_eq!(
+                    res.status,
+                    JobStatus::Completed,
+                    "{name} r{rep}: {}",
+                    res.summary
+                );
+                let report = res.batch.expect("отчёт");
+                assert!(report.completed() == parts.len(), "{}", report.summary());
+                let warm = match (*ready_at.lock().unwrap(), *last_done.lock().unwrap()) {
+                    (Some(r), Some(l)) if l > r => Some((l - r).as_secs_f32()),
+                    _ => None,
+                };
+                // аудио набора — по размерам WAV (PCM16 mono 24 кГц)
+                let audio_s: f64 = std::fs::read_dir(d.join("out"))
+                    .unwrap()
+                    .filter_map(|e| e.ok())
+                    .filter(|e| {
+                        e.file_name()
+                            .to_string_lossy()
+                            .to_ascii_lowercase()
+                            .ends_with(".wav")
+                    })
+                    .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
+                    .map(|len| len.saturating_sub(44) as f64 / 48_000.0)
+                    .sum();
+                // побитовая сверка с эталоном (равносильно сверке SHA256)
+                let mut writes: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+                for part in &parts {
+                    let name_f = part.file_name().unwrap();
+                    let p = d.join("out").join(name_f).with_extension("wav");
+                    let bytes = std::fs::read(&p).unwrap_or_default();
+                    writes.push((p.clone(), bytes));
+                }
+                match &reference {
+                    None => reference = Some(writes.clone()),
+                    Some(refer) => {
+                        for (i, (p, bytes)) in writes.iter().enumerate() {
+                            assert_eq!(
+                                bytes,
+                                &refer[i].1,
+                                "{name} r{rep}: {} побитово отличается от эталона 1×2",
+                                p.display()
+                            );
+                        }
+                    }
+                }
+                let (vram_max, util_avg, cpu_avg) = {
+                    let st = stats.lock().unwrap();
+                    (
+                        st.0,
+                        if st.2 > 0 {
+                            st.1 as f64 / st.2 as f64
+                        } else {
+                            0.0
+                        },
+                        if st.4 > 0 {
+                            st.3 as f64 / st.4 as f64
+                        } else {
+                            0.0
+                        },
+                    )
+                };
+                let kind = if rep == 0 { "warmup" } else { "measured" };
+                let line = format!(
+                    "BENCH {name} {kind}: cold {cold:.2} s | warm {} | аудио {audio_s:.1} с | \
+                     throughput {:.2} реч-с/с (cold) | VRAM max {vram_max} МБ | GPU util \
+                     {util_avg:.0}% | CPU {cpu_avg:.0}% | Pocket {} | процессов {} | {}",
+                    warm.map(|w| format!("{w:.2} s (всего {:.2} реч-с/с)", audio_s / w as f64))
+                        .unwrap_or_else(|| "-".into()),
+                    audio_s / cold as f64,
+                    report
+                        .pool_loads
+                        .map(|v| v.to_string())
+                        .unwrap_or("-".into()),
+                    report
+                        .pool_processes
+                        .map(|v| v.to_string())
+                        .unwrap_or("-".into()),
+                    report.summary()
+                );
+                eprintln!("{line}");
+                if rep > 0 {
+                    table.push(line);
+                }
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        eprintln!("==== ИТОГИ G6.2 BENCH (3 измеренных повтора) ====");
+        for line in &table {
+            eprintln!("{line}");
+        }
     }
 }
