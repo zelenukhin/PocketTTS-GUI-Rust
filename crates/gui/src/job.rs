@@ -1229,6 +1229,8 @@ fn execute_batch_hybrid(
         init_settled: &init_settled,
         watchdog: hybrid::CHILD_WATCHDOG,
         startup_timeout: hybrid::CHILD_STARTUP_TIMEOUT,
+        // G6.2.2: зависшая IPC-отправка не блокирует цикл диспетчера
+        write_timeout: crate::ipc::WRITE_WAIT_TIMEOUT,
     };
     emit(JobEvent::Log(format!(
         "гибрид 2×2: запуск {HYBRID_CHILDREN} процессов CUDA-инференса ({} Pocket на процесс; \
