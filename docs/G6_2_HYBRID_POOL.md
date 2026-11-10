@@ -292,57 +292,30 @@ seed 42, EOS −4/5/3, max_tokens 50, набор main12 из P2B.3 (12 файл�
 
 ### Portable (§17)
 
-Полный портативный комплект (3.4 ГБ) в новом каталоге
-`C:\PocketTTS-GUI-Rust\dist\ShtormTTS-Portable-2026-11-10-g62` **собрать
-не удалось: на C: 0 байт свободно** — `build-portable.ps1` остановился на
-копировании моделей; по политике скрипта частичный каталог (1.2 ГБ) оставлен
-для инспекции, старый `g52-final` не изменялся. Проверка переносимости
-выполнена в обход полного комплекта: exe скопирован в `C:\ShtormG62PortTest`
-(вне репозитория), запуск с рабочим каталогом `C:\`:
+Комплект собран в НОВЫЙ каталог (диск был освобождён; частичный
+`...-g62` не переиспользован, старый `g52-final` не трогался — его уже не
+было в `dist`):
 
-- `--portable-check` — OK (пути exe-относительные; ORT указан явным путём,
-  т.к. комплект не собран);
-- реальный одиночный CUDA-синтез — Completed, RTF 0.531, «io binding active»;
-- `--portable-selftest-hybrid` — 2 процесса, 4 воркера, 6/6 файлов, дочерних
-  процессов после запуска 0; внутренний worker-режим окна НЕ открывает.
+- `C:\PocketTTS-GUI-Rust\dist\ShtormTTS-Portable-2026-11-10-g62-final`,
+  **54 файла, 3404 MiB**, git `94d084f` (dirty=false), manifest.json,
+  exe SHA256 `D2CCAFBD5E46B4F77D543EB56C7F4ACA6A76647B9B67D4DE39D86F461776FA26`.
+- В комплекте: `onnxruntime/cuda` (onnxruntime + cuDNN 9 + cuBLAS/cudart),
+  `onnxruntime/cpu`, `models/ru-v2-fast|slow` (все ONNX + tokenizer),
+  `ffmpeg/ffmpeg.exe`, `voice/reference.wav`, VC++ runtime, лицензии,
+  README, пример настроек.
 
-**Не проверено** (и не заявляется): самодостаточный комплект с моделями и
-ORT DLL рядом с exe, чистая Windows VM. Блокер — свободное место на диске;
-после освобождения места комплект собирается той же командой в НОВЫЙ каталог.
+Проверки запуска ИЗ комплекта с рабочим каталогом `C:\` (вне репозитория):
 
-## 13. Известные ограничения
+| Проверка | Результат |
+|---|---|
+| `--portable-check` | **OK**: модель, ORT CUDA DLL, ffmpeg — все пути из каталога exe |
+| `--portable-selftest` (CUDA) | **Завершено**, «io binding active» |
+| `--portable-selftest --format mp3` | **Завершено** (комплектный ffmpeg) |
+| `--portable-selftest-cancel` | **CANCEL SELFTEST OK** (отмена → повтор Completed) |
+| `--portable-selftest-batch` (CUDA, 2 файла) | **Завершено**: экономичный пул 2 воркера, 2 загрузки Pocket |
+| `--portable-selftest-hybrid` (fake 2×2) | **HYBRID SELFTEST OK**: 2 процесса, 4 воркера, 6/6 |
+| Происхождение модулей CUDA-прогона | **все** onnxruntime/cuDNN/cuBLAS/cudart/MSVC — из комплекта; из системы только драйвер `nvcuda.dll` (DriverStore) |
+| Осиротевшие процессы | 0 `shtorm-gui`, 0 `ffmpeg` после всех прогонов; внутренние worker-режимы окна не открывали |
 
-- Гибрид доступен только для пакетного CUDA; CPU-пакеты, одиночный синтез и
-  экономичный режим не менялись.
-- Топология фиксирована 2×2 (4 Pocket); 1×3/2×3 и иные комбинации не
-  реализованы (по итогам P2B.2/P2B.3 не нужны).
-- Автоматический повтор файла после гибели процесса НЕ выполняется по
-  требованию задания (состояние публикации может быть неопределённым);
-  файл получает Failed с диагнозом, пользователь решает сам.
-- Watchdog 300 с — эвристика; зависший, но живый процесс завершается
-  принудительно только при наличии назначенного файла.
-- Реальная визуальная приёмка живого окна на идущем гибридном пакете —
-  ограничение, как в G6.1/G6.1.1 (окно не открывалось пользователем);
-  модельные тесты UI + headless EXE покрывают события и счётчики.
-- `SHTORM_G62_FAKE=1` — диагностический флаг (движок-заглушка без ONNX);
-  при нём VRAM-префлайт пропускается. Это тестовый режим, не для работы.
-- На не-Windows сборке гибридный режим недоступен (IPC — Windows Named Pipes).
-- Кандидатов < 4 → автоматический экономичный режим (2×2 для 2–3 файлов
-  нецелесообразен: 4 Pocket на меньшее число файлов).
-
-## 14. Команды воспроизведения
-
-```bash
-# unit/E2E без GPU (реальные процессы, fake-движок)
-cargo test -p shtorm-gui --lib hybrid::
-cargo test -p shtorm-gui --lib ipc::
-# smoke реального EXE (fake-гибрид + CLI)
-powershell -NoProfile -ExecutionPolicy Bypass -File tools/g62_hybrid_smoke.ps1
-# real CUDA (по одному на процесс)
-SHTORM_GUI_TEST_DEVICE=cuda cargo test -p shtorm-gui --release --lib \
-  job::tests::real_batch_cuda_hybrid -- --exact --ignored --nocapture --test-threads=1
-# ... real_batch_cuda_hybrid_cancel / _overwrite / _mp3_opus / _child_killed
-# бенчмарк 1×2 vs 2×2 (t4/t2), ~15 мин
-SHTORM_GUI_TEST_DEVICE=cuda cargo test -p shtorm-gui --release --lib \
-  job::tests::real_batch_cuda_hybrid_bench -- --exact --ignored --nocapture --test-threads=1
-```
+**Не проверено** (и не заявляется): чистая Windows VM без Python/Torch/ORT/
+FFmpeg; комплект проверен на машине разработки, как и предыдущие.
