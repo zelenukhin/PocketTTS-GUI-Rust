@@ -58,7 +58,7 @@ impl CliCommand {
 
 /// Справка по запуску (используется `--help` и сообщениями об ошибках).
 pub fn usage_text() -> String {
-    "ShtormTTS GUI — запуск:\n\
+    "PocketTTS-GUI-Rust — запуск:\n\
      \x20 без аргументов              обычное окно GUI\n\
      \x20 --portable-check            headless-проверка ресурсов (модель/ORT/ffmpeg)\n\
      \x20 --portable-selftest         headless-синтез одного файла\n\

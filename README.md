@@ -1,7 +1,8 @@
-# ShtormTTS-Windows
+# PocketTTS-GUI-Rust
 
-Нативный (Rust) движок Shtorm PocketTTS RU для Windows: FP32, CPU и CUDA, без
-Python/PyTorch в рантайме. Каркас этапа «подготовка» — GUI будет позже.
+Приложение PocketTTS-GUI-Rust (ранее называлось ShtormTTS-Windows) —
+нативный (Rust) движок Shtorm PocketTTS RU для Windows и GUI к нему: FP32
+и INT8, CPU и CUDA, без Python/PyTorch в рантайме.
 
 - Движок — производное [teratts-android](https://github.com/9208499-ship-it/teratts-android)
   (ветка `teratts`, commit `edb614e8…`), лицензия **GPL-3.0** (см.

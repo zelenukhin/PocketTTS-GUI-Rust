@@ -29,11 +29,11 @@ headless fake-режим без CUDA/моделей. Числа производ
 ## 1. Архитектура
 
 ```
-GUI-процесс (shtorm-gui.exe) — ДИСПЕТЧЕР
+GUI-процесс (PocketTTS-GUI-Rust.exe) — ДИСПЕТЧЕР
   ├─ preflight пакета (конфликты/существующие/безопасность путей) ДО процессов
   ├─ VRAM-префлайт (4 Pocket × 2355 МБ + 1500 МБ запаса)
   ├─ общая очередь файлов (владеет только диспетчер)
-  ├─ Named Pipe #0  ⇄  дочерний процесс 0 (shtorm-gui.exe --internal-batch-worker)
+  ├─ Named Pipe #0  ⇄  дочерний процесс 0 (PocketTTS-GUI-Rust.exe --internal-batch-worker)
   │                       ├─ Pocket #0 (5 ONNX-сессий) — воркер 0
   │                       └─ Pocket #1 — воркер 1
   └─ Named Pipe #1  ⇄  дочерний процесс 1

@@ -5,10 +5,10 @@
 # stay alive >= 4 s (window opened), then closed softly (CloseMainWindow)
 # or stopped by PID - our own test process only.
 $ErrorActionPreference = 'Stop'
-$exeSrc = 'C:\PocketTTS-GUI-Rust\ShtormTTS-Windows\target\release\shtorm-gui.exe'
-$sandbox = Join-Path $env:TEMP ("shtorm_g611_smoke_" + $PID + "_" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+$exeSrc = 'C:\PocketTTS-GUI-Rust\ShtormTTS-Windows\target\release\PocketTTS-GUI-Rust.exe'
+$sandbox = Join-Path $env:TEMP ("pockettts_g611_smoke_" + $PID + "_" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
 New-Item -ItemType Directory -Path $sandbox | Out-Null
-$exe = Join-Path $sandbox 'shtorm-gui.exe'
+$exe = Join-Path $sandbox 'PocketTTS-GUI-Rust.exe'
 Copy-Item -LiteralPath $exeSrc -Destination $exe
 $voice = 'C:/PocketTTS-GUI/examples/Microsoft Brian Speed 1.wav'
 $onnxBase = 'C:/Users/alexa/Downloads/pocket_tts_android/build/onnx'
@@ -42,7 +42,7 @@ $settingsJson = @"
   "theme_dark": true
 }
 "@
-[IO.File]::WriteAllText((Join-Path $sandbox 'shtorm_gui_settings.json'), $settingsJson)
+[IO.File]::WriteAllText((Join-Path $sandbox 'PocketTTS-GUI-Rust.json'), $settingsJson)
 Write-Output ("SANDBOX: {0}" -f $sandbox)
 
 $script:failures = 0
@@ -95,8 +95,8 @@ Run-Case 'bad-holdms-value'        @('--portable-check', '--hold-ms', 'abc') 2 '
 Run-Case 'option-without-command'  @('--device', 'cuda') 2 'только вместе с диагностической' 5
 
 # --- valid headless modes that load no Pocket ---
-Run-Case 'help'                    @('--help') 0 'ShtormTTS GUI' 5
-Run-Case 'help-short'              @('-h') 0 'ShtormTTS GUI' 5
+Run-Case 'help'                    @('--help') 0 'PocketTTS-GUI-Rust' 5
+Run-Case 'help-short'              @('-h') 0 'PocketTTS-GUI-Rust' 5
 Run-Case 'portable-check'          @('--portable-check') 0 'PORTABLE CHECK OK' 15
 Run-Case 'options-before-command'  @('--device', 'cuda', '--portable-check') 0 'PORTABLE CHECK OK' 15
 

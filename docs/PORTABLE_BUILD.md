@@ -1,29 +1,32 @@
 # G4 — портативная сборка Windows x64
 
-Дата: 2026-11-09 (G4); обновлено 2026-11-10 (актуальный комплект —
-`ShtormTTS-Portable-2026-11-10-g52-final`, см. раздел «Результаты
-проверки G5.2» внизу). Статус: реализовано и проверено на машине
+Дата: 2026-11-09 (G4); обновлено 2026-11-12 (G6.5: приложение переименовано
+в PocketTTS-GUI-Rust — новые комплекты собираются в каталоги
+`PocketTTS-GUI-Rust-Portable-*`, имя `ShtormTTS-Portable-*` скриптом
+отвергается; прежние комплекты — исторические артефакты, не переименованы.
+Актуальный на G5.2 комплект — `ShtormTTS-Portable-2026-11-10-g52-final`,
+см. раздел «Результаты проверки G5.2» внизу). Статус: реализовано и проверено на машине
 разработки (Windows 10 x64, NVIDIA RTX 3060). Проверка на чистой Windows
 VM без Python/PyTorch/ORT/FFmpeg **не проводилась** — см. раздел
 «Результаты».
 
 ## Цель
 
-`ShtormTTS-GUI` запускается из отдельной папки на Windows x64 без
+`PocketTTS-GUI-Rust` запускается из отдельной папки на Windows x64 без
 установленного Python, PyTorch, Rust, системного ONNX Runtime и системного
 FFmpeg. Все ресурсы (модели, ORT CPU/CUDA, ffmpeg) лежат рядом с exe.
 
 ## Структура дистрибутива
 
 ```
-ShtormTTS-Portable-<date>/
-  shtorm-gui.exe
+PocketTTS-GUI-Rust-Portable-<date>/
+  PocketTTS-GUI-Rust.exe
   msvcp140.dll                      # MSVC++ Redistributable runtime
   msvcp140_1.dll
   vcruntime140.dll
   vcruntime140_1.dll
-  shtorm_gui_settings.json          # рабочие настройки с ОТНОСИТЕЛЬНЫМИ путями
-  shtorm_gui_settings.example.json  # тот же пример для восстановления
+  PocketTTS-GUI-Rust.json           # рабочие настройки с ОТНОСИТЕЛЬНЫМИ путями
+  PocketTTS-GUI-Rust.example.json   # тот же пример для восстановления
   manifest.json                     # версии, git-коммит, размеры и SHA256 файлов
   README-PORTABLE.txt
   THIRD_PARTY_NOTICES.md
@@ -70,7 +73,7 @@ ShtormTTS-Portable-<date>/
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\build-portable.ps1 `
-  -Destination C:\PocketTTS-GUI-Rust\dist\ShtormTTS-Portable-2026-11-09 `
+  -Destination C:\PocketTTS-GUI-Rust\dist\PocketTTS-GUI-Rust-Portable-2026-11-12 `
   -ModelsDir C:\Users\alexa\Downloads\pocket_tts_android\build\onnx `
   -Ffmpeg C:\PocketTTS-GUI\ffmpeg\ffmpeg.exe `
   -VoiceFile "C:\PocketTTS-GUI\examples\Microsoft Brian Speed 1.wav"
@@ -101,7 +104,7 @@ powershell -ExecutionPolicy Bypass -File tools\build-portable.ps1 `
 
 Скрипт:
 
-1. собирает `shtorm-gui.exe` (`cargo build --release --bin shtorm-gui`);
+1. собирает `PocketTTS-GUI-Rust.exe` (`cargo build --release --bin PocketTTS-GUI-Rust`);
 2. создаёт новый каталог и подкаталоги (без удалений);
 3. копирует exe, CPU ORT (2 DLL), CUDA ORT (15 DLL), ffmpeg, FP32-модели,
    пример настроек, документацию и лицензии;
@@ -120,7 +123,7 @@ powershell -ExecutionPolicy Bypass -File tools\build-portable.ps1 `
 Приоритет (`crates/gui/src/resources.rs`):
 
 1. **Явный путь пользователя** из настроек. Абсолютный путь используется
-   как есть; относительный — от каталога `shtorm-gui.exe`, а не от текущего
+   как есть; относительный — от каталога `PocketTTS-GUI-Rust.exe`, а не от текущего
    рабочего каталога/ярлыка.
 2. **Портативные подкаталоги рядом с exe**: `models/`, `onnxruntime/cpu/`,
    `onnxruntime/cuda/`, `ffmpeg/`.
@@ -153,7 +156,7 @@ CPU↔CUDA в одном сеансе GUI приложение выдаёт че
 
 ## Настройки по умолчанию
 
-`tools/portable/settings.json` (копируется как `shtorm_gui_settings.json`)
+`tools/portable/settings.json` (копируется как `PocketTTS-GUI-Rust.json`)
 использует только относительные пути:
 
 - `onnx_base`: `models`
@@ -208,17 +211,17 @@ slow.
 ## Диагностические режимы exe
 
 ```text
-shtorm-gui.exe --portable-check
+PocketTTS-GUI-Rust.exe --portable-check
   Печатает exe-каталог, настройки, разрешённые model/ORT/ffmpeg пути.
 
-shtorm-gui.exe --portable-selftest [--device cpu|cuda] [--format wav|mp3|opus]
+PocketTTS-GUI-Rust.exe --portable-selftest [--device cpu|cuda] [--format wav|mp3|opus]
   Короткий синтез из портативного каталога; печатает STATUS/SUMMARY/OUTPUT.
 
-shtorm-gui.exe --portable-selftest-batch [--device cpu|cuda]
+PocketTTS-GUI-Rust.exe --portable-selftest-batch [--device cpu|cuda]
   Два файла во временном уникальном каталоге, результат в новом
   подкаталоге output; печатает отчёт по файлам.
 
-shtorm-gui.exe --portable-selftest-cancel [--device cpu|cuda]
+PocketTTS-GUI-Rust.exe --portable-selftest-cancel [--device cpu|cuda]
   Многочанковое задание, отмена после первого готового чанка (Cancelled,
   итог не опубликован, черновик остаётся), затем повтор на том же пути
   (Completed). P2A.1.

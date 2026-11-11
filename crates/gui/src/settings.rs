@@ -1,8 +1,11 @@
-//! Настройки GUI (G1/G5): собственный JSON (`shtorm_gui_settings.json` рядом
-//! с exe), round-trip с сохранением неизвестных ключей, безопасная атомарная
-//! запись (unique tmp + MoveFileExW REPLACE — старый файл не разрушается при
-//! сбое сериализации). Импорт из Python-GUI удалён в G5: приложение читает
-//! только собственный конфиг.
+//! Настройки GUI (G1/G5/G6.5): собственный JSON (`PocketTTS-GUI-Rust.json`
+//! рядом с exe), round-trip с сохранением неизвестных ключей, безопасная
+//! атомарная запись (unique tmp + MoveFileExW REPLACE — старый файл не
+//! разрушается при сбое сериализации). Импорт из Python-GUI удалён в G5:
+//! приложение читает только собственный конфиг. G6.5 (переименование
+//! приложения): одноразовая миграция настроек из прежнего имени файла
+//! `shtorm_gui_settings.json` — старый файл только читается и никогда не
+//! удаляется/не изменяется автоматически.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -400,12 +403,28 @@ impl GuiSettings {
     }
 }
 
+/// Имя собственного конфига (G6.5: переименование приложения — новое имя).
+pub const SETTINGS_FILE: &str = "PocketTTS-GUI-Rust.json";
+/// Прежнее имя конфига до переименования приложения (G6.5). Используется
+/// ТОЛЬКО для чтения при миграции; автоматически не удаляется и не меняется.
+pub const LEGACY_SETTINGS_FILE: &str = "shtorm_gui_settings.json";
+
 /// Путь собственного конфига: рядом с exe (портативный стиль).
 pub fn settings_path() -> PathBuf {
     std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|d| d.join("shtorm_gui_settings.json")))
-        .unwrap_or_else(|| PathBuf::from("shtorm_gui_settings.json"))
+        .and_then(|p| p.parent().map(|d| d.join(SETTINGS_FILE)))
+        .unwrap_or_else(|| PathBuf::from(SETTINGS_FILE))
+}
+
+/// Путь прежнего конфига (до переименования приложения, G6.5): тот же
+/// каталог, что и новый конфиг. Читается один раз при старте, если нового
+/// файла ещё нет.
+pub fn legacy_settings_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(LEGACY_SETTINGS_FILE)))
+        .unwrap_or_else(|| PathBuf::from(LEGACY_SETTINGS_FILE))
 }
 
 pub fn load_settings(path: &Path) -> Result<GuiSettings> {
@@ -498,7 +517,7 @@ mod tests {
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
         let d = std::env::temp_dir().join(format!(
-            "shtorm_gui_{}_{}_{}",
+            "pockettts_gui_{}_{}_{}",
             std::process::id(),
             tag,
             nanos

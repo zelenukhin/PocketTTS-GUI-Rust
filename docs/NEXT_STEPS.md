@@ -76,7 +76,7 @@ CUDA-P1/P2A/P2A.1 завершены; следующий — CUDA-P2B тольк
    .partial/диагностических журналов, лог чанков, запрет двух заданий,
    закрытие окна с отменой живого задания; CPU/CUDA × WAV/MP3/Opus, отмена,
    повтор, побитовый GUI==CLI паритет подтверждены (real_matrix-тест,
-   `cargo test -p shtorm-gui --release --lib real_matrix -- --ignored`).
+   `cargo test -p pockettts-gui-rust --release --lib real_matrix -- --ignored`).
 8. ~~G2.1~~ ✅ (2026-11-09): проверка ORT_LOADED до изменения PATH, PATH без
    дублей CUDA-каталогов, откат env при сбое init; FFmpeg-валидация через
    `resolve_ffmpeg` с автопоиском; раздельные пресеты MP3/Opus без неявного

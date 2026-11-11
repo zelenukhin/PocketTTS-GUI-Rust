@@ -1,12 +1,12 @@
-ShtormTTS-GUI — portable Windows x64 build
-==========================================
+PocketTTS-GUI-Rust — portable Windows x64 build
+===============================================
 
-Run: shtorm-gui.exe
+Run: PocketTTS-GUI-Rust.exe
 
 Layout:
   msvcp140.dll, msvcp140_1.dll,
   vcruntime140.dll, vcruntime140_1.dll  MSVC++ redistributable runtime
-  shtorm-gui.exe                       GUI executable
+  PocketTTS-GUI-Rust.exe                 GUI executable
   models/ru-v2-fast, models/ru-v2-slow  ONNX models (FP32 default; also
                                        *_int8.onnx graphs: flow_lm_main_int8,
                                        flow_lm_flow_int8, mimi_decoder_int8 —
@@ -19,7 +19,7 @@ Layout:
   voice/reference.wav                   Voice reference; replace with your own 1-30 s WAV
   input/example.txt                     Example source text
   output/                               Default result directory
-  shtorm_gui_settings.json              Default settings with RELATIVE paths
+  PocketTTS-GUI-Rust.json                Default settings with RELATIVE paths
 
 Important:
   * Relative paths in settings are resolved from the EXE directory, not from
@@ -63,17 +63,17 @@ Diagnostics:
   Diagnostic output is written to stdout/stderr. The GUI is a Windows GUI
   subsystem application (no console window), so redirect the streams to
   capture the output, e.g. in PowerShell:
-      & .\shtorm-gui.exe --portable-check > check.txt 2>&1
+      & .\PocketTTS-GUI-Rust.exe --portable-check > check.txt 2>&1
   or use System.Diagnostics.Process with RedirectStandardOutput/Error.
   Exit codes are preserved (0 OK, 1 check failed, 2 bad arguments).
 
-  shtorm-gui.exe --portable-check
+  PocketTTS-GUI-Rust.exe --portable-check
       Print resolved model / ORT / ffmpeg paths and exit.
-  shtorm-gui.exe --portable-selftest [--device cpu|cuda] [--format wav|mp3|opus]
+  PocketTTS-GUI-Rust.exe --portable-selftest [--device cpu|cuda] [--format wav|mp3|opus]
       Run a short synthesis from the portable directory and exit.
-  shtorm-gui.exe --portable-selftest-batch [--device cpu|cuda]
+  PocketTTS-GUI-Rust.exe --portable-selftest-batch [--device cpu|cuda]
       Run a two-file batch into a new output subdirectory and exit.
-  shtorm-gui.exe --portable-selftest-cancel [--device cpu|cuda]
+  PocketTTS-GUI-Rust.exe --portable-selftest-cancel [--device cpu|cuda]
       Run a multi-chunk job, cancel after the first finished chunk, verify
       that the final file is not published and the draft remains, then re-run
       on the same path and verify completion.

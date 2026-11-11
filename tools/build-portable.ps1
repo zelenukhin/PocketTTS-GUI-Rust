@@ -1,4 +1,4 @@
-# Build a portable ShtormTTS-GUI distribution for Windows x64.
+# Build a portable PocketTTS-GUI-Rust distribution for Windows x64.
 #
 # Safety policy:
 #   * Only the project sources and the explicitly passed destination are touched.
@@ -7,9 +7,13 @@
 #   * If a check fails, the partially created destination is left in place for
 #     inspection; do not reuse it, choose a new path.
 #
+# G6.5: the app is named PocketTTS-GUI-Rust; destination directories must use
+# the new name (e.g. PocketTTS-GUI-Rust-Portable-<date>-<tag>). Destinations
+# still carrying the old ShtormTTS-Portable name are rejected.
+#
 # Example:
 #   powershell -ExecutionPolicy Bypass -File tools\build-portable.ps1 `
-#     -Destination C:\PocketTTS-GUI-Rust\dist\ShtormTTS-Portable-2026-11-09 `
+#     -Destination C:\PocketTTS-GUI-Rust\dist\PocketTTS-GUI-Rust-Portable-2026-11-12 `
 #     -ModelsDir C:\Users\alexa\Downloads\pocket_tts_android\build\onnx `
 #     -Ffmpeg C:\PocketTTS-GUI\ffmpeg\ffmpeg.exe `
 #     -VoiceFile "C:\PocketTTS-GUI\examples\Microsoft Brian Speed 1.wav"
@@ -36,6 +40,11 @@ $dest = [IO.Path]::GetFullPath($Destination).TrimEnd('\')
 
 if (Test-Path -LiteralPath $dest) {
     throw "Destination already exists (refusing to overwrite/clean): $dest"
+}
+# G6.5: не выпускать комплекты под прежним именем приложения
+$destLeaf = Split-Path -Leaf $dest
+if ($destLeaf -like '*ShtormTTS-Portable*') {
+    throw "Destination uses the retired app name: $destLeaf (use PocketTTS-GUI-Rust-Portable-*)"
 }
 if ($dest -ieq $repo -or $dest.StartsWith($repo + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
     throw "Destination must be OUTSIDE the source repository for a true portable test: $dest"
@@ -140,9 +149,9 @@ if (-not (Test-Path -LiteralPath $cargo)) {
 Push-Location $repo
 try {
     if ($Configuration -eq "release") {
-        & $cargo build --release --bin shtorm-gui
+        & $cargo build --release --bin PocketTTS-GUI-Rust
     } else {
-        & $cargo build --bin shtorm-gui
+        & $cargo build --bin PocketTTS-GUI-Rust
     }
     if ($LASTEXITCODE -ne 0) {
         throw "cargo build failed with exit code $LASTEXITCODE"
@@ -150,7 +159,7 @@ try {
 } finally {
     Pop-Location
 }
-$exeSrc = Join-Path $repo ("target\" + $Configuration + "\shtorm-gui.exe")
+$exeSrc = Join-Path $repo ("target\" + $Configuration + "\PocketTTS-GUI-Rust.exe")
 if (-not (Test-Path -LiteralPath $exeSrc -PathType Leaf)) {
     throw "Built GUI exe not found: $exeSrc"
 }
@@ -282,7 +291,7 @@ foreach ($d in @(
 }
 
 # --- binaries ---
-Copy-Verified $exeSrc (Join-Path $dest "shtorm-gui.exe")
+Copy-Verified $exeSrc (Join-Path $dest "PocketTTS-GUI-Rust.exe")
 foreach ($f in $vcFiles) {
     Copy-Verified (Join-Path $vcDir $f) (Join-Path $dest $f)
 }
@@ -327,8 +336,8 @@ if ($VoiceFile) {
 }
 
 # --- settings and examples ---
-Copy-Template "settings.json" "shtorm_gui_settings.json"
-Copy-Template "settings.json" "shtorm_gui_settings.example.json"
+Copy-Template "settings.json" "PocketTTS-GUI-Rust.json"
+Copy-Template "settings.json" "PocketTTS-GUI-Rust.example.json"
 Copy-Template "example.txt" "input\example.txt"
 Copy-Template "README.txt" "README-PORTABLE.txt"
 Copy-Template "THIRD_PARTY_NOTICES.md" "THIRD_PARTY_NOTICES.md"
@@ -358,9 +367,9 @@ Existing files are never overwritten: rename the output or choose another direct
 
 # --- required files check ---
 $required = @(
-    "shtorm-gui.exe",
-    "shtorm_gui_settings.json",
-    "shtorm_gui_settings.example.json",
+    "PocketTTS-GUI-Rust.exe",
+    "PocketTTS-GUI-Rust.json",
+    "PocketTTS-GUI-Rust.example.json",
     "onnxruntime\cpu\onnxruntime.dll",
     "onnxruntime\cpu\onnxruntime_providers_shared.dll",
     "README-PORTABLE.txt",
@@ -401,9 +410,9 @@ foreach ($rel in $required) {
 }
 
 # --- semantic checks ---
-$exeInfo = Get-Item -LiteralPath (Join-Path $dest "shtorm-gui.exe")
+$exeInfo = Get-Item -LiteralPath (Join-Path $dest "PocketTTS-GUI-Rust.exe")
 if ($exeInfo.Length -lt 1000000) {
-    throw "shtorm-gui.exe looks too small: $($exeInfo.Length) bytes"
+    throw "PocketTTS-GUI-Rust.exe looks too small: $($exeInfo.Length) bytes"
 }
 
 if (-not $SkipModels) {
@@ -431,7 +440,7 @@ if (-not $SkipFfmpeg) {
     $ffmpegVersion = ($ffOut | Select-Object -First 1).ToString()
 }
 
-$settingsText = Get-Content -LiteralPath (Join-Path $dest "shtorm_gui_settings.json") -Raw
+$settingsText = Get-Content -LiteralPath (Join-Path $dest "PocketTTS-GUI-Rust.json") -Raw
 $null = $settingsText | ConvertFrom-Json
 
 # --- manifest ---
@@ -468,7 +477,7 @@ $ortCudaVersion = if (-not $SkipCuda) {
 }
 
 $manifest = [ordered]@{
-    product = "ShtormTTS-GUI portable"
+    product = "PocketTTS-GUI-Rust portable"
     version = $version
     git_commit = $commit
     git_dirty = $gitDirty
@@ -487,7 +496,7 @@ Write-Utf8NoBom $manifestPath (($manifest | ConvertTo-Json -Depth 8) + "`n")
 # --- summary ---
 $allFiles = Get-ChildItem -LiteralPath $dest -Recurse -File
 $totalBytes = ($allFiles | Measure-Object -Property Length -Sum).Sum
-$exeHash = (Get-FileHash -LiteralPath (Join-Path $dest "shtorm-gui.exe") -Algorithm SHA256).Hash
+$exeHash = (Get-FileHash -LiteralPath (Join-Path $dest "PocketTTS-GUI-Rust.exe") -Algorithm SHA256).Hash
 
 Write-Host ""
 Write-Host "PORTABLE BUILD OK"

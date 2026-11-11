@@ -14,7 +14,7 @@ use crate::batch::FileStatus;
 use crate::job::{JobEvent, JobPhase, JobStatus};
 use crate::settings::{
     load_settings, save_settings, settings_path, DeviceChoice, GuiSettings, ModelChoice,
-    OutputFormatChoice,
+    OutputFormatChoice, LEGACY_SETTINGS_FILE,
 };
 
 /// Клик по заголовку свёртки переворачивает ПОЛЕ настроек: состояние хранится
@@ -213,29 +213,94 @@ impl ShtormApp {
     /// Конструктор с явным путём конфига (продакшн — рядом с exe; тесты —
     /// изолированная песочница, т.к. `settings_path()` привязана к
     /// `current_exe` тестового харнесса).
+    ///
+    /// G6.5 (переименование приложения): если нового конфига
+    /// `PocketTTS-GUI-Rust.json` нет, но рядом лежит прежний
+    /// `shtorm_gui_settings.json`, настройки читаются из него и атомарно
+    /// переносятся в новый файл. Прежний файл не удаляется и не изменяется.
+    /// Повреждённый прежний конфиг — защитная политика `Unreadable` без
+    /// перезаписи; повреждённый НОВЫЙ конфиг не подменяется старыми
+    /// настройками.
     fn with_conf_path(conf_path: PathBuf) -> Self {
-        let (settings, settings_load, note) = match load_settings(&conf_path) {
-            Ok(s) => (
-                s,
-                SettingsLoadState::Loaded,
-                format!("настройки загружены: {}", conf_path.display()),
-            ),
-            // Первый запуск: файла нет — это не «повреждённый конфиг»,
-            // автосохранение при закрытии разрешено (создаёт файл).
-            Err(_) if !conf_path.exists() => (
-                GuiSettings::default(),
-                SettingsLoadState::FirstRun,
-                format!(
-                    "настройки не найдены — значения по умолчанию (сохранятся при закрытии): {}",
-                    conf_path.display()
+        // Прежнее имя конфига ищем в том же каталоге (продакшн — каталог exe,
+        // «рядом со старым EXE или новым EXE» — это один и тот же каталог).
+        let legacy_path = conf_path.with_file_name(LEGACY_SETTINGS_FILE);
+        let (settings, settings_load, note, snapshot) = match load_settings(&conf_path) {
+            Ok(s) => {
+                let snapshot = serde_json::to_string_pretty(&s).unwrap_or_default();
+                (
+                    s,
+                    SettingsLoadState::Loaded,
+                    format!("настройки загружены: {}", conf_path.display()),
+                    snapshot,
+                )
+            }
+            // Нового файла нет — до FirstRun проверяем прежний конфиг (G6.5).
+            Err(_) if !conf_path.exists() => match load_settings(&legacy_path) {
+                Ok(s) => {
+                    let snapshot = serde_json::to_string_pretty(&s).unwrap_or_default();
+                    match save_settings(&s, &conf_path) {
+                        Ok(()) => (
+                            s,
+                            SettingsLoadState::Loaded,
+                            format!(
+                                "настройки перенесены из прежнего конфига {} в новый {}; \
+                                 прежний файл оставлен без изменений",
+                                legacy_path.display(),
+                                conf_path.display()
+                            ),
+                            snapshot,
+                        ),
+                        // Перенос не выполнен: настройки работают, ни один конфиг
+                        // не затёрт (атомарная запись не трогает цель при сбое);
+                        // пустой снимок заставит автосохранение при закрытии
+                        // (или ручное сохранение) повторить создание нового файла.
+                        Err(e) => (
+                            s,
+                            SettingsLoadState::Loaded,
+                            format!(
+                                "настройки прочитаны из прежнего конфига {}, но перенос \
+                                 в {} не выполнен ({e:#}); попытка будет повторена \
+                                 при сохранении/закрытии",
+                                legacy_path.display(),
+                                conf_path.display()
+                            ),
+                            String::new(),
+                        ),
+                    }
+                }
+                // Прежнего файла тоже нет — первый запуск.
+                Err(_) if !legacy_path.exists() => (
+                    GuiSettings::default(),
+                    SettingsLoadState::FirstRun,
+                    format!(
+                        "настройки не найдены — значения по умолчанию (сохранятся при закрытии): {}",
+                        conf_path.display()
+                    ),
+                    String::new(),
                 ),
-            ),
+                // Прежний конфиг существует, но не читается: та же защитная
+                // политика Unreadable — автоматически ничего не перезаписывать.
+                Err(e) => (
+                    GuiSettings::default(),
+                    SettingsLoadState::Unreadable,
+                    format!(
+                        "прежний конфиг не прочитан ({e:#}); файл не будет перезаписан \
+                         автоматически: {}",
+                        legacy_path.display()
+                    ),
+                    String::new(),
+                ),
+            },
+            // Новый конфиг существует, но не читается: настройки из прежнего
+            // файла НЕ подставляем молча (G6.5) — политика прежняя.
             Err(e) => (
                 GuiSettings::default(),
                 SettingsLoadState::Unreadable,
                 format!(
                     "настройки не загружены ({e:#}); конфиг не будет перезаписан автоматически"
                 ),
+                String::new(),
             ),
         };
         // G5.2 (визуальный контроль): ни один кадр ещё не нарисован — если
@@ -244,8 +309,9 @@ impl ShtormApp {
         // при theme_dark=true. Помечаем НЕ применённой: первый кадр
         // установит visuals до отрисовки (без вспышки светлой темы).
         let theme_applied = !settings.theme_dark;
-        // G6.2.3: снимок для сравнения «были ли изменения» при закрытии.
-        let settings_snapshot = serde_json::to_string_pretty(&settings).unwrap_or_default();
+        // G6.2.3: снимок для сравнения «были ли изменения» при закрытии
+        // (G6.5: считается в ветках загрузки выше — миграция задаёт его явно).
+        let settings_snapshot = snapshot;
         Self {
             settings,
             log: String::new(),
@@ -309,7 +375,7 @@ impl ShtormApp {
         // относительный путь источника — от каталога exe, не от CWD
         let text_file = crate::resources::resolve_user_path(&s.text_file);
         let thread = std::thread::Builder::new()
-            .name("shtorm-synth".into())
+            .name("pockettts-synth".into())
             .spawn(move || {
                 let result = if batch {
                     let source = text_file.clone();
@@ -1723,8 +1789,7 @@ impl eframe::App for ShtormApp {
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("ShtormTTS").heading().strong());
-                secondary_label(ui, "нативный GUI");
+                ui.label(egui::RichText::new("PocketTTS-GUI-Rust").heading().strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let (badge, color) = match self.settings_load {
                         SettingsLoadState::Loaded => ("настройки загружены", None),
@@ -2821,13 +2886,13 @@ mod tests {
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
         let d = std::env::temp_dir().join(format!(
-            "shtorm_close_{}_{}_{}",
+            "pockettts_close_{}_{}_{}",
             std::process::id(),
             tag,
             nanos
         ));
         std::fs::create_dir_all(&d).unwrap();
-        d.join("shtorm_gui_settings.json")
+        d.join(crate::settings::SETTINGS_FILE)
     }
 
     /// Один headless-кадр машины закрытия: close_requested подаётся через
@@ -2948,6 +3013,124 @@ mod tests {
             "решение отражено в журнале: {}",
             app.log
         );
+    }
+
+    // ===== G6.5: миграция настроек из прежнего имени конфига =====
+
+    /// Песочница миграции: (новый конфиг, прежний конфиг) в одном каталоге.
+    fn migration_sandbox(tag: &str) -> (PathBuf, PathBuf) {
+        let conf = close_sandbox(tag);
+        let legacy = conf.with_file_name(crate::settings::LEGACY_SETTINGS_FILE);
+        (conf, legacy)
+    }
+
+    /// G6.5: нового конфига нет, прежний валиден — старт переносит настройки
+    /// в новый JSON (атомарная запись), прежний файл байт-в-байт не меняется
+    /// и не удаляется; значения модели FP32/INT8/устройства/unknown-ключи
+    /// сохраняются; закрытие без правок не переписывает новый файл повторно;
+    /// повторный старт читает уже новый файл (миграция не повторяется).
+    #[test]
+    fn migration_reads_legacy_creates_new_keeps_legacy_intact() {
+        let (conf, legacy) = migration_sandbox("mig_ok");
+        let legacy_json = r#"{
+            "model": "SlowInt8",
+            "device": "Cuda",
+            "temperature": 0.45,
+            "theme_dark": false,
+            "future_key": {"nested": [1, 2]}
+        }"#;
+        std::fs::write(&legacy, legacy_json).unwrap();
+        let legacy_before = std::fs::read(&legacy).unwrap();
+
+        let mut app = ShtormApp::with_conf_path(conf.clone());
+        assert_eq!(app.settings_load, crate::app::SettingsLoadState::Loaded);
+        assert_eq!(app.settings.model, ModelChoice::SlowInt8);
+        assert_eq!(app.settings.device, DeviceChoice::Cuda);
+        assert!(app.settings.extra.contains_key("future_key"));
+        assert!(app.load_note.contains("перенесены"), "{}", app.load_note);
+
+        assert!(conf.is_file(), "новый конфиг создан сразу при старте");
+        let migrated = load_settings(&conf).unwrap();
+        assert_eq!(migrated.model, ModelChoice::SlowInt8);
+        assert_eq!(migrated.temperature, 0.45);
+        assert_eq!(
+            migrated.extra.get("future_key"),
+            app.settings.extra.get("future_key"),
+            "unknown-ключ пережил миграцию"
+        );
+        assert_eq!(
+            std::fs::read(&legacy).unwrap(),
+            legacy_before,
+            "прежний файл не тронут"
+        );
+
+        // закрытие без правок не переписывает новый файл
+        let new_before = std::fs::read(&conf).unwrap();
+        let cmds = close_frame(&mut app, true);
+        assert!(has_cancel_close(&cmds) && has_close(&cmds));
+        assert_eq!(std::fs::read(&conf).unwrap(), new_before);
+        assert_eq!(std::fs::read(&legacy).unwrap(), legacy_before);
+
+        // повторный старт — из нового файла, без повторной миграции
+        let app2 = ShtormApp::with_conf_path(conf.clone());
+        assert_eq!(app2.settings_load, crate::app::SettingsLoadState::Loaded);
+        assert_eq!(app2.settings.model, ModelChoice::SlowInt8);
+        assert!(!app2.load_note.contains("перенесены"), "{}", app2.load_note);
+    }
+
+    /// G6.5: прежний конфиг повреждён — та же защитная политика Unreadable:
+    /// автосохранение при закрытии пропускается, ни прежний, ни новый файл
+    /// не создаются/не меняются.
+    #[test]
+    fn migration_legacy_corrupt_is_unreadable_and_never_overwritten() {
+        let (conf, legacy) = migration_sandbox("mig_corrupt_legacy");
+        std::fs::write(&legacy, b"{ broken !!!").unwrap();
+        let legacy_before = std::fs::read(&legacy).unwrap();
+        let mut app = ShtormApp::with_conf_path(conf.clone());
+        assert_eq!(app.settings_load, crate::app::SettingsLoadState::Unreadable);
+        assert!(app.load_note.contains("прежний"), "{}", app.load_note);
+        let cmds = close_frame(&mut app, true);
+        assert!(has_cancel_close(&cmds) && has_close(&cmds));
+        assert!(
+            !conf.exists(),
+            "новый файл не создаётся из повреждённых данных"
+        );
+        assert_eq!(std::fs::read(&legacy).unwrap(), legacy_before);
+    }
+
+    /// G6.5: новый конфиг существует, но повреждён — молчаливой подмены
+    /// настройками из прежнего файла НЕТ (Unreadable), оба файла целы.
+    #[test]
+    fn corrupt_new_config_is_not_replaced_by_legacy() {
+        let (conf, legacy) = migration_sandbox("mig_corrupt_new");
+        std::fs::write(&conf, b"{ broken new !!!").unwrap();
+        std::fs::write(&legacy, r#"{"temperature": 0.31, "model": "FastInt8"}"#).unwrap();
+        let (new_before, legacy_before) = (
+            std::fs::read(&conf).unwrap(),
+            std::fs::read(&legacy).unwrap(),
+        );
+        let mut app = ShtormApp::with_conf_path(conf.clone());
+        assert_eq!(app.settings_load, crate::app::SettingsLoadState::Unreadable);
+        assert_eq!(
+            app.settings.model,
+            GuiSettings::default().model,
+            "дефолт, а не значения прежнего файла"
+        );
+        assert_ne!(app.settings.model, ModelChoice::FastInt8);
+        let cmds = close_frame(&mut app, true);
+        assert!(has_cancel_close(&cmds) && has_close(&cmds));
+        assert_eq!(std::fs::read(&conf).unwrap(), new_before);
+        assert_eq!(std::fs::read(&legacy).unwrap(), legacy_before);
+    }
+
+    /// G6.5: ни нового, ни прежнего конфига — прежний FirstRun (создание
+    /// нового файла при закрытии разрешено, как до переименования).
+    #[test]
+    fn no_new_and_no_legacy_config_is_first_run() {
+        let (conf, legacy) = migration_sandbox("mig_firstrun");
+        let app = ShtormApp::with_conf_path(conf.clone());
+        assert_eq!(app.settings_load, crate::app::SettingsLoadState::FirstRun);
+        assert!(!conf.exists() && !legacy.exists());
     }
 
     /// A5: ошибка записи — окно остаётся живым (без Close), существующий

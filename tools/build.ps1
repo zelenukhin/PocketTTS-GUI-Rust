@@ -1,4 +1,4 @@
-# Сборка ShtormTTS-Windows (release) + юнит-тесты.
+# Сборка PocketTTS-GUI-Rust (release) + юнит-тесты.
 # Никаких системных изменений: только cargo в каталоге проекта.
 param(
     [switch]$SkipTests

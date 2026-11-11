@@ -1,10 +1,10 @@
 ﻿# G6.1.1 headless GPU acceptance: real CUDA synthesis through the EXE
 # diagnostic modes, in the same isolated sandbox style as the CLI smoke.
 $ErrorActionPreference = 'Stop'
-$exeSrc = 'C:\PocketTTS-GUI-Rust\ShtormTTS-Windows\target\release\shtorm-gui.exe'
-$sandbox = Join-Path $env:TEMP ("shtorm_g611_headless_" + $PID + "_" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+$exeSrc = 'C:\PocketTTS-GUI-Rust\ShtormTTS-Windows\target\release\PocketTTS-GUI-Rust.exe'
+$sandbox = Join-Path $env:TEMP ("pockettts_g611_headless_" + $PID + "_" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
 New-Item -ItemType Directory -Path $sandbox | Out-Null
-$exe = Join-Path $sandbox 'shtorm-gui.exe'
+$exe = Join-Path $sandbox 'PocketTTS-GUI-Rust.exe'
 Copy-Item -LiteralPath $exeSrc -Destination $exe
 $voice = 'C:/PocketTTS-GUI/examples/Василий Леванов F5-TTS3.wav'
 $onnxBase = 'C:/Users/alexa/Downloads/pocket_tts_android/build/onnx'
@@ -38,7 +38,7 @@ $settingsJson = @"
   "theme_dark": true
 }
 "@
-[IO.File]::WriteAllText((Join-Path $sandbox 'shtorm_gui_settings.json'), $settingsJson)
+[IO.File]::WriteAllText((Join-Path $sandbox 'PocketTTS-GUI-Rust.json'), $settingsJson)
 Write-Output ("SANDBOX: {0}" -f $sandbox)
 
 $script:failures = 0

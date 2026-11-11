@@ -2,7 +2,7 @@ Microsoft Visual C++ Redistributable runtime notice
 ===================================================
 
 This package bundles the following Microsoft Visual C++ Redistributable
-runtime DLLs next to shtorm-gui.exe:
+runtime DLLs next to PocketTTS-GUI-Rust.exe:
 
   msvcp140.dll
   msvcp140_1.dll

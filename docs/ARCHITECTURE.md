@@ -1,4 +1,4 @@
-# ARCHITECTURE — ShtormTTS-Windows (нативный движок, этап подготовки)
+# ARCHITECTURE — PocketTTS-GUI-Rust (нативный движок и GUI; ранее ShtormTTS-Windows)
 
 ## Слои
 

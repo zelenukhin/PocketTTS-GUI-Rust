@@ -492,7 +492,7 @@ pub fn setup_ort_environment(s: &GuiSettings) -> Result<()> {
         }
     }
     std::env::set_var("ORT_DYLIB_PATH", &dll);
-    if !ort::init().with_name("shtorm-gui").commit() {
+    if !ort::init().with_name("PocketTTS-GUI-Rust").commit() {
         // init не состоялся — не оставляем процесс с чужим DLL/путём
         match old_dylib {
             Some(v) => std::env::set_var("ORT_DYLIB_PATH", v),
@@ -2727,8 +2727,8 @@ mod tests {
     // ============ реальные прогоны (нужны модели + ORT DLL + ffmpeg) ============
     // Запускать ПО ОДНОМУ устройству на процесс (ORT грузится в процесс
     // один раз; смена CPU/CUDA внутри процесса невозможна — честная ошибка):
-    //   cargo test -p shtorm-gui --release --lib real_matrix -- --ignored --nocapture
-    //   SHTORM_GUI_TEST_DEVICE=cuda cargo test -p shtorm-gui --release --lib real_matrix -- --ignored --nocapture
+    //   cargo test -p pockettts-gui-rust --release --lib real_matrix -- --ignored --nocapture
+    //   SHTORM_GUI_TEST_DEVICE=cuda cargo test -p pockettts-gui-rust --release --lib real_matrix -- --ignored --nocapture
 
     const REAL_ONNX_BASE: &str = r"C:\Users\alexa\Downloads\pocket_tts_android\build\onnx";
     const REAL_VOICE: &str = r"C:\PocketTTS-GUI\examples\Microsoft Brian Speed 1.wav";
@@ -2878,7 +2878,7 @@ mod tests {
     /// 2/2 файла синтезированы, WAV валидны, и — ГЛАВНОЕ — выход ОТЛИЧАЕТСЯ
     /// от FP32 побайтово (доказывает, что INT8-графы реально загружены, а
     /// не случился молчаливый откат на FP32). CPU.
-    /// Запуск: `cargo test -p shtorm-gui --release --lib real_batch_cpu_int8
+    /// Запуск: `cargo test -p pockettts-gui-rust --release --lib real_batch_cpu_int8
     /// -- --ignored --nocapture`.
     #[test]
     #[ignore = "реальный синтез: модели + ORT DLL"]
@@ -2951,7 +2951,7 @@ mod tests {
     /// включённой перезаписи, отмена до публикации, повтор после отмены.
     /// Старый файл заменяется только после успешного синтеза; при отмене
     /// остаётся побайтово неизменным, `.partial` — для диагностики.
-    /// Запуск: `cargo test -p shtorm-gui --release --lib
+    /// Запуск: `cargo test -p pockettts-gui-rust --release --lib
     /// real_overwrite_wav -- --ignored --nocapture` (для CUDA:
     /// SHTORM_GUI_TEST_DEVICE=cuda).
     #[test]
@@ -3440,7 +3440,7 @@ mod tests {
     /// G4.1: побитовый WAV-паритет GUI == CLI для НЕстандартных EOS-настроек
     /// (порог −1 и хвосты 0/0; затем None/None). Дефолтный −4/5/3 паритет
     /// проверяет real_matrix_device. Реальные модели + ORT (CPU).
-    /// cargo test -p shtorm-gui --release --lib real_eos_parity -- --ignored --nocapture
+    /// cargo test -p pockettts-gui-rust --release --lib real_eos_parity -- --ignored --nocapture
     #[test]
     #[ignore = "реальный синтез: модели + ORT DLL; CPU"]
     fn real_eos_parity() {
@@ -3636,7 +3636,7 @@ mod tests {
 
     // ===== G6.1: реальный пакетный CUDA на постоянном пуле =====
     // Запуск (по одному на процесс; ORT грузится один раз):
-    //   SHTORM_GUI_TEST_DEVICE=cuda cargo test -p shtorm-gui --release --lib \
+    //   SHTORM_GUI_TEST_DEVICE=cuda cargo test -p pockettts-gui-rust --release --lib \
     //     real_batch_cuda_pool -- --ignored --nocapture --test-threads=1
 
     /// Параметры эталона P2B.3: slow FP32, TF32=0, I/O binding on (дефолт),

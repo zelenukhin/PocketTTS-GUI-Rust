@@ -1,6 +1,6 @@
 [package]
-name = "shtorm-gui"
-description = "ShtormTTS native GUI (eframe/egui) — форма, валидация, настройки, фоновый синтез (G2)"
+name = "pockettts-gui-rust"
+description = "PocketTTS-GUI-Rust — нативный GUI (eframe/egui): форма, валидация, настройки, фоновый синтез (G2)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -21,11 +21,11 @@ shtorm-engine = { path = "../shtorm-engine" }
 ort = { version = "=2.0.0-rc.11", default-features = false, features = ["load-dynamic"] }
 
 [lib]
-name = "shtorm_gui"
+name = "pockettts_gui_rust"
 path = "src/lib.rs"
 
 [[bin]]
-name = "shtorm-gui"
+name = "PocketTTS-GUI-Rust"
 path = "src/main.rs"
 
 [target.'cfg(windows)'.dependencies]

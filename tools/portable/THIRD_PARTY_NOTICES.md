@@ -1,9 +1,9 @@
-# Third-party notices — ShtormTTS-GUI portable build
+# Third-party notices — PocketTTS-GUI-Rust portable build
 
 This package is assembled locally from the project sources and the following
 third-party components. It is not published to the Internet.
 
-## ShtormTTS-GUI (this project)
+## PocketTTS-GUI-Rust (this project)
 
 License: GNU General Public License v3.0 only (GPL-3.0-only).
 Source: the project repository from which this package was built.
@@ -30,7 +30,7 @@ Agreement and the cuDNN Software License Agreement. See
 ## Microsoft Visual C++ Redistributable runtime
 
 Files: `msvcp140.dll`, `msvcp140_1.dll`, `vcruntime140.dll`,
-`vcruntime140_1.dll` next to `shtorm-gui.exe`.
+`vcruntime140_1.dll` next to `PocketTTS-GUI-Rust.exe`.
 These are Microsoft redistributable components, included so that a clean
 Windows installation can start the application without a separately installed
 VC++ Redistributable. See `LICENSES/MSVC-RUNTIME-NOTICE.txt`.

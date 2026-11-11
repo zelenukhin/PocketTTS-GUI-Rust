@@ -7,7 +7,7 @@
 //! - Основной GUI-процесс — ДИСПЕТЧЕР: владеет планом пакета, preflight и
 //!   ОБЩЕЙ очередью файлов; сам ONNX не загружает (CUDA-контекстов в GUI
 //!   процессе нет).
-//! - Два ДОЧЕРНИХ процесса — тот же `shtorm-gui.exe` во внутреннем режиме
+//! - Два ДОЧЕРНИХ процесса — тот же `PocketTTS-GUI-Rust.exe` во внутреннем режиме
 //!   `--internal-batch-worker <имя_канала>` (окна нет, конфигурация приходит
 //!   по IPC; exe-относительный резолвер портативной сборки работает
 //!   идентично — это тот же exe). Каждый создаёт 2 постоянных `Pocket`
@@ -1173,7 +1173,7 @@ pub fn connect_child(server: PipeServer, child: std::process::Child) -> Result<S
 /// Тестовый спавнер (только lib-тесты): дочерний worker-процесс — ТОТ ЖЕ
 /// тестовый бинарник, харнесс которого запускает единственный child-entry
 /// тест (env SHTORM_G62_TEST_PIPE). Нужен real-тестам гибрида внутри
-/// `cargo test` (там current_exe — харнесс, а не shtorm-gui.exe).
+/// `cargo test` (там current_exe — харнесс, а не PocketTTS-GUI-Rust.exe).
 #[cfg(test)]
 pub fn spawn_child_via_test_harness(job: &ChildJobGuard, ci: usize) -> Result<SpawnedChild> {
     let server = PipeServer::create_unique(&format!("g62j{ci}"))?;

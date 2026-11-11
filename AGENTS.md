@@ -1,8 +1,11 @@
 # AGENTS.md — постоянные инструкции для агентов ZCode в этом проекте
 
-Проект: `C:\PocketTTS-GUI-Rust\ShtormTTS-Windows` — нативный Windows x64
-GUI для Pocket-TTS на Rust. Оперативное состояние — **HANDOFF.md** (читать
-первым). Этот файл — только постоянные правила.
+Проект: приложение **PocketTTS-GUI-Rust** (полное переименование из
+ShtormTTS — G6.5) — нативный Windows x64
+GUI для Pocket-TTS на Rust; репозиторий —
+`C:\PocketTTS-GUI-Rust\ShtormTTS-Windows` (каталог пока носит прежнее имя —
+см. план миграции в HANDOFF.md, G6.5). Оперативное состояние — **HANDOFF.md**
+(читать первым). Этот файл — только постоянные правила.
 
 ## Назначение проекта
 
@@ -153,10 +156,13 @@ GUI для Pocket-TTS на Rust. Оперативное состояние — *
   каталогов (`create_dir_all_no_reparse` — без следования по ссылкам).
   Входные тексты, WAV-голос, модели и настройки замене не подлежат.
 - Другая разрешённая замена — собственный конфиг GUI
-  `shtorm_gui_settings.json` (atomic: unique tmp + `MoveFileExW
+  `PocketTTS-GUI-Rust.json` (atomic: unique tmp + `MoveFileExW
   REPLACE_EXISTING|WRITE_THROUGH`; G6.2.3: автосохранение при штатном
   закрытии окна; непрочитанный при старте конфиг автоматически НЕ
-  перезаписывается).
+  перезаписывается; G6.5: при отсутствии нового файла настройки один раз
+  переносятся из прежнего `shtorm_gui_settings.json` — он только читается,
+  не удаляется и не изменяется; повреждённый новый конфиг не подменяется
+  старым).
 - **G6.2.3 — окна консоли**: release-GUI — Windows GUI-подсистема;
   консольные дочерние процессы (`ffmpeg`, `nvidia-smi`) спавнятся через
   `app_core::hide_console()` (CREATE_NO_WINDOW), дочерние worker-процессы —

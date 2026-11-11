@@ -6,14 +6,14 @@
 #   3. `--portable-selftest-hybrid` runs a REAL full hybrid batch: 2 child
 #      processes, 4 workers, Named Pipe IPC, 6/6 files published (fake engine
 #      writes real WAVs through the real sinks; ONNX/CUDA are not touched).
-#   4. No child shtorm-gui processes are left behind (count before/after).
+#   4. No child PocketTTS-GUI-Rust processes are left behind (count before/after).
 # Isolation: sandbox with its own copy of the exe and settings; only our own
 # processes are started/stopped (by PID).
 $ErrorActionPreference = 'Stop'
-$exeSrc = 'C:\PocketTTS-GUI-Rust\ShtormTTS-Windows\target\release\shtorm-gui.exe'
-$sandbox = Join-Path $env:TEMP ("shtorm_g62_smoke_" + $PID + "_" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+$exeSrc = 'C:\PocketTTS-GUI-Rust\ShtormTTS-Windows\target\release\PocketTTS-GUI-Rust.exe'
+$sandbox = Join-Path $env:TEMP ("pockettts_g62_smoke_" + $PID + "_" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
 New-Item -ItemType Directory -Path $sandbox | Out-Null
-$exe = Join-Path $sandbox 'shtorm-gui.exe'
+$exe = Join-Path $sandbox 'PocketTTS-GUI-Rust.exe'
 Copy-Item -LiteralPath $exeSrc -Destination $exe
 $voice = 'C:/PocketTTS-GUI/examples/Microsoft Brian Speed 1.wav'
 $onnxBase = 'C:/Users/alexa/Downloads/pocket_tts_android/build/onnx'
@@ -44,11 +44,11 @@ $settingsJson = @"
   "theme_dark": true
 }
 "@
-[IO.File]::WriteAllText((Join-Path $sandbox 'shtorm_gui_settings.json'), $settingsJson)
+[IO.File]::WriteAllText((Join-Path $sandbox 'PocketTTS-GUI-Rust.json'), $settingsJson)
 Write-Output ("SANDBOX: {0}" -f $sandbox)
 
 function Get-WorkerCount {
-    $procs = Get-Process -Name 'shtorm-gui' -ErrorAction SilentlyContinue
+    $procs = Get-Process -Name 'PocketTTS-GUI-Rust' -ErrorAction SilentlyContinue
     return @($procs).Count
 }
 

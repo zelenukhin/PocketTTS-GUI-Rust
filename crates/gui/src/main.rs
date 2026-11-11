@@ -1,6 +1,6 @@
-//! ShtormTTS GUI. Кириллица: подключаем системный шрифт Segoe UI
+//! PocketTTS-GUI-Rust. Кириллица: подключаем системный шрифт Segoe UI
 //! (есть на любой Windows) с приоритетом — гарант корректного отображения.
-//! Логика (форма/настройки/задание синтеза) — в библиотеке shtorm_gui.
+//! Логика (форма/настройки/задание синтеза) — в библиотеке pockettts_gui_rust.
 //!
 //! G4: диагностические режимы портативной сборки:
 //! `--portable-check`, `--portable-selftest`, `--portable-selftest-batch`,
@@ -8,7 +8,7 @@
 //! `execute_job`/`execute_batch`, что и GUI, и не заменяют интерактивную
 //! проверку окна.
 //!
-//! G6.1.1: диспетчеризация аргументов строго проверяется (`shtorm_gui::cli`)
+//! G6.1.1: диспетчеризация аргументов строго проверяется (`pockettts_gui_rust::cli`)
 //! — неизвестный/повторный/некорректный аргумент завершает процесс с кодом 2
 //! и diagnostic-сообщением, окно НЕ открывается (раньше опечатка во флаге
 //! молча запускала GUI).
@@ -31,14 +31,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use shtorm_gui::cli::{parse_cli_args, usage_text, CliCommand};
-use shtorm_gui::job::{
+use pockettts_gui_rust::cli::{parse_cli_args, usage_text, CliCommand};
+use pockettts_gui_rust::job::{
     execute_batch, execute_job, resolve_model_dir, resolve_ort_dylib, JobConfig, JobEvent,
     JobStatus,
 };
-use shtorm_gui::resources;
-use shtorm_gui::settings::{
-    load_settings, settings_path, DeviceChoice, GuiSettings, OutputFormatChoice,
+use pockettts_gui_rust::resources;
+use pockettts_gui_rust::settings::{
+    legacy_settings_path, load_settings, settings_path, DeviceChoice, GuiSettings,
+    OutputFormatChoice,
 };
 
 const FALLBACK_TEXT: &str =
@@ -61,9 +62,9 @@ fn cli_error_output(e: &str, usage: &str) {
         let no_stderr = stderr_handle.is_null() || stderr_handle == INVALID_HANDLE_VALUE;
         if no_stderr {
             let text = format!(
-                "ShtormTTS: ошибка аргументов командной строки.\n\n{e}\n\nПолная справка: shtorm-gui.exe --help"
+                "PocketTTS-GUI-Rust: ошибка аргументов командной строки.\n\n{e}\n\nПолная справка: PocketTTS-GUI-Rust.exe --help"
             );
-            let caption = "ShtormTTS — неверные аргументы";
+            let caption = "PocketTTS-GUI-Rust — неверные аргументы";
             let wide =
                 |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
             let (wt, wc) = (wide(&text), wide(caption));
@@ -109,7 +110,7 @@ fn main() -> eframe::Result<()> {
         // открывается: выход до eframe::run_native, конфигурация — по IPC.
         #[cfg(windows)]
         CliCommand::InternalBatchWorker(pipe) => {
-            std::process::exit(shtorm_gui::hybrid::worker_main(&pipe))
+            std::process::exit(pockettts_gui_rust::hybrid::worker_main(&pipe))
         }
         #[cfg(not(windows))]
         CliCommand::InternalBatchWorker(_) => {
@@ -123,24 +124,24 @@ fn main() -> eframe::Result<()> {
     // мониторе не растягивается на весь экран, min_inner_size уменьшается
     // на маленьких дисплеях. Позиционирование — однократно в creation
     // callback (см. window.rs), без resize-циклов в update().
-    let plan = shtorm_gui::window::initial_plan();
+    let plan = pockettts_gui_rust::window::initial_plan();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(plan.inner_size)
             .with_min_inner_size(plan.min_inner_size)
-            .with_title("ShtormTTS — нативный GUI"),
+            .with_title("PocketTTS-GUI-Rust"),
         ..Default::default()
     };
     eframe::run_native(
-        "ShtormTTS",
+        "PocketTTS-GUI-Rust",
         options,
         Box::new(|cc| {
             install_cyrillic_fonts(&cc.egui_ctx);
             // Окно ещё скрыто (eframe показывает его после первого кадра):
             // переносим на монитор запуска и выравниваем размер до первого
             // отображения — без мерцания и повторных подстроек.
-            shtorm_gui::window::place_on_launch_monitor(cc);
-            Ok(Box::new(shtorm_gui::app::ShtormApp::new()))
+            pockettts_gui_rust::window::place_on_launch_monitor(cc);
+            Ok(Box::new(pockettts_gui_rust::app::ShtormApp::new()))
         }),
     )
 }
@@ -164,7 +165,15 @@ fn load_portable_settings() -> Result<GuiSettings, String> {
     if path.is_file() {
         load_settings(&path).map_err(|e| format!("настройки {}: {e:#}", path.display()))
     } else {
-        Ok(GuiSettings::default())
+        // G6.5: нового конфига нет — диагностика может читать прежний файл
+        // (только чтение; миграцию выполняет GUI при старте). Повреждённый
+        // прежний конфиг — честная ошибка, дефолты молча не подставляем.
+        let legacy = legacy_settings_path();
+        if legacy.is_file() {
+            load_settings(&legacy).map_err(|e| format!("настройки {}: {e:#}", legacy.display()))
+        } else {
+            Ok(GuiSettings::default())
+        }
     }
 }
 
@@ -266,7 +275,7 @@ fn portable_selftest(args: &[String], batch: bool) -> i32 {
     }
 
     let result = if batch {
-        let src = std::env::temp_dir().join(format!("shtorm_portable_batch_{stamp}"));
+        let src = std::env::temp_dir().join(format!("pockettts_portable_batch_{stamp}"));
         if let Err(e) = std::fs::create_dir_all(src.join("sub")) {
             println!("BATCH SOURCE ERROR: {}: {e}", src.display());
             return 2;
@@ -346,7 +355,7 @@ fn portable_selftest_hybrid(args: &[String]) -> i32 {
     // Путь гибрида включается для пакетного CUDA; fake-движок GPU не трогает.
     s.device = DeviceChoice::Cuda;
     s.device_id = 0;
-    s.batch_cuda_mode = shtorm_gui::settings::BatchCudaMode::MaxSpeed;
+    s.batch_cuda_mode = pockettts_gui_rust::settings::BatchCudaMode::MaxSpeed;
     s.clamped();
     let text = std::fs::read_to_string(resources::resolve_user_path(&s.text_file))
         .unwrap_or_else(|_| FALLBACK_TEXT.to_string());
@@ -356,7 +365,7 @@ fn portable_selftest_hybrid(args: &[String]) -> i32 {
         println!("OUTPUT DIR ERROR: {}: {e}", out_root.display());
         return 2;
     }
-    let src = std::env::temp_dir().join(format!("shtorm_portable_hybrid_{stamp}"));
+    let src = std::env::temp_dir().join(format!("pockettts_portable_hybrid_{stamp}"));
     if let Err(e) = std::fs::create_dir_all(src.join("sub")) {
         println!("HYBRID SOURCE ERROR: {}: {e}", src.display());
         return 2;

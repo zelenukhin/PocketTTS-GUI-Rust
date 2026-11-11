@@ -1,19 +1,20 @@
 # HANDOFF.md — оперативный снимок проекта (читать первым вместе с AGENTS.md)
 
-- **Дата обновления**: 2026-11-11 (G6.4: адаптивный GUI — окно по рабочей
-  области/DPI, прокрутка, 2→1 колонки, закреплённый низ; затем
-  G6.4-compact — компактная типографика Python-масштаба и строго
-  вертикальный блок «Модель и устройство» — отчёт
-  `docs/G6_4_RESPONSIVE_GUI.md`; ранее G6.3 — INT8-модели v2,
-  G6.2.3 — автосохранение + GUI без консоли, G6.2.2a — IPC hardening,
-  G6.2.1 — жизненный цикл гибрида, G6.2 — гибридный пакетный CUDA 2×2;
-  G6.1.2 — запрет повторных CLI-опций).
+- **Дата обновления**: 2026-11-12 (G6.5: полное переименование приложения в
+  **PocketTTS-GUI-Rust** — exe, Cargo-крейт, заголовки GUI, файл настроек с
+  миграцией, portable-шаблоны/скрипты, документация; названия моделей
+  Shtorm-v2 и каталогов движка не менялись). Ранее 2026-11-11 (G6.4 —
+  адаптивный GUI; G6.4-compact — типографика Python-масштаба — отчёт
+  `docs/G6_4_RESPONSIVE_GUI.md`; G6.3 — INT8-модели v2, G6.2.3 —
+  автосохранение + GUI без консоли, G6.2.2a — IPC hardening, G6.2.1 —
+  жизненный цикл гибрида, G6.2 — гибридный пакетный CUDA 2×2; G6.1.2 —
+  запрет повторных CLI-опций).
 - **HEAD**: только из Git (`git log -1 --oneline`), не из этого файла.
-- **Бэкап на NAS (верифицирован, сделан ПЕРЕД типографикой-13 G6.4,
-  2026-11-11 20:30)**: полный архив HEAD `045f957` (G6.4-compact) —
-  `\DISKSTATION\Ableton 2\Temp2\ShtormTTS-Windows-full-045f957-20261111-203027.zip`,
-  SHA256 `10EC95F0175DDBC0F2A39EC25002D37E4F0D0CB0301C9907116BC5D4E5A28BF0`,
-  171/171 blob совпадают. Ранее: `e03342f`, `bb2ea85`, `b868c1c`,
+- **Бэкап на NAS (верифицирован, сделан ПЕРЕД переименованием G6.5,
+  2026-11-12 01:46)**: полный архив HEAD `3d30692` (G6.4-type-e03342f) —
+  `\\DISKSTATION\Ableton 2\Temp2\ShtormTTS-Windows-full-3d30692-20261112-014608.zip`,
+  SHA256 `3A8FB5F513AFB63DAE9DDFAE18B8F66F8D591F43320CFDC47D166E85EA44551D`,
+  171/171 blob совпадают. Ранее: `045f957`, `e03342f`, `bb2ea85`, `b868c1c`,
   `af005f7`; прежние архивы не тронуты.
 - **Прежний бэкап (G6.4-fix)**: полный архив HEAD `e03342f` —
   `\\DISKSTATION\Ableton 2\Temp2\ShtormTTS-Windows-full-e03342f-20261111-190125.zip`,
@@ -26,7 +27,7 @@
 
 ## Текущий функционал
 
-Нативный Windows x64 GUI (eframe/egui) для синтеза аудиокниг моделями
+нативный Windows x64 GUI (eframe/egui) для синтеза аудиокниг моделями
 Shtorm-PocketTTS-RU v2 fast/slow (ONNX, CPU и CUDA RTX 3060): FP32 (режим
 по умолчанию, поведение побитово неизменно) и явный выбор INT8
 (динамически-квантованные main/flow/decoder + всегда-FP32 encoder/text,
@@ -36,9 +37,62 @@ WAV/MP3/Opus без накопления аудио в памяти, одино�
 режим, портативная сборка без установки (модели/ORT/ffmpeg/VC++ runtime),
 настраиваемые EOS (−4/5/3 teratts-android по умолчанию), явный флаг
 перезаписи с атомарной заменой, тёмная тема. Приложение читает только
-свой `shtorm_gui_settings.json` (импорта Python-настроек нет).
+свой `PocketTTS-GUI-Rust.json` (импорта Python-настроек нет; настройки из
+прежнего `shtorm_gui_settings.json` переносятся один раз при старте —
+G6.5).
 
-## G6.4 — что сделано (текущий этап)
+## G6.5 — что сделано (текущий этап: переименование в PocketTTS-GUI-Rust)
+
+- **EXE/крейт**: `crates/gui` — package `pockettts-gui-rust`, lib
+  `pockettts_gui_rust`, bin `PocketTTS-GUI-Rust` → собирается
+  **`target\release\PocketTTS-GUI-Rust.exe`** (второго EXE под старым
+  именем нет). Дочерние процессы гибрида спавнятся через `current_exe()`
+  (как и раньше) — переименование не затронуло Named Pipes/Job
+  Object/watchdog. ORT env name — `PocketTTS-GUI-Rust`.
+- **GUI**: заголовок окна `eframe::run_native`/`ViewportBuilder` и верхняя
+  панель — `PocketTTS-GUI-Rust` (подпись «нативный GUI» убрана по ТЗ);
+  MessageBox об ошибках аргументов, справка `--help`, имя потока синтеза
+  `pockettts-synth`. Иконка/компоновка G6.4 не менялись.
+- **Файл настроек**: `PocketTTS-GUI-Rust.json` рядом с exe. Миграция
+  (`app.rs::with_conf_path`): нового файла нет + есть прежний
+  `shtorm_gui_settings.json` (тот же каталог) → чтение прежнего, перенос
+  атомарной записью в новый (unknown-ключи сохраняются), прежний файл НЕ
+  удаляется/не изменяется; повреждённый прежний → защитная политика
+  `Unreadable` (ничего не перезаписывается); повреждённый НОВЫЙ не
+  подменяется старыми настройками; сбой переноса → диагностика в
+  `load_note`, повтор при сохранении/закрытии (пустой снимок).
+  Диагностические `--portable-*` читают прежний файл только чтением.
+  Внутренние ключи JSON (`temperature`, `model`, `device`, …) не менялись.
+- **Portable**: новые комплекты — каталоги `PocketTTS-GUI-Rust-Portable-*`;
+  `build-portable.ps1` отвергает destination с именем `ShtormTTS-Portable*`,
+  кладёт `PocketTTS-GUI-Rust.exe` + `PocketTTS-GUI-Rust.json` (+example),
+  manifest `product = "PocketTTS-GUI-Rust portable"`. Прежние комплекты
+  (`g62/g623/g63/…`) — исторические артефакты, не переименовывались.
+  **Полный portable НЕ пересобирался** (по ТЗ — после проверки EXE
+  пользователем).
+- **Скрипты/документация**: smoke `g611/g612/g62` и headless-gpu — новое
+  имя EXE/настроек/процесса (`Get-Process PocketTTS-GUI-Rust`); README,
+  portable-шаблоны (README-PORTABLE/NOTICES), AGENTS.md, актуальные разделы
+  docs/ — новое имя; README один раз отмечает прежнее имя
+  ShtormTTS-Windows. Исторические отчёты этапов (G6_*.md, CUDA_PROFILE_*,
+  SAFETY_AUDIT, записи приёмок прежних комплектов) не переписывались.
+- **Не переименовано (осознанно)**: модели `Shtorm-v2 Fast/Slow` и их
+  каталоги `ru-v2-fast|slow`; крейт `shtorm-engine` (движок, не
+  приложение); диагностические env-переменные `SHTORM_*`
+  (`SHTORM_GUI_TEST_DEVICE`, `SHTORM_G62_FAKE`, `SHTORM_CUDA_IO_BINDING`,
+  `SHTORM_GUI_BATCH_POOL`) — внутренние, CLI-флаги при этом не содержат
+  имени приложения; рабочий каталог репозитория
+  `C:\PocketTTS-GUI-Rust\ShtormTTS-Windows` (план миграции — в конце
+  файла); серия NAS-архивов `ShtormTTS-Windows-full-*`.
+- **Тесты**: +4 миграционные (перенос с сохранением значений/unknown-ключей
+  и неприкосновенностью прежнего файла; повреждённый прежний → Unreadable
+  без перезаписи; повреждённый новый не подменяется; FirstRun без обоих
+  файлов). Итоги — в «Результаты последних проверок».
+- **Рабочий каталог репозитория НЕ переименован** — см. «План миграции
+  каталога» в конце файла (безопасный переезд вынесен в отдельный шаг по
+  ТЗ).
+
+## G6.4 — что сделано (этап завершён)
 
 - **Отчёт**: `docs/G6_4_RESPONSIVE_GUI.md`.
 - **Окно**: стартовый размер — по РАБОЧЕЙ области монитора запуска (без
@@ -621,9 +675,27 @@ WAV/MP3/Opus без накопления аудио в памяти, одино�
 - Проверки: fmt OK, clippy 0, `cargo test --release` — **179 passed /
   0 failed / 18 ignored**, release OK.
 
-## Результаты последних проверок (2026-11-11, Windows, release)
+## Результаты последних проверок (2026-11-12, Windows, release)
 
-- **G6.3**: `cargo fmt --all -- --check` OK;
+- **G6.5 (переименование)**: `cargo fmt --all -- --check` OK;
+  `cargo clippy --all-targets --release -- -D warnings` — 0;
+  `cargo test --release` — **277 passed / 0 failed / 31 ignored** (+4
+  миграционных); `cargo build --release` — единственный
+  `target\release\PocketTTS-GUI-Rust.exe` (PE subsystem=2 WINDOWS_GUI;
+  устаревший артефакт `shtorm-gui.exe` удалён). Реальный EXE:
+  `--help` — «PocketTTS-GUI-Rust — запуск:», exit 0; smoke
+  `tools/g611_cli_smoke.ps1` 14/14 ALL PASS (exit-коды/справка/portable-
+  check/GUI открывается и закрывается exit 0); `tools/g612_cli_smoke.ps1`
+  ALL PASS; `tools/g62_hybrid_smoke.ps1` ALL PASS (fake 2×2: 2 процесса, 4
+  воркера, 6/6, сирот 0 — дочерние процессы нового EXE через
+  `current_exe()`). Real: `real_batch_cpu` ok (пакет 5 файлов, 9.7 с);
+  CUDA `real_batch_cuda_hybrid` — 12/12, 4 воркера, Pocket 4, процессов
+  CUDA 2, 41.2 с, VRAM 552→683 МБ; `real_batch_cuda_hybrid_cancel` —
+  отмена+повтор 11 готово/1 пропущено, ok. `build-portable.ps1`
+  отвергает `ShtormTTS-Portable-*` (проверено, каталог не создаётся).
+  Полный лог тестов — `out/g65_test_full.log`. Визуальная проверка
+  заголовка окна и portable-сборка — за пользователем (по ТЗ).
+- **G6.3** (для истории): `cargo fmt --all -- --check` OK;
   `cargo clippy --all-targets --release -- -D warnings` — 0; `cargo test
   --release` — **264 passed / 0 failed / 31 ignored** (+5 новых G6.3 и
   ignored-real `real_batch_cpu_int8`); FP32 WAV побитово = бинарю `af005f7`
@@ -741,27 +813,27 @@ export PATH="$HOME/.cargo/bin:$PATH"
 cargo build --release
 cargo test && cargo clippy --all-targets   # норма: 0 failed / 0 warning
 # реальные проверки GUI (по ОДНОМУ устройству на процесс):
-cargo test -p shtorm-gui --release --lib real_matrix_device -- --ignored --nocapture
-SHTORM_GUI_TEST_DEVICE=cuda cargo test -p shtorm-gui --release --lib \
+cargo test -p pockettts-gui-rust --release --lib real_matrix_device -- --ignored --nocapture
+SHTORM_GUI_TEST_DEVICE=cuda cargo test -p pockettts-gui-rust --release --lib \
   real_matrix_device -- --ignored --nocapture
-cargo test -p shtorm-gui --release --lib real_overwrite_wav -- --ignored --nocapture
-cargo test -p shtorm-gui --release --lib real_overwrite_mp3_opus -- --ignored --nocapture
-cargo test -p shtorm-gui --release --lib real_ffmpeg_error_existing_result -- --ignored --nocapture
-cargo test -p shtorm-gui --release --lib real_batch_overwrite_mixed -- --ignored --nocapture
-cargo test -p shtorm-gui --release --lib real_batch_cpu -- --ignored --nocapture
-cargo test -p shtorm-gui --release --lib real_eos_parity -- --ignored --nocapture
+cargo test -p pockettts-gui-rust --release --lib real_overwrite_wav -- --ignored --nocapture
+cargo test -p pockettts-gui-rust --release --lib real_overwrite_mp3_opus -- --ignored --nocapture
+cargo test -p pockettts-gui-rust --release --lib real_ffmpeg_error_existing_result -- --ignored --nocapture
+cargo test -p pockettts-gui-rust --release --lib real_batch_overwrite_mixed -- --ignored --nocapture
+cargo test -p pockettts-gui-rust --release --lib real_batch_cpu -- --ignored --nocapture
+cargo test -p pockettts-gui-rust --release --lib real_eos_parity -- --ignored --nocapture
 # unit/E2E G6.2 (без GPU: реальные дочерние процессы + fake-движок)
-cargo test -p shtorm-gui --lib hybrid::
-cargo test -p shtorm-gui --lib ipc::
+cargo test -p pockettts-gui-rust --lib hybrid::
+cargo test -p pockettts-gui-rust --lib ipc::
 # smoke реального EXE (fake-гибрид + CLI внутреннего режима)
 powershell -NoProfile -ExecutionPolicy Bypass -File tools/g62_hybrid_smoke.ps1
 # real-тесты гибрида G6.2 (по одному на процесс)
-SHTORM_GUI_TEST_DEVICE=cuda cargo test -p shtorm-gui --release --lib \
+SHTORM_GUI_TEST_DEVICE=cuda cargo test -p pockettts-gui-rust --release --lib \
   job::tests::real_batch_cuda_hybrid -- --exact --ignored --nocapture --test-threads=1
 # ... real_batch_cuda_hybrid_cancel / _overwrite / _mp3_opus / _child_killed
 #   и бенчмарк real_batch_cuda_hybrid_bench (~15 мин)
 # real-тесты пула G6.1 (по одному на процесс; набор P2B.3 main12 в out/cuda_p2b3):
-SHTORM_GUI_TEST_DEVICE=cuda cargo test -p shtorm-gui --release --lib \
+SHTORM_GUI_TEST_DEVICE=cuda cargo test -p pockettts-gui-rust --release --lib \
   job::tests::real_batch_cuda_pool -- --exact job::tests::real_batch_cuda_pool --ignored --nocapture --test-threads=1
 # … так же real_batch_cuda_pool_cancel / real_batch_cuda_pool_overwrite /
 #   real_batch_cuda_pool_mp3_opus / real_batch_cuda_bench (~11 мин)
@@ -774,22 +846,51 @@ bash out/p2a1/bench_clean.sh auto 1 <tag>
 
 ## NEXT TASK (НЕ НАЧИНАТЬ без явного задания)
 
-G6.3 завершён (отчёт `docs/G6_3_INT8.md`). Возможные направления (только по
-явному заданию):
+G6.5 завершён (переименование в PocketTTS-GUI-Rust; portable НЕ пересобран —
+ожидается визуальная проверка EXE пользователем). Возможные направления
+(только по явному заданию):
 
-1. **Оптимизация покадрового пути ORT/CUDA** (по смыслу P2B.1 §13):
+1. **Portable-комплект G6.5** — после визуальной проверки пользователем
+   нового EXE и заголовка окна: `tools\build-portable.ps1` в новый каталог
+   `C:\PocketTTS-GUI-Rust\dist\PocketTTS-GUI-Rust-Portable-<дата>-g65-*` +
+   приёмка (portable-check, selftest CPU/CUDA, hybrid fake 2×2, миграция
+   настроек из комплектного прежнего JSON).
+2. **Оптимизация покадрового пути ORT/CUDA** (по смыслу P2B.1 §13):
    убрать 222 CPU-EP узла/кадр и межEP-синхронизации main-графа
    (переэкспорт с shape-операциями на CUDA/статическими формами), затем
    сократить ~540 запусков ядер/кадр (фьюзинг, при возможности ORT CUDA
    Graph), flow/decoder I/O Binding. При 1 воркере 630 мс/чанк и util ≈ 42%
    — по-прежнему latency-bound.
-2. **Слушательская оценка INT8** — автоматические метрики сопоставимы
+3. **Слушательская оценка INT8** — автоматические метрики сопоставимы
    (docs/G6_3_INT8.md §5), но человеческое прослушивание пар
    `out/g63/wav/quality_*` не проводилось.
+4. **Переименование рабочего каталога репозитория** — см. план ниже;
+   выполняется отдельным заданием после закрытия всех сессий ZCode.
 
 Не начинать: INT4 / FP16 / BF16 / TF32 / переэкспорт ONNX / статическое
 квантование под CUDA-опы / денойз с реальной моделью / чистую Windows VM /
 перевод CPU-пакетов на пул — без отдельного задания.
+
+## План миграции каталога репозитория (G6.5, отложено)
+
+Рабочий каталог `C:\PocketTTS-GUI-Rust\ShtormTTS-Windows` НЕ переименован
+в этапе G6.5: приоритет — имя выпускаемого приложения; перенос корня
+репозитория среди открытых сессий ZCode и с ~20 абсолютными путями в
+скриптах/доках — риск без выигрыша для пользователя. Безопасный план:
+
+1. Закрыть все сессии ZCode и скрипты, использующие абсолютный путь.
+2. `Rename-Item C:\PocketTTS-GUI-Rust\ShtormTTS-Windows PocketTTS-GUI-Rust`
+   (одиночный `Rename-Item` каталога; никакого объединения с внешним
+   каталогом `C:\PocketTTS-GUI-Rust` — цель НЕ существует, коллизии нет;
+   git-репозиторий переезд безразличен).
+3. Обновить абсолютные пути: `tools/g611_cli_smoke.ps1`,
+   `tools/g612_cli_smoke.ps1`, `tools/g611_headless_gpu.ps1`,
+   `tools/g62_hybrid_smoke.ps1`, `tools/bench-cuda-multiprocess.ps1`,
+   `AGENTS.md` (строка проекта), `HANDOFF.md`, исторические скрипты `out/`
+   (по мере использования).
+4. Прогнать `cargo build --release` + smoke-скрипты из нового пути;
+   серия NAS-архивов может остаться `ShtormTTS-Windows-full-*` (историческое
+   имя) либо переключиться на `PocketTTS-GUI-Rust-full-*` с новой записи.
 
 ## Подробные документы
 

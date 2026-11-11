@@ -2729,6 +2729,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "pockettts-gui-rust"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "app-core",
+ "eframe",
+ "egui",
+ "env_logger",
+ "log",
+ "ort",
+ "raw-window-handle",
+ "rfd",
+ "serde",
+ "serde_json",
+ "shtorm-engine",
+ "text-processing",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "polling"
 version = "3.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3228,26 +3248,6 @@ dependencies = [
  "rand_distr",
  "rustfft",
  "unicode-normalization",
-]
-
-[[package]]
-name = "shtorm-gui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "app-core",
- "eframe",
- "egui",
- "env_logger",
- "log",
- "ort",
- "raw-window-handle",
- "rfd",
- "serde",
- "serde_json",
- "shtorm-engine",
- "text-processing",
- "windows-sys 0.59.0",
 ]
 
 [[package]]

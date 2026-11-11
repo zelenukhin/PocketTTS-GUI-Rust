@@ -324,11 +324,11 @@ Wall — полный прогон пакета (включая загрузки
 ```bash
 # юнит-тесты пула (без ONNX)
 cargo test -p app-core --lib persistent
-cargo test -p shtorm-gui --lib batch
+cargo test -p pockettts-gui-rust --lib batch
 # real CUDA (по одному на процесс)
-SHTORM_GUI_TEST_DEVICE=cuda cargo test -p shtorm-gui --release --lib \
+SHTORM_GUI_TEST_DEVICE=cuda cargo test -p pockettts-gui-rust --release --lib \
   job::tests::real_batch_cuda_pool -- --ignored --nocapture --test-threads=1
 # ... real_batch_cuda_pool_cancel / _overwrite / _mp3_opus / real_batch_cuda_bench
 # GUI-exe, пакет CUDA (2 файла; exe-относительный settings с путями моделей):
-shtorm-gui.exe --portable-selftest-batch
+PocketTTS-GUI-Rust.exe --portable-selftest-batch
 ```
