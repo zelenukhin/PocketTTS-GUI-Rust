@@ -92,9 +92,10 @@ fn resolve_model_base_at(exe: &Path, s: &GuiSettings) -> Result<PathBuf> {
         );
         return Ok(p);
     }
+    // G6.3: INT8-варианты живут в тех же каталогах (mixed-графы).
     let wanted = match s.model {
-        ModelChoice::Fast => Some("ru-v2-fast"),
-        ModelChoice::Slow => Some("ru-v2-slow"),
+        ModelChoice::Fast | ModelChoice::FastInt8 => Some("ru-v2-fast"),
+        ModelChoice::Slow | ModelChoice::SlowInt8 => Some("ru-v2-slow"),
         ModelChoice::Custom => None,
     };
     let mut tried = Vec::new();

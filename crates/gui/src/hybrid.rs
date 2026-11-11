@@ -2293,6 +2293,42 @@ mod tests {
         assert!(matches!(back, Cmd::Init { fake: true, .. }));
     }
 
+    /// G6.3: выбор INT8-модели доходит до дочернего worker-процесса без
+    /// потерь: Init с `ModelChoice::FastInt8` проходит wire round-trip
+    /// (Named Pipe передаёт тот же JSON), и build_worker_env снимает с него
+    /// Int8-точность + каталог ru-v2-fast.
+    #[test]
+    fn init_carries_int8_model_choice_over_ipc() {
+        let settings = GuiSettings {
+            model: crate::settings::ModelChoice::FastInt8,
+            ..GuiSettings::default()
+        };
+        let init = Cmd::Init {
+            settings: settings.clone(),
+            workers: 2,
+            fake: false,
+            test: TestFaults::default(),
+        };
+        let v = cmd_to_value(&init).unwrap();
+        assert_eq!(v["cmd"], "init");
+        assert_eq!(v["settings"]["model"], "FastInt8");
+        let back: Cmd = serde_json::from_value(v).unwrap();
+        match back {
+            Cmd::Init { settings, .. } => {
+                assert_eq!(settings.model, crate::settings::ModelChoice::FastInt8);
+                assert_eq!(
+                    settings.model.precision(),
+                    shtorm_engine::ModelPrecision::Int8
+                );
+            }
+            other => panic!("не тот вариант: {other:?}"),
+        }
+        // build_worker_env сам модели не грузит; точность снимается в
+        // pipeline_options (job.rs, pipeline_options_carries_precision) —
+        // здесь проверяем резолв каталога для INT8-варианта
+        assert_eq!(settings.model.sub_dir(), Some("ru-v2-fast"));
+    }
+
     // ------------------------- state machine -------------------------
 
     /// Полный прогон 5 файлов на 2×2: готовность → назначения → завершения →

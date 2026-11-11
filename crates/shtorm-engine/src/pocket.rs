@@ -5,8 +5,12 @@
 //! commit edb614e81186ea82a27294b34d567f1b4937bb20, файл `rust/src/pocket.rs`.
 //!
 //! ТОЧНЫЕ ОТЛИЧИЯ ОТ ОРИГИНАЛА (семантика генерации не менялась):
-//! 1. FP32-only: всегда грузится `flow_lm_main.onnx`; автоматическое предпочтение
-//!    `flow_lm_main_int8.onnx` УДАЛЕНО (по требованию задачи порта).
+//! 1. Точность графов (G6.3): по умолчанию FP32 (все пять графов —
+//!    исходное поведение); ЯВНЫЙ выбор `ModelPrecision::Int8` заменяет только
+//!    main/flow/decoder на динамически-квантованные `_int8`-графы (encoder и
+//!    text_conditioner остаются FP32 — INT8-версий этих графов нет).
+//!    Автоматического предпочтения INT8-файлов нет и молчаливого отката
+//!    между точностями нет (отсутствие файла — явная ошибка).
 //! 2. Устройство: `Device::Cpu` / `Device::Cuda` выбирает Execution Providers
 //!    сессии (оригинал — только CPU/XNNPACK).
 //! 3. Детерминированный seed: поле `seed: Option<u64>`; `say_chunk(text, voice,
@@ -82,6 +86,58 @@ impl Device {
     }
 }
 
+/// Точность ONNX-графов Pocket (G6.3). Выбор точности не влияет на
+/// математику семплирования/EOS/seed/DSP — меняются ТОЛЬКО имена файлов
+/// трёх графов, загружаемых из каталога модели:
+///
+/// - `Fp32` — исходный режим: все пять графов FP32 (поведение до G6.3
+///   побитово неизменно);
+/// - `Int8` — смешанные графы: `flow_lm_main_int8.onnx`,
+///   `flow_lm_flow_int8.onnx`, `mimi_decoder_int8.onnx` (динамическое
+///   INT8-квантование: `DynamicQuantizeLinear` + `MatMulInteger`,
+///   интерфейсы входов/выходов идентичны FP32 — проверено G6.3a), а
+///   `mimi_encoder` и `text_conditioner` остаются FP32 (INT8-версий нет).
+///
+/// Отсутствие выбранного файла — явная ошибка с именем; молчаливого
+/// отката на FP32 нет.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModelPrecision {
+    #[default]
+    Fp32,
+    Int8,
+}
+
+impl ModelPrecision {
+    /// Имена стемов пяти графов для этой точности (encoder/text всегда FP32).
+    pub fn graph_stems(&self) -> GraphStems {
+        match self {
+            ModelPrecision::Fp32 => GraphStems {
+                encoder: "mimi_encoder",
+                text: "text_conditioner",
+                main: "flow_lm_main",
+                flow: "flow_lm_flow",
+                decoder: "mimi_decoder",
+            },
+            ModelPrecision::Int8 => GraphStems {
+                encoder: "mimi_encoder",
+                text: "text_conditioner",
+                main: "flow_lm_main_int8",
+                flow: "flow_lm_flow_int8",
+                decoder: "mimi_decoder_int8",
+            },
+        }
+    }
+}
+
+/// Стемы ONNX-файлов пяти графов Pocket для выбранной точности (G6.3).
+pub struct GraphStems {
+    pub encoder: &'static str,
+    pub text: &'static str,
+    pub main: &'static str,
+    pub flow: &'static str,
+    pub decoder: &'static str,
+}
+
 /// Everything `Pocket::load` needs besides the model directory.
 #[derive(Debug, Clone)]
 pub struct LoadOptions {
@@ -91,6 +147,9 @@ pub struct LoadOptions {
     /// Base generation seed. `Some(s)` + `say_chunk(.., i)` seeds the noise as
     /// `s + i` (deterministic, worker-order independent); `None` is random.
     pub seed: Option<u64>,
+    /// Точность графов (G6.3): FP32 (по умолчанию — исходное поведение) или
+    /// смешанные INT8/FP32. Молчаливого отката нет.
+    pub precision: ModelPrecision,
     /// Каталог для трассировок профилировщика ORT (по файлу `<graph>.json` на
     /// сессию). Профилирование замедляет исполнение — включать только для
     /// диагностики (ep_probe), не для бенчей.
@@ -103,6 +162,7 @@ impl Default for LoadOptions {
             device: Device::Cpu,
             threads: 4,
             seed: None,
+            precision: ModelPrecision::Fp32,
             profile_dir: None,
         }
     }
@@ -633,7 +693,8 @@ fn speech_limit_frames(prepared: &str) -> usize {
     ((letters as f32 / 11.0 + 1.0) * 12.5).ceil() as usize
 }
 
-/// Is [dir] a Shtorm model folder? (FP32 graph only; int8 variants are ignored on purpose.)
+/// Is [dir] a Shtorm model folder? (Base FP32 graph; presence of INT8
+/// variants is a separate question resolved by [ModelPrecision].)
 pub fn is_pocket_dir(dir: &str) -> bool {
     Path::new(dir).join("flow_lm_main.onnx").exists()
 }
@@ -654,8 +715,15 @@ pub enum CleanOutcome {
 
 impl Pocket {
     pub fn load(dir: &Path, opts: &LoadOptions) -> Result<Self> {
-        let open = |name: &str| -> Result<Session> {
-            let path = dir.join(format!("{name}.onnx"));
+        let open = |stem: &str| -> Result<Session> {
+            let path = dir.join(format!("{stem}.onnx"));
+            anyhow::ensure!(
+                path.is_file(),
+                "файл графа отсутствует: {} (точность {:?}); \
+                 молчаливый откат на другую точность запрещён",
+                path.display(),
+                opts.precision
+            );
             let t = std::time::Instant::now();
             // no optimised copy on disk (the main graph alone is 300 MB)
             let mut builder = session_builder(
@@ -665,21 +733,24 @@ impl Pocket {
             )?;
             if let Some(pdir) = &opts.profile_dir {
                 std::fs::create_dir_all(pdir).ok();
-                builder = builder.with_profiling(pdir.join(format!("{name}.json")))?;
+                builder = builder.with_profiling(pdir.join(format!("{stem}.json")))?;
             }
             let s = builder
                 .commit_from_file(&path)
                 .with_context(|| format!("load {}", path.display()))?;
-            log::info!("load {name}: {} ms", t.elapsed().as_millis());
+            log::info!("load {stem}: {} ms", t.elapsed().as_millis());
             Ok(s)
         };
-        // FP32 only — никогда int8 (изменение против teratts, см. шапку файла).
+        // G6.3: единый механизм разрешения имён графов по точности. INT8
+        // заменяет только main/flow/decoder (динамическое квантование,
+        // интерфейсы идентичны FP32 — G6.3a); encoder/text — всегда FP32.
+        let stems = opts.precision.graph_stems();
         let (encoder, text, main, flow, decoder) = (
-            open("mimi_encoder")?,
-            open("text_conditioner")?,
-            open("flow_lm_main")?,
-            open("flow_lm_flow")?,
-            open("mimi_decoder")?,
+            open(stems.encoder)?,
+            open(stems.text)?,
+            open(stems.main)?,
+            open(stems.flow)?,
+            open(stems.decoder)?,
         );
         let main_states = States::of(&main)?;
         let decoder_states = States::of(&decoder)?;
@@ -1239,6 +1310,27 @@ pub fn resample(x: &[f32], from: u32, to: u32) -> Vec<f32> {
 mod tests {
     use super::*;
 
+    /// G6.3: точность задаёт имена графов; FP32 — исходный набор (регрессия
+    /// «загрузчик всегда берёт flow_lm_main.onnx»), INT8 — только main/flow/
+    /// decoder квантованные, encoder/text всегда FP32.
+    #[test]
+    fn precision_graph_stems() {
+        let fp32 = ModelPrecision::Fp32.graph_stems();
+        assert_eq!(fp32.main, "flow_lm_main");
+        assert_eq!(fp32.flow, "flow_lm_flow");
+        assert_eq!(fp32.decoder, "mimi_decoder");
+        assert_eq!(fp32.encoder, "mimi_encoder");
+        assert_eq!(fp32.text, "text_conditioner");
+        let int8 = ModelPrecision::Int8.graph_stems();
+        assert_eq!(int8.main, "flow_lm_main_int8");
+        assert_eq!(int8.flow, "flow_lm_flow_int8");
+        assert_eq!(int8.decoder, "mimi_decoder_int8");
+        assert_eq!(int8.encoder, "mimi_encoder", "INT8-версии нет — FP32");
+        assert_eq!(int8.text, "text_conditioner", "INT8-версии нет — FP32");
+        // дефолт LoadOptions — Fp32 (исходное поведение не меняется)
+        assert_eq!(LoadOptions::default().precision, ModelPrecision::Fp32);
+    }
+
     #[test]
     fn speech_limit() {
         // 54 characters: 4.9 s + 1 s → 74 frames; stress marks and the padding do not count
@@ -1536,6 +1628,7 @@ mod real_model {
                 device: Device::cuda(0),
                 threads,
                 seed: Some(42),
+                precision: ModelPrecision::Fp32,
                 profile_dir: None,
             },
         )

@@ -15,7 +15,7 @@ use app_core::pipeline::{
     PipelineOptions, RunStatus, StreamError, StreamOutcome,
 };
 use app_core::sink::{make_sink, OutputFormat};
-use shtorm_engine::{Device, EosTail};
+use shtorm_engine::{Device, EosTail, ModelPrecision};
 use text_processing::CharRules;
 
 #[derive(Parser, Debug)]
@@ -80,6 +80,10 @@ struct Args {
     /// Параллельные воркеры (каждый со своим экземпляром движка)
     #[arg(long, default_value_t = 1)]
     workers: usize,
+    /// Точность графов (G6.3): fp32 — все пять FP32 (исходный режим);
+    /// int8 — main/flow/decoder квантованные, encoder/text FP32.
+    #[arg(long, default_value = "fp32")]
+    precision: String,
 }
 
 /// Разбор значения хвоста EOS: `none` — отдельное состояние (штатная
@@ -146,6 +150,11 @@ fn run() -> Result<ExitCode> {
         "cuda" => Device::cuda(args.device_id),
         other => bail!("--device cpu|cuda, получено {other}"),
     };
+    let precision = match args.precision.trim().to_ascii_lowercase().as_str() {
+        "fp32" => ModelPrecision::Fp32,
+        "int8" => ModelPrecision::Int8,
+        other => bail!("--precision fp32|int8, получено {other}"),
+    };
 
     let char_rules = match &args.char_rules {
         Some(p) => {
@@ -179,6 +188,7 @@ fn run() -> Result<ExitCode> {
         voice: args.voice.clone(),
         device,
         threads: args.threads,
+        precision,
         seed: if args.seed < 0 {
             None
         } else {

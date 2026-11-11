@@ -20,7 +20,7 @@ use app_core::pipeline::{
 use app_core::pool::SeedPolicy;
 use app_core::sink::{make_sink_with_overwrite, OutputFormat};
 use app_core::worker::{real_worker_factory, RealWorker};
-use shtorm_engine::Device;
+use shtorm_engine::{Device, ModelPrecision};
 use text_processing::CharRules;
 
 use crate::batch::{
@@ -29,7 +29,7 @@ use crate::batch::{
     PreparedFile,
 };
 use crate::resources;
-use crate::settings::{BatchCudaMode, DeviceChoice, GuiSettings, ModelChoice, OutputFormatChoice};
+use crate::settings::{BatchCudaMode, DeviceChoice, GuiSettings, OutputFormatChoice};
 
 // G4: единый резолвер ресурсов; реэкспорт сохраняет существующий API/тесты.
 pub use crate::resources::{find_project_root, resolve_ort_dylib, resolve_ort_dylib_in};
@@ -201,13 +201,14 @@ impl JobStatus {
     }
 }
 
-/// Каталог модели по выбору Fast/Slow/Custom; проверка обязательных файлов
-/// движка — как валидация G1, но тем же кодом для реального запуска.
+/// Каталог модели по выбору Fast/Slow/Custom (+ INT8-варианты G6.3 — тот же
+/// каталог, другая точность); проверка обязательных файлов движка — как
+/// валидация G1, но тем же кодом для реального запуска. Для INT8 проверяются
+/// ТРИ квантованных графа; молчаливого отката на FP32 нет.
 pub fn resolve_model_dir(s: &GuiSettings) -> Result<PathBuf> {
-    let dir = match s.model {
-        ModelChoice::Fast => resources::resolve_model_base(s)?.join("ru-v2-fast"),
-        ModelChoice::Slow => resources::resolve_model_base(s)?.join("ru-v2-slow"),
-        ModelChoice::Custom => {
+    let dir = match s.model.sub_dir() {
+        Some(sub) => resources::resolve_model_base(s)?.join(sub),
+        None => {
             let p = resources::resolve_user_path(&s.model_dir);
             anyhow::ensure!(
                 !p.as_os_str().is_empty(),
@@ -216,11 +217,30 @@ pub fn resolve_model_dir(s: &GuiSettings) -> Result<PathBuf> {
             p
         }
     };
-    anyhow::ensure!(
-        dir.join("flow_lm_main.onnx").is_file(),
-        "в каталоге модели нет flow_lm_main.onnx: {}",
-        dir.display()
-    );
+    match s.model.precision() {
+        ModelPrecision::Fp32 => {
+            anyhow::ensure!(
+                dir.join("flow_lm_main.onnx").is_file(),
+                "в каталоге модели нет flow_lm_main.onnx: {}",
+                dir.display()
+            );
+        }
+        ModelPrecision::Int8 => {
+            for file in [
+                "flow_lm_main_int8.onnx",
+                "flow_lm_flow_int8.onnx",
+                "mimi_decoder_int8.onnx",
+            ] {
+                anyhow::ensure!(
+                    dir.join(file).is_file(),
+                    "в каталоге модели нет INT8-графа {file}: {} \
+                     — режим INT8 требует все три квантованных графа \
+                     (fallback на FP32 запрещён)",
+                    dir.display()
+                );
+            }
+        }
+    }
     Ok(dir)
 }
 
@@ -287,6 +307,9 @@ pub fn pipeline_options(
             DeviceChoice::Cuda => Device::cuda(s.device_id),
         },
         threads: s.threads as usize,
+        // G6.3: точность графов из выбранного варианта модели; каждый Pocket
+        // задания (пул/гибрид/дочерние процессы) грузит одни и те же файлы.
+        precision: s.model.precision(),
         seed: if s.seed < 0 {
             None
         } else {
@@ -2094,6 +2117,78 @@ mod tests {
         assert!(format!("{err:#}").contains("flow_lm_main.onnx"), "{err:#}");
     }
 
+    /// G6.3: INT8-варианты резолвятся в те же каталоги ru-v2-fast/slow;
+    /// отсутствие ЛЮБОГО из трёх INT8-графов — явная ошибка с именем файла
+    /// (молчаливого отката на FP32 нет); полный набор — успех.
+    #[test]
+    fn resolve_model_dir_int8_variants() {
+        let base = tmpdir("models_int8");
+        let fast = fake_model(&base, "ru-v2-fast");
+        let slow = fake_model(&base, "ru-v2-slow");
+        let int8_files = [
+            "flow_lm_main_int8.onnx",
+            "flow_lm_flow_int8.onnx",
+            "mimi_decoder_int8.onnx",
+        ];
+        for f in int8_files {
+            std::fs::write(fast.join(f), b"fake").unwrap();
+            std::fs::write(slow.join(f), b"fake").unwrap();
+        }
+        let mut s = GuiSettings {
+            onnx_base: base.display().to_string(),
+            ..Default::default()
+        };
+        s.model = ModelChoice::FastInt8;
+        assert_eq!(resolve_model_dir(&s).unwrap(), fast);
+        s.model = ModelChoice::SlowInt8;
+        assert_eq!(resolve_model_dir(&s).unwrap(), slow);
+        // убираем каждый из трёх по очереди — ошибка называет файл
+        // (каждая итерация — свой чистый каталог, тесты файлы не удаляют)
+        for (i, missing) in int8_files.iter().enumerate() {
+            let probe = tmpdir(&format!("models_int8_probe_{i}"));
+            let d = probe.join("ru-v2-slow");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("flow_lm_main.onnx"), b"fake").unwrap();
+            for f in int8_files {
+                if f != *missing {
+                    std::fs::write(d.join(f), b"fake").unwrap();
+                }
+            }
+            let s = GuiSettings {
+                model: ModelChoice::SlowInt8,
+                onnx_base: probe.display().to_string(),
+                ..Default::default()
+            };
+            let err = resolve_model_dir(&s).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains(missing), "нет имени {missing}: {msg}");
+            assert!(msg.contains("fallback"), "нет запрета fallback: {msg}");
+        }
+    }
+
+    /// G6.3: точность из выбранного варианта модели переносится в
+    /// PipelineOptions (FP32-варианты — Fp32, INT8-варианты — Int8).
+    #[test]
+    fn pipeline_options_carries_precision() {
+        for (choice, precision) in [
+            (ModelChoice::Fast, shtorm_engine::ModelPrecision::Fp32),
+            (ModelChoice::Slow, shtorm_engine::ModelPrecision::Fp32),
+            (ModelChoice::FastInt8, shtorm_engine::ModelPrecision::Int8),
+            (ModelChoice::SlowInt8, shtorm_engine::ModelPrecision::Int8),
+            (ModelChoice::Custom, shtorm_engine::ModelPrecision::Fp32),
+        ] {
+            let s = GuiSettings {
+                model: choice,
+                ..Default::default()
+            };
+            assert_eq!(
+                pipeline_options(&s, PathBuf::from(r"C:\m"), None).precision,
+                precision,
+                "{choice:?}"
+            );
+        }
+    }
+
     #[test]
     fn out_path_uses_text_stem_and_format_ext() {
         let s = GuiSettings {
@@ -2776,6 +2871,80 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, JobEvent::FileDone { .. })));
+    }
+
+    /// G6.3: реальный пакетный синтез INT8 через полный путь GUI
+    /// (execute_batch → пул → Pocket с ModelPrecision::Int8). Проверяет:
+    /// 2/2 файла синтезированы, WAV валидны, и — ГЛАВНОЕ — выход ОТЛИЧАЕТСЯ
+    /// от FP32 побайтово (доказывает, что INT8-графы реально загружены, а
+    /// не случился молчаливый откат на FP32). CPU.
+    /// Запуск: `cargo test -p shtorm-gui --release --lib real_batch_cpu_int8
+    /// -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "реальный синтез: модели + ORT DLL"]
+    fn real_batch_cpu_int8() {
+        let d = tmpdir("g63_int8_batch");
+        let src = d.join("src");
+        let out = d.join("out");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(src.join("one.txt"), "Стр+елки час+ов показ+ывали п+олночь.").unwrap();
+        std::fs::write(
+            src.join("two.txt"),
+            "Ветер перелист+ал страницы забытой книги.",
+        )
+        .unwrap();
+
+        let mut s = real_settings(OutputFormatChoice::Wav, &out);
+        s.device = DeviceChoice::Cpu;
+        s.model = ModelChoice::FastInt8;
+        s.workers = Some(2);
+        s.clamped();
+        let no_emit: Arc<dyn Fn(JobEvent) + Send + Sync> = Arc::new(|_| {});
+        let res = execute_batch(&s, &src, &Arc::new(AtomicBool::new(false)), &no_emit);
+        eprintln!("[g63_int8_batch] {} | {}", res.status.label(), res.summary);
+        assert_eq!(res.status, JobStatus::Completed, "{}", res.summary);
+        let report = res.batch.expect("пакетный отчёт");
+        assert_eq!(report.completed(), 2, "{}", report.summary());
+        for name in ["one.wav", "two.wav"] {
+            let wav = out.join(name);
+            let bytes = std::fs::read(&wav).unwrap();
+            assert!(
+                bytes.len() > 10_000,
+                "{name}: {}/{} байт",
+                bytes.len(),
+                wav.display()
+            );
+            assert_eq!(&bytes[0..4], b"RIFF", "{name}: не WAV");
+            assert!(
+                bytes[44..].iter().any(|&b| b != 0),
+                "{name}: данные не должны быть тишиной"
+            );
+        }
+
+        // тот же один текст через Fast FP32 одиночным заданием: байты другие
+        // (квантование меняет выход) — значит INT8-графы действительно грузились
+        let s_fp32 = GuiSettings {
+            model: ModelChoice::Fast,
+            ..s.clone()
+        };
+        let fp32_out = out.join("one_fp32.wav");
+        let res32 = execute_job(
+            &JobConfig {
+                settings: s_fp32,
+                text: "Стр+елки час+ов показ+ывали п+олночь.".into(),
+                out_path: fp32_out.clone(),
+            },
+            &Arc::new(AtomicBool::new(false)),
+            &|_| {},
+        );
+        assert_eq!(res32.status, JobStatus::Completed, "{}", res32.summary);
+        let int8 = std::fs::read(out.join("one.wav")).unwrap();
+        let fp32 = std::fs::read(&fp32_out).unwrap();
+        assert_ne!(
+            int8, fp32,
+            "INT8 и FP32 выходы обязаны отличаться (иначе был fallback на FP32)"
+        );
     }
 
     /// G5/G5.1: реальная перезапись WAV — существующий файл, новый файл при

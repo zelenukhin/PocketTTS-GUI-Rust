@@ -36,7 +36,7 @@ use app_core::pipeline::PipelineOptions;
 use app_core::pool::{run_job, ChunkAudio, ChunkWorker, PoolConfig, SeedPolicy, Task};
 use app_core::sink::{AudioSink, WavSink};
 use app_core::worker::{real_worker_factory, RealWorker};
-use shtorm_engine::{Device, EosTail, POCKET_RATE};
+use shtorm_engine::{Device, EosTail, ModelPrecision, POCKET_RATE};
 use text_processing::{
     apply_char_rules, chunk_pause_s, chunk_pipeline, to_model_stress_notation, CharRules,
 };
@@ -391,6 +391,7 @@ impl SynthArgs {
             voice: self.voice.clone(),
             device,
             threads: self.threads,
+            precision: ModelPrecision::Fp32,
             seed: Some(self.seed as u64),
             temperature: self.temperature,
             decode_steps: self.decode_steps as usize,

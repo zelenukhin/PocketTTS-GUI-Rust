@@ -11,7 +11,7 @@
 use anyhow::Result;
 use std::path::PathBuf;
 
-use shtorm_engine::{Device, EosTail, POCKET_RATE};
+use shtorm_engine::{Device, EosTail, ModelPrecision, POCKET_RATE};
 use text_processing::{apply_char_rules, CharRules};
 
 /// Полные параметры прогона (зеркалируют SynthSettings + пути).
@@ -21,6 +21,10 @@ pub struct PipelineOptions {
     pub voice: PathBuf,
     pub device: Device,
     pub threads: usize,
+    /// Точность ONNX-графов (G6.3): Fp32 — исходное поведение по умолчанию;
+    /// Int8 — смешанные INT8/FP32-графы. Передаётся в `LoadOptions` каждого
+    /// Pocket без изменений.
+    pub precision: ModelPrecision,
     /// Фиксированный seed (None — случайный на запуск).
     pub seed: Option<u64>,
     pub temperature: f32,
@@ -905,6 +909,7 @@ mod stream_error_tests {
             voice: d.join("voice.wav"),
             device: Device::Cpu,
             threads: 1,
+            precision: ModelPrecision::Fp32,
             seed: Some(42),
             temperature: 0.3,
             decode_steps: 1,
@@ -1131,6 +1136,7 @@ mod publish_phase_tests {
         PipelineOptions {
             model_dir: model_dir.to_path_buf(),
             voice: model_dir.join("voice.wav"),
+            precision: ModelPrecision::Fp32,
             device: Device::Cpu,
             threads: 1,
             seed: Some(42),

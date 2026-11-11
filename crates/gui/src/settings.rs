@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use shtorm_engine::EosTail;
+use shtorm_engine::{EosTail, ModelPrecision};
 
 /// Порог EOS в настройках GUI (G4.1/G5). В интерфейсе G5 выбранное значение —
 /// всегда число; `Auto` оставлен только как совместимый алиас старых конфигов
@@ -189,11 +189,49 @@ pub struct GuiSettings {
     pub extra: BTreeMap<String, serde_json::Value>,
 }
 
+/// Выбор модели в GUI (G6.3: один список — вариант сразу определяет и
+/// Fast/Slow, и точность графов; отдельного поля «точность» нет).
+///
+/// Сериализация: старые значения `"Fast"`/`"Slow"`/`"Custom"` сохраняют
+/// прежнюю семантику (FP32); INT8-варианты — однозначные `"FastInt8"`/
+/// `"SlowInt8"`. FP32 — значение по умолчанию.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ModelChoice {
     Fast,
     Slow,
+    /// Fast + смешанные INT8-графы (main/flow/decoder квантованные,
+    /// encoder/text_conditioner — FP32; G6.3).
+    FastInt8,
+    /// Slow + смешанные INT8-графы (G6.3).
+    SlowInt8,
     Custom,
+}
+
+impl ModelChoice {
+    /// Точность графов для этого варианта (движковое представление).
+    pub fn precision(&self) -> ModelPrecision {
+        match self {
+            ModelChoice::FastInt8 | ModelChoice::SlowInt8 => ModelPrecision::Int8,
+            _ => ModelPrecision::Fp32,
+        }
+    }
+    /// Каталог внутри onnx_base (Custom разрешается отдельно по model_dir).
+    pub fn sub_dir(&self) -> Option<&'static str> {
+        match self {
+            ModelChoice::Fast | ModelChoice::FastInt8 => Some("ru-v2-fast"),
+            ModelChoice::Slow | ModelChoice::SlowInt8 => Some("ru-v2-slow"),
+            ModelChoice::Custom => None,
+        }
+    }
+    pub fn label(&self) -> &'static str {
+        match self {
+            ModelChoice::Fast => "Shtorm-v2 Fast (FP32)",
+            ModelChoice::FastInt8 => "Shtorm-v2 Fast (INT8)",
+            ModelChoice::Slow => "Shtorm-v2 Slow (FP32)",
+            ModelChoice::SlowInt8 => "Shtorm-v2 Slow (INT8)",
+            ModelChoice::Custom => "Свой каталог ONNX",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -567,6 +605,84 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains("tmp."))
             .collect();
         assert!(leftovers.is_empty(), "tmp убраны после успеха");
+    }
+
+    /// G6.3: INT8-варианты модели сериализуются однозначно и переживают
+    /// round-trip; старые значения "Fast"/"Slow"/"Custom" загружаются как
+    /// прежде (FP32); поле отсутствует в старом конфиге → дефолт (FP32).
+    #[test]
+    fn model_choice_int8_roundtrip_and_legacy() {
+        let d = tmpdir("model_int8");
+        let p = d.join("s.json");
+        for (choice, json_value) in [
+            (ModelChoice::Fast, "\"Fast\""),
+            (ModelChoice::Slow, "\"Slow\""),
+            (ModelChoice::FastInt8, "\"FastInt8\""),
+            (ModelChoice::SlowInt8, "\"SlowInt8\""),
+            (ModelChoice::Custom, "\"Custom\""),
+        ] {
+            let s = GuiSettings {
+                model: choice,
+                ..Default::default()
+            };
+            save_settings(&s, &p).unwrap();
+            let raw = std::fs::read_to_string(&p).unwrap();
+            assert!(
+                raw.contains(&format!("\"model\": {json_value}")),
+                "{choice:?}: {raw}"
+            );
+            let s2 = load_settings(&p).unwrap();
+            assert_eq!(s2.model, choice, "{choice:?}");
+        }
+        // старый конфиг со значением "Slow" — без правки файла
+        std::fs::write(&p, r#"{"model": "Slow", "theme_dark": true}"#).unwrap();
+        let s = load_settings(&p).unwrap();
+        assert_eq!(s.model, ModelChoice::Slow);
+        assert_eq!(s.model.precision(), shtorm_engine::ModelPrecision::Fp32);
+        assert!(s.theme_dark, "соседние ключи не потеряны");
+        // конфиг вообще без поля model → дефолт (FP32)
+        std::fs::write(&p, r#"{"threads": 4}"#).unwrap();
+        let s = load_settings(&p).unwrap();
+        assert_eq!(s.model, ModelChoice::Slow, "дефолт — Slow FP32");
+        assert_eq!(s.model.precision(), shtorm_engine::ModelPrecision::Fp32);
+        // точность каждого варианта
+        assert_eq!(
+            ModelChoice::FastInt8.precision(),
+            shtorm_engine::ModelPrecision::Int8
+        );
+        assert_eq!(
+            ModelChoice::SlowInt8.precision(),
+            shtorm_engine::ModelPrecision::Int8
+        );
+        assert_eq!(
+            ModelChoice::Fast.precision(),
+            shtorm_engine::ModelPrecision::Fp32
+        );
+        assert_eq!(
+            ModelChoice::Slow.precision(),
+            shtorm_engine::ModelPrecision::Fp32
+        );
+        assert_eq!(
+            ModelChoice::Custom.precision(),
+            shtorm_engine::ModelPrecision::Fp32
+        );
+        // подкаталоги: INT8-варианты делят каталог с FP32-вариантами
+        assert_eq!(ModelChoice::FastInt8.sub_dir(), Some("ru-v2-fast"));
+        assert_eq!(ModelChoice::SlowInt8.sub_dir(), Some("ru-v2-slow"));
+        assert_eq!(ModelChoice::Fast.sub_dir(), Some("ru-v2-fast"));
+        assert_eq!(ModelChoice::Custom.sub_dir(), None);
+        // метки списка уникальны (видны пользователю в одном комбобоксе)
+        let labels = [
+            ModelChoice::Fast.label(),
+            ModelChoice::FastInt8.label(),
+            ModelChoice::Slow.label(),
+            ModelChoice::SlowInt8.label(),
+            ModelChoice::Custom.label(),
+        ];
+        let mut sorted = labels.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), labels.len(), "метки дублируются: {labels:?}");
     }
 
     /// Пресет выбирается по формату: MP3 и Opus не делят одно поле и не

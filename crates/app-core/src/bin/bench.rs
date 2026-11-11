@@ -16,7 +16,7 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use shtorm_engine::{Device, LoadOptions, Pocket, POCKET_RATE};
+use shtorm_engine::{Device, LoadOptions, ModelPrecision, Pocket, POCKET_RATE};
 
 #[derive(Parser, Debug)]
 #[command(about = "Shtorm engine benchmark/stress: RTF + memory + VRAM")]
@@ -61,6 +61,10 @@ struct Args {
     /// Сэмплировать память каждые N чанков
     #[arg(long, default_value_t = 10)]
     sample_every: u32,
+    /// Точность графов (G6.3): fp32 (исходный режим) | int8 (main/flow/decoder
+    /// квантованные, encoder/text FP32)
+    #[arg(long, default_value = "fp32")]
+    precision: String,
 }
 
 fn p95(mut xs: Vec<f32>) -> f32 {
@@ -191,6 +195,11 @@ fn main() -> Result<()> {
         "cuda" => Device::cuda(args.device_id),
         other => bail!("--device cpu|cuda, got {other}"),
     };
+    let precision = match args.precision.trim().to_ascii_lowercase().as_str() {
+        "fp32" => ModelPrecision::Fp32,
+        "int8" => ModelPrecision::Int8,
+        other => bail!("--precision fp32|int8, got {other}"),
+    };
     let seed = if args.seed < 0 {
         None
     } else {
@@ -213,6 +222,7 @@ fn main() -> Result<()> {
             device,
             threads: args.threads,
             seed,
+            precision,
             profile_dir: None,
         },
     )?;

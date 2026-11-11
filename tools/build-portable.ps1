@@ -24,6 +24,7 @@ param(
     [switch]$SkipModels,
     [switch]$SkipCuda,
     [switch]$SkipFfmpeg,
+    [switch]$SkipInt8Models,
     [switch]$HardLinkPayload,
     [ValidateSet("release", "debug")][string]$Configuration = "release"
 )
@@ -202,6 +203,15 @@ $modelFiles = @(
     "tokenizer.model"
 )
 
+# G6.3: три квантованных графа на модель (main/flow/decoder); encoder/text
+# INT8-версий не имеют и всегда берутся FP32. -SkipInt8Models — компактный
+# комплект без режима INT8.
+$int8ModelFiles = @(
+    "flow_lm_main_int8.onnx",
+    "flow_lm_flow_int8.onnx",
+    "mimi_decoder_int8.onnx"
+)
+
 if (-not $SkipModels) {
     if ($ModelsDir) {
         $modelsRoot = [IO.Path]::GetFullPath($ModelsDir)
@@ -219,6 +229,13 @@ if (-not $SkipModels) {
         foreach ($f in $modelFiles) {
             if (-not (Test-Path -LiteralPath (Join-Path $dir $f) -PathType Leaf)) {
                 throw "Model file missing: $($dir)\$f"
+            }
+        }
+        if (-not $SkipInt8Models) {
+            foreach ($f in $int8ModelFiles) {
+                if (-not (Test-Path -LiteralPath (Join-Path $dir $f) -PathType Leaf)) {
+                    throw "INT8 model file missing: $($dir)\$f (use -SkipInt8Models for an FP32-only kit)"
+                }
             }
         }
     }
@@ -288,12 +305,18 @@ if (-not $SkipModels) {
         foreach ($f in $modelFiles) {
             Copy-Verified (Join-Path $modelsRoot "$m\$f") (Join-Path $dest "models\$m\$f") -HardLink
         }
+        if (-not $SkipInt8Models) {
+            foreach ($f in $int8ModelFiles) {
+                Copy-Verified (Join-Path $modelsRoot "$m\$f") (Join-Path $dest "models\$m\$f") -HardLink
+            }
+        }
     }
 } else {
     Write-Utf8NoBom (Join-Path $dest "models\README-MISSING.txt") @"
 Models were intentionally skipped (-SkipModels).
-Place FP32 ru-v2-fast and ru-v2-slow directories here. The loader always uses
-flow_lm_main.onnx; INT8 files are not used.
+Place FP32 ru-v2-fast and ru-v2-slow directories here (FP32 graphs are the
+default). For the INT8 mode also add flow_lm_main_int8.onnx,
+flow_lm_flow_int8.onnx and mimi_decoder_int8.onnx into each model directory.
 "@
 }
 
@@ -384,14 +407,16 @@ if ($exeInfo.Length -lt 1000000) {
 }
 
 if (-not $SkipModels) {
-    $int8 = Get-ChildItem -LiteralPath (Join-Path $dest "models") -Recurse -File -Filter "*_int8.onnx" -ErrorAction SilentlyContinue
-    if ($int8) {
-        throw "INT8 model files must not be bundled: $($int8[0].FullName)"
-    }
     foreach ($m in @("ru-v2-fast", "ru-v2-slow")) {
         $main = Get-Item -LiteralPath (Join-Path $dest "models\$m\flow_lm_main.onnx")
         if ($main.Length -lt 100000000) {
             throw "flow_lm_main.onnx is unexpectedly small (not FP32?): $($main.FullName)"
+        }
+        if (-not $SkipInt8Models) {
+            $int8Main = Get-Item -LiteralPath (Join-Path $dest "models\$m\flow_lm_main_int8.onnx")
+            if ($int8Main.Length -lt 50000000 -or $int8Main.Length -gt 100000000) {
+                throw "flow_lm_main_int8.onnx has an unexpected size (not the quantized graph?): $($int8Main.FullName)"
+            }
         }
     }
 }

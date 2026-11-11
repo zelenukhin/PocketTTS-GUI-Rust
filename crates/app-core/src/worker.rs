@@ -6,7 +6,9 @@ use anyhow::Result;
 use std::path::PathBuf;
 
 use shtorm_engine::dsp::{fade_out, trim_edges};
-use shtorm_engine::{high_shelf, resample, Device, EosTail, LoadOptions, Pocket, POCKET_RATE};
+use shtorm_engine::{
+    high_shelf, resample, Device, EosTail, LoadOptions, ModelPrecision, Pocket, POCKET_RATE,
+};
 
 use crate::pipeline::{resolve_denoise, PipelineOptions};
 use crate::pool::{ChunkAudio, ChunkWorker, DenoiseChunkStatus, Task};
@@ -72,6 +74,7 @@ pub fn real_worker_factory(
     let threads = opts.threads;
     let brightness_db = opts.brightness_db;
     let device: Device = opts.device.clone();
+    let precision: ModelPrecision = opts.precision;
     let denoise_requested = opts.denoise;
     move |_worker_id: usize, _seed: u64| {
         let mut engine = Pocket::load(
@@ -80,6 +83,7 @@ pub fn real_worker_factory(
                 device: device.clone(),
                 threads,
                 seed: Some(base_seed), // seed+index: детерминизм от номера воркера не зависит
+                precision,
                 profile_dir: None,
             },
         )?;
@@ -149,6 +153,7 @@ mod tests {
 
     fn opts() -> PipelineOptions {
         PipelineOptions {
+            precision: ModelPrecision::Fp32,
             model_dir: PathBuf::from(r"C:\m"),
             voice: PathBuf::from(r"C:\v.wav"),
             device: Device::Cpu,

@@ -1002,30 +1002,42 @@ impl eframe::App for ShtormApp {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label("Модель:");
+                        // G6.3: один список — вариант сразу задаёт и Fast/Slow,
+                        // и точность графов (FP32/INT8); отдельного поля
+                        // «точность» в интерфейсе нет.
                         egui::ComboBox::from_id_salt("model")
-                            .selected_text(match s.model {
-                                ModelChoice::Fast => "Shtorm-v2 fast",
-                                ModelChoice::Slow => "Shtorm-v2 slow",
-                                ModelChoice::Custom => "Свой каталог ONNX",
-                            })
+                            .selected_text(s.model.label())
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut s.model,
+                                for choice in [
                                     ModelChoice::Fast,
-                                    "Shtorm-v2 fast",
-                                );
-                                ui.selectable_value(
-                                    &mut s.model,
+                                    ModelChoice::FastInt8,
                                     ModelChoice::Slow,
-                                    "Shtorm-v2 slow",
-                                );
-                                ui.selectable_value(
-                                    &mut s.model,
+                                    ModelChoice::SlowInt8,
                                     ModelChoice::Custom,
-                                    "Свой каталог ONNX",
-                                );
+                                ] {
+                                    ui.selectable_value(&mut s.model, choice, choice.label());
+                                }
                             });
                     });
+                    if s.model.precision() == shtorm_engine::ModelPrecision::Int8 {
+                        ui.weak(
+                            "INT8: 3 квантованных графа (flow_lm_main, flow_lm_flow, \
+                             mimi_decoder) + 2 FP32 (mimi_encoder, text_conditioner).",
+                        );
+                        if s.device == DeviceChoice::Cuda {
+                            // G6.3: смешанное выполнение — квантованные узлы
+                            // (MatMulInteger/DynamicQuantizeLinear) CUDA EP не
+                            // поддерживает, они идут на CPU с покадровыми
+                            // копиями через PCIe (замер: ~2.7× медленнее FP32).
+                            // Предупреждение без блокировки и смены выбора.
+                            ui.colored_label(
+                                egui::Color32::from_rgb(230, 160, 60),
+                                "CUDA + INT8: работает, но замеренно ~2.7× медленнее \
+                                 FP32 (квантованные узлы выполняются на CPU); для INT8 \
+                                 рекомендован CPU. Выбор не меняется автоматически.",
+                            );
+                        }
+                    }
                     if s.model == ModelChoice::Custom {
                         ui.horizontal(|ui| {
                             ui.label("Каталог модели:");

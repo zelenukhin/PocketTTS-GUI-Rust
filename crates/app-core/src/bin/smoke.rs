@@ -15,7 +15,7 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use shtorm_engine::{Device, EosTail, LoadOptions, Pocket, POCKET_RATE};
+use shtorm_engine::{Device, EosTail, LoadOptions, ModelPrecision, Pocket, POCKET_RATE};
 
 /// Разбор значения хвоста EOS для smoke: `none` или число 0..=10.
 fn parse_eos_tail(s: &str) -> Result<EosTail, String> {
@@ -84,9 +84,17 @@ struct Args {
     /// Сколько раз прогнать фразу (разные chunk_index)
     #[arg(long, default_value_t = 1)]
     repeats: u32,
+    /// Точность графов (G6.3): fp32 | int8
+    #[arg(long, default_value = "fp32")]
+    precision: String,
     /// Пауза между повторами, с
     #[arg(long, default_value_t = 0.3)]
     pause_s: f32,
+    /// Каталог для трассировок ORT-профилировщика (по файлу на сессию;
+    /// G6.3: анализ распределения узлов по Execution Providers). Замедляет
+    /// исполнение — только диагностика.
+    #[arg(long)]
+    profile_dir: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -111,6 +119,11 @@ fn main() -> Result<()> {
         "cuda" => Device::cuda(args.device_id),
         other => bail!("--device: только cpu|cuda, получено {other}"),
     };
+    let precision = match args.precision.trim().to_ascii_lowercase().as_str() {
+        "fp32" => ModelPrecision::Fp32,
+        "int8" => ModelPrecision::Int8,
+        other => bail!("--precision: только fp32|int8, получено {other}"),
+    };
     let seed = if args.seed < 0 {
         None
     } else {
@@ -134,7 +147,8 @@ fn main() -> Result<()> {
             device: device.clone(),
             threads: args.threads,
             seed,
-            profile_dir: None,
+            precision,
+            profile_dir: args.profile_dir.clone(),
         },
     )
     .with_context(|| format!("load model {}", args.model_dir.display()))?;
@@ -267,6 +281,11 @@ fn main() -> Result<()> {
             m.peak_working_set_mb,
             m.private_mb - mem0.as_ref().map(|x| x.private_mb).unwrap_or(0.0)
         );
+    }
+    // G6.3: финализация трассировок профилировщика до drop сессий
+    if args.profile_dir.is_some() {
+        let files = engine.end_profiling();
+        println!("ORT profile files: {}", files.join("; "));
     }
     Ok(())
 }

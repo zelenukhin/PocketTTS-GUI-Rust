@@ -172,13 +172,14 @@ fn main() -> Result<()> {
     // каталоги и файлы не удаляются и не перезаписываются никогда.
     let trace_dir = app_core::trace_dir::new_trace_dir(&args.trace_dir)?;
     println!("trace dir: {}", trace_dir.display());
-    use shtorm_engine::{LoadOptions, Pocket};
+    use shtorm_engine::{LoadOptions, ModelPrecision, Pocket};
     let mut engine = Pocket::load(
         &args.model_dir,
         &LoadOptions {
             device: shtorm_engine::Device::cuda(args.device_id),
             threads: 4,
             seed: Some(42),
+            precision: ModelPrecision::Fp32,
             profile_dir: Some(trace_dir.clone()),
         },
     )?;

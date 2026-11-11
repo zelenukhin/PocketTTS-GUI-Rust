@@ -19,6 +19,6 @@ pub mod pocket;
 
 pub use pocket::CleanOutcome;
 pub use pocket::{
-    high_shelf, read_voice, resample, Bpe, Device, EosTail, LoadOptions, Pocket,
-    POCKET_MAX_CHUNK_CHARS, POCKET_RATE,
+    high_shelf, read_voice, resample, Bpe, Device, EosTail, GraphStems, LoadOptions,
+    ModelPrecision, Pocket, POCKET_MAX_CHUNK_CHARS, POCKET_RATE,
 };
