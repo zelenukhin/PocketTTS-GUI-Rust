@@ -700,7 +700,7 @@ impl ShtormApp {
             .show(ctx, |ui| {
                 ui.label("Не удалось автоматически сохранить настройки:");
                 ui.add_space(4.0);
-                ui.label(egui::RichText::new(&err).size(SMALL_SIZE));
+                ui.label(egui::RichText::new(&err).small());
                 ui.add_space(4.0);
                 ui.label("Файл настроек не изменён.");
                 ui.add_space(6.0);
@@ -1386,16 +1386,9 @@ const LOG_MIN_HEIGHT: f32 = 48.0;
 const LOG_HEADER_HEIGHT: f32 = 30.0;
 const LOG_HANDLE_HEIGHT: f32 = 6.0;
 
-// Компактная типографика Python GUI в ЛОГИЧЕСКИХ пунктах (egui × DPI).
-const BODY_SIZE: f32 = 13.0;
-/// Вспомогательный текст (пути, пояснения, статусы, предупреждения):
-/// ТОТ ЖЕ размер, что и основной (13 пт) — второстепенность обозначается
-/// цветом (secondary_text_color), а не уменьшением шрифта. Умышленное
-/// уменьшение ниже BODY_SIZE запрещено (регресс в «мелкий серый» текст).
-const SMALL_SIZE: f32 = BODY_SIZE;
-/// Журнал выполнения (моноширинный, плотный): допускается 12–13 пт.
-const MONO_SIZE: f32 = BODY_SIZE;
-const HEADING_SIZE: f32 = 15.0;
+// G6.4-type-default: размеры шрифтов — ЗАВОДСКИЕ egui 0.31, ровно как в
+// G6.3 (b868c1c): Small 9 / Body 12.5 / Button 12.5 / Heading 18 /
+// Monospace 12. Собственных переопределений text_styles НЕТ.
 
 /// Минимальная ширина одной колонки параметров: подпись + ползунок
 /// минимальной ширины + значение + два горизонтальных отступа. Порог
@@ -1408,38 +1401,12 @@ fn two_columns_threshold() -> f32 {
     COLUMN_MIN_WIDTH * 2.0 + COLUMN_GAP
 }
 
-// Детерминированный запрет регресса типографики (проверяется при сборке):
-// вспомогательный текст не мельче основного, журнал не мельче 12 пт,
-// заголовки заметно крупнее. Иначе пути/подсказки/статусы снова
-// превратятся в «мелкий серый» текст.
-const _: () = assert!(SMALL_SIZE >= BODY_SIZE - 0.25);
-const _: () = assert!(MONO_SIZE >= 12.0);
-const _: () = assert!(HEADING_SIZE >= BODY_SIZE + 1.5);
-
 /// Типографика и отступы — один раз при старте. Размеры логические:
 /// при 125/150/200 % Windows масштабирование делает egui, а не мы.
 fn configure_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
-    style.text_styles = [
-        (
-            egui::TextStyle::Heading,
-            egui::FontId::proportional(HEADING_SIZE),
-        ),
-        (egui::TextStyle::Body, egui::FontId::proportional(BODY_SIZE)),
-        (
-            egui::TextStyle::Button,
-            egui::FontId::proportional(BODY_SIZE),
-        ),
-        (
-            egui::TextStyle::Small,
-            egui::FontId::proportional(SMALL_SIZE),
-        ),
-        (
-            egui::TextStyle::Monospace,
-            egui::FontId::monospace(MONO_SIZE),
-        ),
-    ]
-    .into();
+    // text_styles НЕ переопределяем: размеры шрифтов — заводские egui
+    // (как в b868c1c). Меняются только отступы.
     style.spacing.item_spacing = egui::vec2(8.0, 4.0);
     style.spacing.button_padding = egui::vec2(8.0, 4.0);
     style.spacing.interact_size = egui::vec2(36.0, ROW_HEIGHT);
@@ -1463,7 +1430,7 @@ fn secondary_text_color(ui: &egui::Ui) -> egui::Color32 {
 fn secondary_label(ui: &mut egui::Ui, text: impl Into<String>) {
     ui.add(egui::Label::new(
         egui::RichText::new(text.into())
-            .size(SMALL_SIZE)
+            .small()
             .color(secondary_text_color(ui)),
     ));
 }
@@ -1532,7 +1499,7 @@ fn hint(ui: &mut egui::Ui, text: impl Into<String>) {
     ui.add(
         egui::Label::new(
             egui::RichText::new(text)
-                .size(SMALL_SIZE)
+                .small()
                 .color(secondary_text_color(ui)),
         )
         .wrap(),
@@ -1541,7 +1508,7 @@ fn hint(ui: &mut egui::Ui, text: impl Into<String>) {
 
 fn hint_colored(ui: &mut egui::Ui, text: impl Into<String>, color: egui::Color32) {
     let text = soft_wrap_paths(&text.into());
-    ui.add(egui::Label::new(egui::RichText::new(text).size(SMALL_SIZE).color(color)).wrap());
+    ui.add(egui::Label::new(egui::RichText::new(text).small().color(color)).wrap());
 }
 
 /// Мягкие точки переноса для длинных путей: невидимый U+200B после
@@ -1662,7 +1629,7 @@ fn checkbox_row_resp(
         let icon = ui.checkbox(checked, "");
         let text = ui
             .add(
-                egui::Label::new(egui::RichText::new(label).size(BODY_SIZE))
+                egui::Label::new(egui::RichText::new(label))
                     .selectable(false)
                     .truncate()
                     .sense(egui::Sense::click()),
@@ -1748,9 +1715,9 @@ impl eframe::App for ShtormApp {
                         }
                     };
                     let text = match color {
-                        Some(c) => egui::RichText::new(badge).size(SMALL_SIZE).color(c),
+                        Some(c) => egui::RichText::new(badge).small().color(c),
                         None => egui::RichText::new(badge)
-                            .size(SMALL_SIZE)
+                            .small()
                             .color(secondary_text_color(ui)),
                     };
                     ui.add(egui::Label::new(text).truncate())
@@ -1843,7 +1810,7 @@ impl eframe::App for ShtormApp {
                                 ui.add(
                                     egui::Label::new(
                                         egui::RichText::new(format!("сохранено: {}", p.display()))
-                                            .size(SMALL_SIZE)
+                                            .small()
                                             .color(secondary_text_color(ui)),
                                     )
                                     .truncate(),
@@ -1929,14 +1896,14 @@ impl eframe::App for ShtormApp {
                 if errors.is_empty() {
                     ui.label(
                         egui::RichText::new("✓ параметры валидны")
-                            .size(SMALL_SIZE)
+                            .small()
                             .color(ok_color(ui)),
                     );
                 } else {
                     ui.add(
                         egui::Label::new(
                             egui::RichText::new(format!("⚠ {} проблем(ы)", errors.len()))
-                                .size(SMALL_SIZE)
+                                .small()
                                 .color(warn_color(ui)),
                         )
                         .truncate(),
@@ -1951,7 +1918,7 @@ impl eframe::App for ShtormApp {
                 ui.add(
                     egui::Label::new(
                         egui::RichText::new(&self.status)
-                            .size(SMALL_SIZE)
+                            .small()
                             .color(secondary_text_color(ui)),
                     )
                     .truncate(),
@@ -1999,7 +1966,7 @@ impl eframe::App for ShtormApp {
                                                     f.total,
                                                     phase
                                                 ))
-                                                .size(SMALL_SIZE),
+                                                .small(),
                                             )
                                             .truncate(),
                                         );
@@ -2040,7 +2007,7 @@ impl eframe::App for ShtormApp {
                             ui.add(
                                 egui::Label::new(
                                     egui::RichText::new(format!("• {}", soft_wrap_paths(e)))
-                                        .size(SMALL_SIZE)
+                                        .small()
                                         .color(warn_color(ui)),
                                 )
                                 .wrap(),
@@ -3279,28 +3246,24 @@ mod tests {
         configure_style(&ctx);
         let st = ctx.style();
         let size = |style: egui::TextStyle| st.text_styles[&style].size;
-        // Компактный масштаб Python GUI: 13/13/13/15, не 15–16.
-        assert!((13.0..=14.0).contains(&size(egui::TextStyle::Body)));
-        assert!((13.0..=14.0).contains(&size(egui::TextStyle::Button)));
-        // Вспомогательный текст не мельче основного: второстепенность
-        // передаётся цветом, а не размером.
-        assert!(
-            size(egui::TextStyle::Small) >= size(egui::TextStyle::Body) - 0.25,
-            "Small {:?} мельче Body {:?}",
-            size(egui::TextStyle::Small),
-            size(egui::TextStyle::Body)
-        );
-        // Журнал: 12–13 пт — не «мелкий серый».
-        assert!(
-            (12.0..=13.5).contains(&size(egui::TextStyle::Monospace)),
-            "Monospace {:?}",
-            size(egui::TextStyle::Monospace)
-        );
-        assert!((14.0..=16.0).contains(&size(egui::TextStyle::Heading)));
-        assert!(
-            size(egui::TextStyle::Heading) >= size(egui::TextStyle::Body) + 2.0,
-            "заголовки должны быть заметно крупнее основного текста"
-        );
+        // Размеры шрифтов — ЗАВОДСКИЕ egui, как в G6.3 (b868c1c):
+        // Small 9 / Body 12.5 / Button 12.5 / Heading 18 / Monospace 12.
+        // configure_style не имеет права переопределять text_styles.
+        let default_styles = egui::Style::default().text_styles;
+        for style in [
+            egui::TextStyle::Small,
+            egui::TextStyle::Body,
+            egui::TextStyle::Button,
+            egui::TextStyle::Heading,
+            egui::TextStyle::Monospace,
+        ] {
+            assert_eq!(
+                st.text_styles[&style].size, default_styles[&style].size,
+                "{style:?}: собственное переопределение размера шрифта"
+            );
+        }
+        assert!((12.0..=13.0).contains(&size(egui::TextStyle::Body)));
+        assert!((17.0..=19.0).contains(&size(egui::TextStyle::Heading)));
         assert!((24.0..=28.0).contains(&st.spacing.interact_size.y));
         assert!((14.0..=16.0).contains(&st.spacing.icon_width));
         assert!((3.0..=5.0).contains(&st.spacing.item_spacing.y));
