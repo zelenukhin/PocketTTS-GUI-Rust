@@ -1373,22 +1373,23 @@ impl ShtormApp {
 /// Максимальная ширина формы: на широком мониторе поля не растягиваются на
 /// всю ширину, а форма центрируется.
 const FORM_MAX_WIDTH: f32 = 1160.0;
-const LABEL_WIDTH: f32 = 150.0;
-/// Высота строки параметра — под основной текст 13 пт с полями.
-const ROW_HEIGHT: f32 = 24.0;
+const LABEL_WIDTH: f32 = 165.0;
+/// Высота строки параметра — под основной текст 15 пт с полями.
+const ROW_HEIGHT: f32 = 26.0;
 const SLIDER_MIN_WIDTH: f32 = 80.0;
 const SLIDER_MAX_WIDTH: f32 = 360.0;
 /// Запас справа под значение ползунка («0.30», «300», «8.0»), чтобы оно
 /// не обрезалось краем колонки.
-const SLIDER_VALUE_RESERVE: f32 = 56.0;
+const SLIDER_VALUE_RESERVE: f32 = 64.0;
 const COMBO_MAX_WIDTH: f32 = 300.0;
 const LOG_MIN_HEIGHT: f32 = 48.0;
-const LOG_HEADER_HEIGHT: f32 = 30.0;
+const LOG_HEADER_HEIGHT: f32 = 34.0;
 const LOG_HANDLE_HEIGHT: f32 = 6.0;
 
-// G6.4-type-default: размеры шрифтов — ЗАВОДСКИЕ egui 0.31, ровно как в
-// G6.3 (b868c1c): Small 9 / Body 12.5 / Button 12.5 / Heading 18 /
-// Monospace 12. Собственных переопределений text_styles НЕТ.
+// Типографика e03342f (G6.4-fix) в ЛОГИЧЕСКИХ пунктах: egui × DPI.
+const BODY_SIZE: f32 = 15.0;
+const SMALL_SIZE: f32 = 14.0;
+const HEADING_SIZE: f32 = 19.0;
 
 /// Минимальная ширина одной колонки параметров: подпись + ползунок
 /// минимальной ширины + значение + два горизонтальных отступа. Порог
@@ -1405,15 +1406,33 @@ fn two_columns_threshold() -> f32 {
 /// при 125/150/200 % Windows масштабирование делает egui, а не мы.
 fn configure_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
-    // text_styles НЕ переопределяем: размеры шрифтов — заводские egui
-    // (как в b868c1c). Меняются только отступы.
-    style.spacing.item_spacing = egui::vec2(8.0, 4.0);
-    style.spacing.button_padding = egui::vec2(8.0, 4.0);
-    style.spacing.interact_size = egui::vec2(36.0, ROW_HEIGHT);
-    style.spacing.icon_width = 14.0;
-    style.spacing.icon_width_inner = 8.0;
-    style.spacing.icon_spacing = 4.0;
-    style.spacing.indent = 18.0;
+    style.text_styles = [
+        (
+            egui::TextStyle::Heading,
+            egui::FontId::proportional(HEADING_SIZE),
+        ),
+        (egui::TextStyle::Body, egui::FontId::proportional(BODY_SIZE)),
+        (
+            egui::TextStyle::Button,
+            egui::FontId::proportional(BODY_SIZE),
+        ),
+        (
+            egui::TextStyle::Small,
+            egui::FontId::proportional(SMALL_SIZE),
+        ),
+        (
+            egui::TextStyle::Monospace,
+            egui::FontId::monospace(SMALL_SIZE),
+        ),
+    ]
+    .into();
+    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+    style.spacing.button_padding = egui::vec2(10.0, 5.0);
+    style.spacing.interact_size = egui::vec2(40.0, ROW_HEIGHT);
+    style.spacing.icon_width = 16.0;
+    style.spacing.icon_width_inner = 9.0;
+    style.spacing.icon_spacing = 5.0;
+    style.spacing.indent = 20.0;
     ctx.set_style(style);
 }
 
@@ -1570,7 +1589,7 @@ fn combo_row(
 
 /// Фиксированная ширина кнопки «Обзор…»: поле получает ровно остаток
 /// строки, поэтому длинный путь не выталкивает кнопку за пределы окна.
-const BROWSE_BUTTON_WIDTH: f32 = 84.0;
+const BROWSE_BUTTON_WIDTH: f32 = 92.0;
 
 /// Ширины (поле, кнопка) для строки пути: сумма + отступ не превышает
 /// доступную ширину. Вынесено для юнит-теста адаптивности.
@@ -1629,7 +1648,7 @@ fn checkbox_row_resp(
         let icon = ui.checkbox(checked, "");
         let text = ui
             .add(
-                egui::Label::new(egui::RichText::new(label))
+                egui::Label::new(egui::RichText::new(label).size(BODY_SIZE))
                     .selectable(false)
                     .truncate()
                     .sense(egui::Sense::click()),
@@ -1854,7 +1873,7 @@ impl eframe::App for ShtormApp {
                 let run = ui.add_enabled(
                     errors.is_empty() && !job_running,
                     egui::Button::new(egui::RichText::new("Запустить синтез").strong())
-                        .min_size(egui::vec2(160.0, 24.0)),
+                        .min_size(egui::vec2(160.0, 26.0)),
                 );
                 if run.clicked() {
                     self.start_job(ctx);
@@ -1868,7 +1887,7 @@ impl eframe::App for ShtormApp {
                         .add_enabled(
                             self.stop_available(),
                             egui::Button::new("Стоп")
-                                .min_size(egui::vec2(72.0, 24.0))
+                                .min_size(egui::vec2(72.0, 26.0))
                                 .fill(egui::Color32::from_rgb(150, 45, 45)),
                         )
                         .on_disabled_hover_text(
@@ -1883,7 +1902,7 @@ impl eframe::App for ShtormApp {
                     }
                 }
                 if ui
-                    .add(egui::Button::new("Сохранить настройки").min_size(egui::vec2(0.0, 24.0)))
+                    .add(egui::Button::new("Сохранить настройки").min_size(egui::vec2(0.0, 26.0)))
                     .clicked()
                 {
                     // общий метод (используется и тестами) — логика состояния
@@ -3246,28 +3265,19 @@ mod tests {
         configure_style(&ctx);
         let st = ctx.style();
         let size = |style: egui::TextStyle| st.text_styles[&style].size;
-        // Размеры шрифтов — ЗАВОДСКИЕ egui, как в G6.3 (b868c1c):
-        // Small 9 / Body 12.5 / Button 12.5 / Heading 18 / Monospace 12.
-        // configure_style не имеет права переопределять text_styles.
-        let default_styles = egui::Style::default().text_styles;
-        for style in [
-            egui::TextStyle::Small,
-            egui::TextStyle::Body,
-            egui::TextStyle::Button,
-            egui::TextStyle::Heading,
-            egui::TextStyle::Monospace,
-        ] {
-            assert_eq!(
-                st.text_styles[&style].size, default_styles[&style].size,
-                "{style:?}: собственное переопределение размера шрифта"
-            );
-        }
-        assert!((12.0..=13.0).contains(&size(egui::TextStyle::Body)));
-        assert!((17.0..=19.0).contains(&size(egui::TextStyle::Heading)));
-        assert!((24.0..=28.0).contains(&st.spacing.interact_size.y));
-        assert!((14.0..=16.0).contains(&st.spacing.icon_width));
-        assert!((3.0..=5.0).contains(&st.spacing.item_spacing.y));
-        assert!(st.spacing.indent >= 16.0);
+        // Типографика e03342f (G6.4-fix): Body/Button 15, Small/Mono 14,
+        // Heading 19 — читаемые размеры, согласованные заказчиком.
+        assert!((15.0..=16.0).contains(&size(egui::TextStyle::Body)));
+        assert!((15.0..=16.0).contains(&size(egui::TextStyle::Button)));
+        assert!((14.0..=15.0).contains(&size(egui::TextStyle::Small)));
+        assert!(
+            size(egui::TextStyle::Heading) >= size(egui::TextStyle::Body) + 3.0,
+            "заголовки должны быть заметно крупнее основного текста"
+        );
+        assert!((26.0..=28.0).contains(&st.spacing.interact_size.y));
+        assert!(st.spacing.icon_width >= 16.0);
+        assert!(st.spacing.item_spacing.y >= 8.0);
+        assert!(st.spacing.indent >= 18.0);
     }
 
     /// G6.4 (визуальная приёмка): иконка чекбокса и подпись — разные
