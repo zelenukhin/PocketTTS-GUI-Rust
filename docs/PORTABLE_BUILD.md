@@ -470,3 +470,34 @@ audio files are never overwritten» — с G5 неточная (перезапи
 
 Ограничение: как и ранее, проверка выполнена на машине разработки, чистая
 Windows-VM не проверялась.
+
+## Результаты проверки G6.3 (2026-11-11)
+
+Комплект: `dist\ShtormTTS-Portable-2026-11-11-g63-final-v2` — из чистого
+дерева git `d615532` (dirty=false), 60 файлов (54 прежних + три INT8-графа
+× две модели), 3610.9 MiB, exe SHA256
+`4AE97D219DDBC34AC87EE6433D2B2798BF6B444BC54AC8B92797757CEDBF88D7`.
+Крупные файлы — hardlink (`-HardLinkPayload`; диск C: заполнен, ~4 ГБ
+свободно; hardlink не занимает дополнительное место и не меняет содержимое).
+Промежуточный каталог `...-g63-final` был собран из dirty-дерева (незакоммичен
+README) — не считается эталонным, не удалялся, использовать `-v2`.
+
+Приёмка (`out/g63_portable_acceptance.ps1`, запуск с CWD `C:\`; полный лог —
+`out/g63/portable_acceptance.log`):
+
+- **M1/M2 манифест**: 6 записей `*_int8.onnx`; SHA256 манифеста совпадают с
+  файлами (6 INT8 + exe).
+- **A1 `--portable-check`**: OK, все пути из каталога комплекта.
+- **B1 FP32 CPU selftest**: Completed (RTF 0.914).
+- **C1 INT8 CPU selftest** (`model=FastInt8` в настройках): Completed,
+  RTF 0.623; в логе — фактическая загрузка `flow_lm_main_int8` /
+  `flow_lm_flow_int8` / `mimi_decoder_int8`.
+- **D1 INT8 CPU batch** (`--portable-selftest-batch`): 2/2.
+- **E1 FP32 CUDA selftest**: Completed (RTF 0.419, I/O Binding активен).
+- **F1 INT8 CUDA selftest** (`model=SlowInt8`): Completed (RTF 0.531 —
+  экспериментальный режим: медленнее FP32, как задокументировано).
+- **G1**: `shtorm_gui_settings.json` восстановлен из example побайтово.
+
+Автосохранение выбора точности и отсутствие консольных окон проверены на
+том же exe вне комплекта (`out/g63_gui_e2e4.ps1`, 9/9 PASS); GUI-подсистема
+и спавны детей не менялись со времён G6.2.3.
