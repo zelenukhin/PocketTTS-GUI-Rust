@@ -361,6 +361,19 @@ WAV/MP3/Opus без накопления аудио в памяти, одино�
   1×2 pool, 2×2 hybrid 12/12 (2 процесса, 4 Pocket, 40.9 с, VRAM к базе),
   hybrid cancel/overwrite/MP3/Opus, single overwrite WAV, batch CPU —
   зелёные.
+- **G6.2.3-fix (небольшой дефект)**: после повреждённого конфига успешное
+  РУЧНОЕ сохранение переводило файл в корректное состояние, но
+  `settings_load` оставался `Unreadable` — автосохранение при закрытии
+  молча пропускалось и последние правки терялись. Исправление: логика
+  кнопки «Сохранить настройки» вынесена в общий метод `manual_save()`
+  (используется и тестами); при `Ok(())` — снимок обновляется и состояние
+  становится `Loaded`; при ошибке `Unreadable` сохраняется, повреждённый
+  JSON не тронут. +4 регрессионных теста (Unreadable→ручное
+  сохранение→правки→закрытие→reload; ошибка ручного сохранения; закрытие
+  без ручного сохранения; Loaded→ручное сохранение→закрытие без правок —
+  без повторной записи). Машина CloseFlow, атомарная запись и защита
+  unknown-key не менялись; portable не пересобирался (изменение только
+  состояния загрузки настроек).
 - **Portable**: финальный комплект
   `C:\PocketTTS-GUI-Rust\dist\ShtormTTS-Portable-2026-11-11-g623-final`
   — git `4579ca9` dirty=false, 54 файла, 3404.1 MiB, exe SHA256
@@ -494,9 +507,10 @@ WAV/MP3/Opus без накопления аудио в памяти, одино�
 
 ## Результаты последних проверок (2026-11-11, Windows, release)
 
-- **G6.2.3**: `cargo fmt --all -- --check` OK; `cargo clippy --all-targets
-  -- -D warnings` — 0 предупреждений; `cargo test` — **255 passed /
-  0 failed / 30 ignored** (+7 close-flow); `cargo build --release` OK;
+- **G6.2.3 + G6.2.3-fix**: `cargo fmt --all -- --check` OK;
+  `cargo clippy --all-targets --release -- -D warnings` — 0; `cargo test
+  --release` — **259 passed / 0 failed / 30 ignored** (2 контрольных
+  прогона подряд; +7 close-flow, +4 ручное-сохранение/Unreadable); `cargo build --release` OK;
   PE subsystem release=WINDOWS_GUI (debug=CONSOLE). E2E реального EXE
   (`out/g623_gui_e2e.ps1`): A1/A3 тема+свёртки round-trip, A2 MaxSpeed в
   JSON (в юнит-тесте), A4 закрытие при активной генерации (cancel+save+

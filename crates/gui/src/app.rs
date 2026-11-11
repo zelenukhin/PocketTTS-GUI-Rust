@@ -596,6 +596,35 @@ impl ShtormApp {
         }
     }
 
+    /// Ручное сохранение кнопкой «Сохранить настройки» (и тестами — общий
+    /// метод, чтобы логика состояния не дублировалась). При успехе:
+    /// обновляется снимок для пропуска лишней записи при закрытии, и
+    /// НЕЧИТАЕМЫЙ конфиг переводится в Loaded — файл на диске теперь
+    /// корректен по явному действию пользователя, автосохранение при
+    /// закрытии снова работает (дефект G6.2.3-fix: state оставался
+    /// Unreadable и последние правки терялись). При ошибке состояние
+    /// загрузки НЕ меняется: защита повреждённого JSON сохраняется,
+    /// существующий файл не тронут (атомарная запись в save_settings).
+    /// Возвращает текст ошибки для вызывающего кода/тестов.
+    fn manual_save(&mut self) -> Result<(), String> {
+        self.settings.clamped();
+        match save_settings(&self.settings, &self.conf_path) {
+            Ok(()) => {
+                self.last_saved = Some(self.conf_path.clone());
+                self.settings_snapshot =
+                    serde_json::to_string_pretty(&self.settings).unwrap_or_default();
+                self.settings_load = SettingsLoadState::Loaded;
+                self.status = format!("сохранено: {}", self.conf_path.display());
+                Ok(())
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                self.status = format!("ошибка сохранения: {msg}");
+                Err(msg)
+            }
+        }
+    }
+
     /// Попытка автосохранения при закрытии (G6.2.3). Политики:
     /// - конфиг не читался при старте (повреждён) — НЕ перезаписывать молча:
     ///   пользовательский файл остаётся нетронутым, причина — в журнале
@@ -854,18 +883,9 @@ impl eframe::App for ShtormApp {
                     );
                 }
                 if ui.button("Сохранить настройки").clicked() {
-                    self.settings.clamped();
-                    match save_settings(&self.settings, &self.conf_path) {
-                        Ok(()) => {
-                            self.last_saved = Some(self.conf_path.clone());
-                            // G6.2.3: ручное сохранение обновляет снимок —
-                            // закрытие без дальнейших правок не пишет файл снова
-                            self.settings_snapshot =
-                                serde_json::to_string_pretty(&self.settings).unwrap_or_default();
-                            self.status = format!("сохранено: {}", self.conf_path.display());
-                        }
-                        Err(e) => self.status = format!("ошибка сохранения: {e:#}"),
-                    }
+                    // общий метод (используется и тестами) — логика состояния
+                    // загрузки не дублируется
+                    let _ = self.manual_save();
                 }
                 // G5: переключение темы сохраняется вместе с настройками.
                 ui.checkbox(&mut self.settings.theme_dark, "Тёмная тема");
@@ -2450,5 +2470,123 @@ mod tests {
         app3.settings.temperature = 0.9;
         <ShtormApp as eframe::App>::on_exit(&mut app3, None);
         assert_eq!(std::fs::read(&conf2).unwrap(), b"not json");
+    }
+
+    // ===== G6.2.3-fix: ручное сохранение и состояние Unreadable =====
+
+    /// Дефект G6.2.3: Unreadable → ручное сохранение (успех) → правки →
+    /// закрытие → повторная загрузка: последние изменения обязаны
+    /// сохраниться (раньше settings_load оставался Unreadable, и
+    /// автосохранение на закрытии молча пропускалось).
+    #[test]
+    fn manual_save_unlocks_autosave_after_unreadable_config() {
+        let conf = close_sandbox("fix_unlock");
+        std::fs::write(&conf, b"{ broken json").unwrap();
+        let mut app = ShtormApp::with_conf_path(conf.clone());
+        assert_eq!(app.settings_load, SettingsLoadState::Unreadable);
+        // пользователь вручную восстанавливает конфиг (осознанное решение)
+        app.settings.temperature = 0.4;
+        app.manual_save()
+            .expect("ручное сохранение перезаписывает битый файл");
+        assert_eq!(app.settings_load, SettingsLoadState::Loaded);
+        // ...затем меняет ещё несколько настроек и закрывает окно
+        app.settings.temperature = 0.61;
+        app.settings.theme_dark = false;
+        let cmds = close_frame(&mut app, true);
+        assert!(has_cancel_close(&cmds) && has_close(&cmds));
+        assert_eq!(app.close_flow, CloseFlow::Closing);
+        let reloaded = load_settings(&conf).unwrap();
+        assert_eq!(reloaded.temperature, 0.61, "последние правки сохранены");
+        assert!(!reloaded.theme_dark);
+    }
+
+    /// Unreadable → ручное сохранение (ОШИБКА, read-only цель) → закрытие:
+    /// состояние остаётся Unreadable (защита не снята), повреждённый файл
+    /// не перезаписан ни ручной попыткой, ни автосохранением.
+    #[cfg(windows)]
+    #[test]
+    fn manual_save_failure_keeps_unreadable_and_broken_file() {
+        let conf = close_sandbox("fix_fail");
+        let broken = b"{ broken json";
+        std::fs::write(&conf, broken).unwrap();
+        // read-only у ЦЕЛИ: атомарная замена MoveFileExW не может подменить
+        // файл с атрибутом «только чтение»
+        let mut perms = std::fs::metadata(&conf).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&conf, perms).unwrap();
+
+        let mut app = ShtormApp::with_conf_path(conf.clone());
+        assert_eq!(app.settings_load, SettingsLoadState::Unreadable);
+        app.settings.temperature = 0.7;
+        assert!(app.manual_save().is_err(), "read-only цель — отказ записи");
+        assert_eq!(
+            app.settings_load,
+            SettingsLoadState::Unreadable,
+            "ошибка ручного сохранения НЕ снимает защиту повреждённого конфига"
+        );
+        // закрытие: политика Unreadable — пропуск автосохранения, файл цел
+        let cmds = close_frame(&mut app, true);
+        assert!(has_cancel_close(&cmds) && has_close(&cmds));
+        assert_eq!(std::fs::read(&conf).unwrap(), broken, "файл байт-в-байт");
+
+        // восстановить атрибут артефакта песочницы
+        {
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                SetFileAttributesW, FILE_ATTRIBUTE_NORMAL,
+            };
+            let wide: Vec<u16> = conf
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            // SAFETY: wide — NUL-терминированный путь песочницы этого теста
+            unsafe { SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_NORMAL) };
+        }
+    }
+
+    /// Unreadable → закрытие БЕЗ ручного сохранения: прежнее защитное
+    /// поведение — автосохранение пропущено, повреждённый файл не тронут,
+    /// лишних временных файлов не появилось (A7-семантика сохранена).
+    #[test]
+    fn unreadable_close_without_manual_save_still_protects_file() {
+        let conf = close_sandbox("fix_protect");
+        let broken = b"{ broken json";
+        std::fs::write(&conf, broken).unwrap();
+        let mut app = ShtormApp::with_conf_path(conf.clone());
+        assert_eq!(app.settings_load, SettingsLoadState::Unreadable);
+        app.settings.temperature = 0.8; // правки пользователя
+        let cmds = close_frame(&mut app, true);
+        assert!(has_cancel_close(&cmds) && has_close(&cmds));
+        assert_eq!(app.close_flow, CloseFlow::Closing);
+        assert_eq!(std::fs::read(&conf).unwrap(), broken);
+        let tmps: Vec<_> = std::fs::read_dir(conf.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("tmp."))
+            .collect();
+        assert!(tmps.is_empty(), "временных файлов нет");
+    }
+
+    /// Loaded → ручное сохранение → закрытие без новых правок: повторной
+    /// записи нет (снимок обновлён ручным сохранением, файл байт-в-байт).
+    #[test]
+    fn manual_save_updates_snapshot_close_writes_nothing() {
+        let conf = close_sandbox("fix_snapshot");
+        save_settings(&GuiSettings::default(), &conf).unwrap();
+        let mut app = ShtormApp::with_conf_path(conf.clone());
+        assert_eq!(app.settings_load, SettingsLoadState::Loaded);
+        app.settings.temperature = 0.5;
+        app.manual_save()
+            .expect("ручное сохранение валидного конфига");
+        let after_manual = std::fs::read(&conf).unwrap();
+        // пользователь больше ничего не меняет и закрывает окно
+        let cmds = close_frame(&mut app, true);
+        assert!(has_close(&cmds));
+        assert_eq!(
+            std::fs::read(&conf).unwrap(),
+            after_manual,
+            "повторной записи при закрытии нет"
+        );
     }
 }
