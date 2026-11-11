@@ -29,6 +29,9 @@ name = "shtorm-gui"
 path = "src/main.rs"
 
 [target.'cfg(windows)'.dependencies]
+# G6.4: HWND живого окна для однократного размещения по рабочей области
+# монитора запуска (физические пиксели, per-monitor DPI).
+raw-window-handle = "0.6"
 windows-sys = { version = "0.59", features = [
     "Win32_Storage_FileSystem",
     "Win32_Foundation",
@@ -40,4 +43,7 @@ windows-sys = { version = "0.59", features = [
     # G6.2.3: MessageBoxW для ошибок CLI при запуске без stderr (GUI-подсистема)
     "Win32_System_Console",
     "Win32_UI_WindowsAndMessaging",
+    # G6.4: рабочая область монитора и per-monitor DPI
+    "Win32_Graphics_Gdi",
+    "Win32_UI_HiDpi",
 ] }

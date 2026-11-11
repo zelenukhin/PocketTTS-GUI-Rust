@@ -165,6 +165,17 @@ pub struct ShtormApp {
     ffmpeg_checked_at: std::time::Instant,
     /// G5: последняя применённая тема (переключатель без лишних set_visuals).
     theme_applied: bool,
+    /// G6.4: полный текст статуса загрузки настроек (tooltip верхней панели;
+    /// сама панель показывает короткую метку).
+    load_note: String,
+    /// G6.4: высота прокручиваемой области журнала в логических точках
+    /// (регулируется перетаскиванием верхней кромки, в конфиг не пишется).
+    log_height: f32,
+    /// G6.4: журнал развёрнут пользователем в этой сессии.
+    log_open: bool,
+    /// G6.4: последняя наблюдённая конфигурация монитора (размер в точках,
+    /// DPI×100) — однократная подстройка при смене монитора/разрешения.
+    monitor_key: Option<(i32, i32, i32)>,
 }
 
 /// Живое задание: флаг отмены, канал событий из потока, поток.
@@ -236,7 +247,10 @@ impl ShtormApp {
         Self {
             settings,
             log: String::new(),
-            status: note,
+            // G6.4: статус загрузки конфига — отдельно от рабочего статуса
+            // (верхняя панель показывает его постоянно, нижняя — ход задания).
+            status: "готов".into(),
+            load_note: note,
             last_saved: None,
             conf_path,
             settings_load,
@@ -254,6 +268,9 @@ impl ShtormApp {
             ffmpeg_check_err: None,
             ffmpeg_checked_at: std::time::Instant::now(),
             theme_applied,
+            log_height: 120.0,
+            log_open: true,
+            monitor_key: None,
         }
     }
 
@@ -807,6 +824,736 @@ impl ShtormApp {
         }
         errs
     }
+
+    /// G6.4: содержимое центральной прокручиваемой области: режим обработки
+    /// и все секции настроек. Ширину задаёт вызывающий (форма центрируется,
+    /// на узком окне колонки автоматически становятся одной).
+    fn form_ui(&mut self, ui: &mut egui::Ui) {
+        let s = &mut self.settings;
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("Режим обработки:").strong());
+            ui.radio_value(&mut s.batch, false, "Один файл");
+            ui.radio_value(&mut s.batch, true, "Каталог (пакетно)");
+            if s.batch {
+                ui.weak("рекурсивно .txt/.md/.log");
+            }
+        });
+        ui.add_space(6.0);
+
+        // ---- Источник и голос ----
+        let batch = s.batch;
+        let resp = egui::CollapsingHeader::new(egui::RichText::new("Источник и голос").strong())
+            .open(Some(s.source_open))
+            .show(ui, |ui| {
+                path_row(
+                    ui,
+                    if batch {
+                        "Исходный каталог:"
+                    } else {
+                        "Текстовый файл:"
+                    },
+                    &mut s.text_file,
+                    || {
+                        if batch {
+                            rfd::FileDialog::new()
+                                .set_title("Выберите каталог с .txt/.md/.log")
+                                .pick_folder()
+                        } else {
+                            rfd::FileDialog::new()
+                                .set_title("Выберите текстовый файл")
+                                .add_filter("Текст", &["txt", "md", "log"])
+                                .pick_file()
+                        }
+                    },
+                );
+                if batch {
+                    hint(
+                        ui,
+                        "Рекурсивно .txt/.md/.log без символических ссылок; выходная папка исключается.",
+                    );
+                }
+                path_row(ui, "WAV-голос:", &mut s.voice_wav, || {
+                    rfd::FileDialog::new()
+                        .set_title("Выберите WAV-голос (1–30 с чистой речи)")
+                        .add_filter("WAV", &["wav"])
+                        .pick_file()
+                });
+                hint(
+                    ui,
+                    "Голосовой референс: поддерживается WAV (.safetensors — в будущих этапах).",
+                );
+            });
+        header_clicked(&resp, &mut s.source_open);
+        ui.add_space(8.0);
+
+        // ---- Модель и устройство ----
+        let resp = egui::CollapsingHeader::new(egui::RichText::new("Модель и устройство").strong())
+            .open(Some(s.model_open))
+            .show(ui, |ui| {
+                let is_cuda = s.device == DeviceChoice::Cuda;
+                let int8 = s.model.precision() == shtorm_engine::ModelPrecision::Int8;
+                let effective_workers = s.effective_workers();
+                let model_note = crate::job::resolve_model_dir(s)
+                    .map(|d| d.display().to_string())
+                    .unwrap_or_else(|e| e.to_string());
+                two_columns(
+                    ui,
+                    |ui| {
+                        // G6.3: один список — вариант сразу задаёт и Fast/Slow,
+                        // и точность графов (FP32/INT8); отдельного поля
+                        // «точность» в интерфейсе нет.
+                        combo_row(ui, "Модель:", "model", s.model.label(), |ui| {
+                            for choice in [
+                                ModelChoice::Fast,
+                                ModelChoice::FastInt8,
+                                ModelChoice::Slow,
+                                ModelChoice::SlowInt8,
+                                ModelChoice::Custom,
+                            ] {
+                                ui.selectable_value(&mut s.model, choice, choice.label());
+                            }
+                        });
+                        if s.model == ModelChoice::Custom {
+                            path_row(ui, "Каталог модели:", &mut s.model_dir, || {
+                                rfd::FileDialog::new()
+                                    .set_title("Каталог модели (flow_lm_main.onnx и др.)")
+                                    .pick_folder()
+                            });
+                        } else {
+                            path_row(ui, "Каталог ONNX:", &mut s.onnx_base, || {
+                                rfd::FileDialog::new()
+                                    .set_title("Каталог с ru-v2-fast / ru-v2-slow")
+                                    .pick_folder()
+                            });
+                        }
+                        ui.horizontal(|ui| {
+                            label_cell(ui, "Устройство:");
+                            let selected = match s.device {
+                                DeviceChoice::Cpu => "CPU",
+                                DeviceChoice::Cuda => "CUDA",
+                            };
+                            egui::ComboBox::from_id_salt("device")
+                                .width(110.0)
+                                .selected_text(selected)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut s.device, DeviceChoice::Cpu, "CPU");
+                                    ui.selectable_value(&mut s.device, DeviceChoice::Cuda, "CUDA");
+                                });
+                            if is_cuda {
+                                ui.add(
+                                    egui::DragValue::new(&mut s.device_id)
+                                        .range(0..=8)
+                                        .prefix("GPU "),
+                                );
+                            }
+                        });
+                    },
+                    |ui| {
+                        let dll = if is_cuda {
+                            &mut s.ort_gpu_dll
+                        } else {
+                            &mut s.ort_cpu_dll
+                        };
+                        path_row(ui, "onnxruntime.dll:", dll, || {
+                            rfd::FileDialog::new()
+                                .set_title("onnxruntime.dll")
+                                .add_filter("DLL", &["dll"])
+                                .pick_file()
+                        });
+                        hint(ui, "(пусто = авто из deps проекта)");
+                        hint(
+                            ui,
+                            format!("Воркеров: {effective_workers} (авто: CPU 2 / CUDA 1)"),
+                        );
+                    },
+                );
+                ui.add_space(2.0);
+                hint(ui, format!("модель: {model_note}"));
+                if int8 {
+                    hint(
+                        ui,
+                        "INT8: 3 квантованных графа (flow_lm_main, flow_lm_flow, \
+                         mimi_decoder) + 2 FP32 (mimi_encoder, text_conditioner).",
+                    );
+                    if is_cuda {
+                        // G6.3: смешанное выполнение — квантованные узлы
+                        // (MatMulInteger/DynamicQuantizeLinear) CUDA EP не
+                        // поддерживает, они идут на CPU с покадровыми
+                        // копиями через PCIe (замер: ~2.7× медленнее FP32).
+                        // Предупреждение без блокировки и смены выбора.
+                        hint_colored(
+                            ui,
+                            "CUDA + INT8: работает, но замеренно ~2.7× медленнее \
+                             FP32 (квантованные узлы выполняются на CPU); для INT8 \
+                             рекомендован CPU. Выбор не меняется автоматически.",
+                            COLOR_CAUTION,
+                        );
+                    }
+                }
+            });
+        header_clicked(&resp, &mut s.model_open);
+        ui.add_space(8.0);
+
+        // ---- Параметры генерации ----
+        let resp = egui::CollapsingHeader::new(egui::RichText::new("Параметры генерации").strong())
+            .open(Some(s.gen_open))
+            .show(ui, |ui| {
+                two_columns(
+                    ui,
+                    |ui| {
+                        slider_row(ui, "Температура:", |ui| {
+                            ui.add(
+                                egui::Slider::new(&mut s.temperature, 0.05..=1.5)
+                                    .step_by(0.05)
+                                    .fixed_decimals(2),
+                            );
+                        });
+                        slider_row(ui, "Шаги декодирования:", |ui| {
+                            ui.add(egui::Slider::new(&mut s.decode_steps, 1..=8));
+                        });
+                        slider_row(ui, "Макс. токенов:", |ui| {
+                            ui.add(egui::Slider::new(&mut s.max_tokens, 10..=300).step_by(5.0));
+                        });
+                        ui.horizontal(|ui| {
+                            label_cell(ui, "Seed:");
+                            ui.add(egui::DragValue::new(&mut s.seed).range(-1..=i64::MAX));
+                            ui.weak("(-1 — случайный)");
+                        });
+                    },
+                    |ui| {
+                        checkbox_row(ui, &mut s.anti_repeat, "Защита от повторов (двухпопытная)");
+                        checkbox_row(ui, &mut s.denoise, "Очистка звука (DPDFNet)");
+                        slider_row(ui, "Яркость (дБ):", |ui| {
+                            ui.add(
+                                egui::Slider::new(&mut s.brightness_db, 0.0..=12.0)
+                                    .fixed_decimals(1),
+                            );
+                        });
+                    },
+                );
+                ui.add_space(4.0);
+                // G4.1: компактная группа EOS — порог и оба хвоста.
+                // Значения teratts-android: порог −4, хвосты 5/3 — без
+                // Python-пересчёта 6/4.
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("EOS (конец речи)").strong())
+                            .on_hover_text(
+                                "Параметры конца речи (EOS) движка teratts-android. \
+                                     Дефолты −4/5/3 воспроизводят оригинальную Android-версию.",
+                            );
+                        if ui
+                            .button("Значения teratts-android")
+                            .on_hover_text(
+                                "Установить порог −4 и хвосты 5/3 — встроенные значения \
+                                     оригинального teratts-android (без пересчёта).",
+                            )
+                            .clicked()
+                        {
+                            s.eos_threshold = crate::settings::EosThresholdSetting::Fixed(-4.0);
+                            s.eos_tail_short = shtorm_engine::EosTail::Fixed(5);
+                            s.eos_tail_long = shtorm_engine::EosTail::Fixed(3);
+                        }
+                    });
+                    // G5: «Авто» в списке больше нет — выбранное значение
+                    // всегда число. Устаревший Auto из старого конфига
+                    // показываем как −4.0 и при любом выборе заменяем числом.
+                    let threshold_label = format!("{}", s.eos_threshold.value());
+                    combo_row(ui, "Порог:", "eos_threshold", &threshold_label, |ui| {
+                        for v in crate::settings::EOS_THRESHOLD_CHOICES {
+                            ui.selectable_value(
+                                &mut s.eos_threshold,
+                                crate::settings::EosThresholdSetting::Fixed(*v),
+                                format!("{v}"),
+                            );
+                        }
+                    })
+                    .on_hover_text(
+                        "Логит EOS выше порога — конец речи. Значение \
+                             передаётся движку как есть; −4.0 — встроенное \
+                             значение teratts-android (не читается из runtime.json).",
+                    );
+                    ui.horizontal(|ui| {
+                        label_cell(ui, "Кадров хвоста EOS:");
+                        ui.label("≤4 слов:").on_hover_text(
+                            "Хвост для коротких чанков (1–4 слова по подготовленному \
+                                 тексту до добавления служебных пробелов).",
+                        );
+                        egui::ComboBox::from_id_salt("eos_tail_short")
+                            .width(64.0)
+                            .selected_text(eos_tail_label(s.eos_tail_short))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut s.eos_tail_short,
+                                    shtorm_engine::EosTail::Default,
+                                    "None",
+                                );
+                                for n in crate::settings::EOS_TAIL_CHOICES {
+                                    ui.selectable_value(
+                                        &mut s.eos_tail_short,
+                                        shtorm_engine::EosTail::Fixed(*n),
+                                        n.to_string(),
+                                    );
+                                }
+                            })
+                            .response
+                            .on_hover_text(EOS_TAIL_TOOLTIP);
+                        ui.label("≥5 слов:").on_hover_text(
+                            "Хвост для длинных чанков (5 и более слов текущего чанка).",
+                        );
+                        egui::ComboBox::from_id_salt("eos_tail_long")
+                            .width(64.0)
+                            .selected_text(eos_tail_label(s.eos_tail_long))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut s.eos_tail_long,
+                                    shtorm_engine::EosTail::Default,
+                                    "None",
+                                );
+                                for n in crate::settings::EOS_TAIL_CHOICES {
+                                    ui.selectable_value(
+                                        &mut s.eos_tail_long,
+                                        shtorm_engine::EosTail::Fixed(*n),
+                                        n.to_string(),
+                                    );
+                                }
+                            })
+                            .response
+                            .on_hover_text(EOS_TAIL_TOOLTIP);
+                    });
+                });
+            });
+        header_clicked(&resp, &mut s.gen_open);
+        ui.add_space(8.0);
+
+        // ---- Паузы и воркеры ----
+        let resp = egui::CollapsingHeader::new(egui::RichText::new("Паузы и воркеры").strong())
+            .open(Some(s.pauses_open))
+            .show(ui, |ui| {
+                let auto_workers = s.effective_workers();
+                // G6.2: режим пакетного CUDA. Гибрид 2×2 включается ТОЛЬКО
+                // осознанным выбором (дефолт — экономичный 1×2); выбор
+                // сохраняется в настройках.
+                let batch_cuda = s.batch && s.device == DeviceChoice::Cuda;
+                two_columns(
+                    ui,
+                    |ui| {
+                        slider_row(ui, "Масштаб пауз:", |ui| {
+                            ui.add(
+                                egui::Slider::new(&mut s.pause_scale, 0.0..=2.0)
+                                    .step_by(0.05)
+                                    .fixed_decimals(2),
+                            );
+                        });
+                        slider_row(ui, "Пауза абзаца (с):", |ui| {
+                            ui.add(
+                                egui::Slider::new(&mut s.paragraph_pause_s, 0.0..=3.0)
+                                    .step_by(0.05)
+                                    .fixed_decimals(2),
+                            );
+                        });
+                        let mut manual = s.workers.is_some();
+                        if ui.checkbox(&mut manual, "Воркеров вручную").changed() {
+                            s.workers = if manual {
+                                Some(auto_workers.max(1))
+                            } else {
+                                None
+                            };
+                        }
+                        if let Some(w) = &mut s.workers {
+                            ui.add(egui::Slider::new(w, 1..=12));
+                        }
+                    },
+                    |ui| {
+                        ui.horizontal(|ui| {
+                            label_cell(ui, "Потоков ORT:");
+                            ui.add(egui::DragValue::new(&mut s.threads).range(1..=16));
+                        });
+                        hint(ui, "intra-op, паритет с CLI --threads (по умолчанию 4)");
+                        if batch_cuda {
+                            combo_row(
+                                ui,
+                                "Пакетный CUDA:",
+                                "batch_cuda_mode",
+                                s.batch_cuda_mode.label(),
+                                |ui| {
+                                    ui.selectable_value(
+                                        &mut s.batch_cuda_mode,
+                                        crate::settings::BatchCudaMode::Economy,
+                                        crate::settings::BatchCudaMode::Economy.label(),
+                                    );
+                                    ui.selectable_value(
+                                        &mut s.batch_cuda_mode,
+                                        crate::settings::BatchCudaMode::MaxSpeed,
+                                        crate::settings::BatchCudaMode::MaxSpeed.label(),
+                                    );
+                                },
+                            );
+                            hint(
+                                ui,
+                                match s.batch_cuda_mode {
+                                    crate::settings::BatchCudaMode::Economy => {
+                                        "1 процесс × 2 постоянных воркера, ~4.9 ГБ VRAM — \
+                                         проверенный режим"
+                                    }
+                                    crate::settings::BatchCudaMode::MaxSpeed => {
+                                        "2 процесса × 2 постоянных воркера, ~9.2 ГБ VRAM: \
+                                         быстрее, но нужен запас свободной VRAM (префлайт; \
+                                         иначе — экономичный режим)"
+                                    }
+                                },
+                            );
+                        }
+                    },
+                );
+            });
+        header_clicked(&resp, &mut s.pauses_open);
+        ui.add_space(8.0);
+
+        // ---- Вывод и формат ----
+        let resp = egui::CollapsingHeader::new(egui::RichText::new("Вывод и формат").strong())
+            .open(Some(s.out_open))
+            .show(ui, |ui| {
+                let needs_ffmpeg = s.format.needs_ffmpeg();
+                two_columns(
+                    ui,
+                    |ui| {
+                        ui.horizontal(|ui| {
+                            label_cell(ui, "Формат:");
+                            egui::ComboBox::from_id_salt("format")
+                                .width(90.0)
+                                .selected_text(s.format.label())
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut s.format,
+                                        OutputFormatChoice::Wav,
+                                        "WAV",
+                                    );
+                                    ui.selectable_value(
+                                        &mut s.format,
+                                        OutputFormatChoice::Mp3,
+                                        "MP3",
+                                    );
+                                    ui.selectable_value(
+                                        &mut s.format,
+                                        OutputFormatChoice::Opus,
+                                        "Opus",
+                                    );
+                                });
+                            // Пресеты раздельные: каждый формат показывает и
+                            // меняет только свой — несовместимый выбор невозможен.
+                            match s.format {
+                                OutputFormatChoice::Mp3 => {
+                                    egui::ComboBox::from_id_salt("mp3_preset")
+                                        .width(170.0)
+                                        .selected_text(&s.mp3_preset)
+                                        .show_ui(ui, |ui| {
+                                            for p in crate::settings::MP3_PRESETS {
+                                                ui.selectable_value(
+                                                    &mut s.mp3_preset,
+                                                    (*p).to_string(),
+                                                    *p,
+                                                );
+                                            }
+                                        });
+                                }
+                                OutputFormatChoice::Opus => {
+                                    egui::ComboBox::from_id_salt("opus_preset")
+                                        .width(140.0)
+                                        .selected_text(&s.opus_preset)
+                                        .show_ui(ui, |ui| {
+                                            for p in crate::settings::OPUS_PRESETS {
+                                                ui.selectable_value(
+                                                    &mut s.opus_preset,
+                                                    (*p).to_string(),
+                                                    *p,
+                                                );
+                                            }
+                                        });
+                                }
+                                OutputFormatChoice::Wav => {}
+                            }
+                        });
+                    },
+                    |ui| {
+                        ui.checkbox(&mut s.chunk_log, "Лог чанков");
+                        // G5: замена готового аудиофайла — только явное согласие.
+                        // Старый файл не удаляется до успешного синтеза; замена
+                        // выполняется атомарно после финализации sink.
+                        ui.checkbox(
+                            &mut s.overwrite_existing,
+                            "Перезаписывать существующие файлы",
+                        )
+                        .on_hover_text(
+                            "Выключено (по умолчанию): существующий результат \
+                             пропускается без изменений. Включено: новый аудиофайл \
+                             пишется в уникальный .partial и заменяет готовый только \
+                             после успешного завершения синтеза; при ошибке/отмене \
+                             старый файл остаётся. Защита входных файлов, моделей и \
+                             настроек не ослабляется.",
+                        );
+                    },
+                );
+                if needs_ffmpeg {
+                    path_row(ui, "ffmpeg:", &mut s.ffmpeg_path, || {
+                        rfd::FileDialog::new()
+                            .set_title("ffmpeg.exe")
+                            .add_filter("ffmpeg", &["exe"])
+                            .pick_file()
+                    });
+                }
+                path_row(
+                    ui,
+                    "Папка результата:",
+                    &mut s.out_dir,
+                    || {
+                        rfd::FileDialog::new()
+                            .set_title("Папка результата")
+                            .pick_folder()
+                    },
+                );
+            });
+        header_clicked(&resp, &mut s.out_open);
+        ui.add_space(8.0);
+    }
+
+    /// G6.4: однократная реакция на смену монитора/разрешения/DPI: минимум
+    /// окна и (при необходимости) его размер подрезаются под новый монитор,
+    /// чтобы элементы оставались доступными. Ключ монитора исключает
+    /// повторные команды и resize-циклы; ручной ресайз не затрагивается.
+    fn adapt_to_monitor(&mut self, ctx: &egui::Context) {
+        let (monitor, ppp) = ctx.input(|i| {
+            let vp = i.viewport();
+            (vp.monitor_size, vp.native_pixels_per_point)
+        });
+        let Some(monitor) = monitor else { return };
+        let key = (
+            monitor.x.round() as i32,
+            monitor.y.round() as i32,
+            (ppp.unwrap_or(1.0) * 100.0).round() as i32,
+        );
+        if self.monitor_key == Some(key) {
+            return;
+        }
+        self.monitor_key = Some(key);
+        // Приблизительная доступная область нового монитора: только поля по
+        // краям. Точная рабочая область (без панели задач) вычисляется на
+        // старте (window.rs); здесь важно лишь не оставить окно БОЛЬШЕ
+        // монитора при смене разрешения/отключении второго монитора.
+        let avail = egui::vec2((monitor.x - 32.0).max(240.0), (monitor.y - 32.0).max(180.0));
+        let min = egui::vec2(
+            crate::window::MIN_WIDTH.min(avail.x),
+            crate::window::MIN_HEIGHT.min(avail.y),
+        );
+        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(min));
+        if let Some(rect) = ctx.input(|i| i.viewport().inner_rect) {
+            let size = rect.size();
+            if size.x > avail.x || size.y > avail.y {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                    size.x.min(avail.x),
+                    size.y.min(avail.y),
+                )));
+            }
+        }
+    }
+}
+
+// ===== G6.4: адаптивная компоновка формы =====
+
+/// Максимальная ширина формы: на широком мониторе поля не растягиваются на
+/// всю ширину, а форма центрируется.
+const FORM_MAX_WIDTH: f32 = 1160.0;
+/// Порог перехода «две колонки → одна» по ФАКТИЧЕСКОЙ ширине центральной
+/// панели (не по разрешению монитора).
+const TWO_COLUMN_MIN_WIDTH: f32 = 820.0;
+const LABEL_WIDTH: f32 = 150.0;
+const ROW_HEIGHT: f32 = 22.0;
+const SLIDER_MIN_WIDTH: f32 = 80.0;
+const SLIDER_MAX_WIDTH: f32 = 360.0;
+const COMBO_MAX_WIDTH: f32 = 300.0;
+const LOG_MIN_HEIGHT: f32 = 48.0;
+const LOG_HEADER_HEIGHT: f32 = 30.0;
+const LOG_HANDLE_HEIGHT: f32 = 6.0;
+const COLOR_OK: egui::Color32 = egui::Color32::from_rgb(90, 200, 90);
+const COLOR_WARN: egui::Color32 = egui::Color32::from_rgb(230, 120, 60);
+const COLOR_CAUTION: egui::Color32 = egui::Color32::from_rgb(230, 160, 60);
+
+/// Две колонки только при достаточной ширине панели.
+fn uses_two_columns(available_width: f32) -> bool {
+    available_width >= TWO_COLUMN_MIN_WIDTH
+}
+
+/// Подпись параметра фиксированной ширины — значения в строках выровнены
+/// (как в Python-версии), длинные подписи не ломают сетку. Текст прижат
+/// к левому краю ячейки: `add_sized` центрирует содержимое и давал
+/// «плавающие» подписи.
+fn label_cell(ui: &mut egui::Ui, text: &str) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(LABEL_WIDTH, ROW_HEIGHT),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.add(egui::Label::new(text).truncate())
+                .on_hover_text(text);
+        },
+    );
+}
+
+fn hint(ui: &mut egui::Ui, text: impl Into<String>) {
+    ui.add(egui::Label::new(egui::RichText::new(text.into()).small().weak()).wrap());
+}
+
+fn hint_colored(ui: &mut egui::Ui, text: impl Into<String>, color: egui::Color32) {
+    ui.add(egui::Label::new(egui::RichText::new(text.into()).small().color(color)).wrap());
+}
+
+/// Мягкие точки переноса для длинных путей: невидимый U+200B после
+/// разделителей и каждых 24 символов. Текст визуально не меняется, но
+/// egui может переносить длинный путь, а не обрезать его краем панели.
+fn soft_wrap_paths(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + text.len() / 24);
+    let mut run = 0usize;
+    for ch in text.chars() {
+        out.push(ch);
+        if matches!(ch, '\\' | '/' | ':' | ' ') {
+            run = 0;
+        } else {
+            run += 1;
+            if run >= 24 {
+                out.push('\u{200B}');
+                run = 0;
+            }
+        }
+    }
+    out
+}
+
+/// Строка «подпись + ползунок». Ширина ползунка ограничена: на широком
+/// мониторе он не растягивается на всю колонку, значение видно в самом
+/// ползунке рядом с бегунком.
+fn slider_row(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal(|ui| {
+        label_cell(ui, label);
+        let w = ui
+            .available_width()
+            .clamp(SLIDER_MIN_WIDTH, SLIDER_MAX_WIDTH);
+        ui.spacing_mut().slider_width = w;
+        add(ui);
+    });
+}
+
+/// Строка «подпись + ComboBox» ограниченной ширины.
+fn combo_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    id: &str,
+    selected: &str,
+    add: impl FnOnce(&mut egui::Ui),
+) -> egui::Response {
+    let mut response = None;
+    ui.horizontal(|ui| {
+        label_cell(ui, label);
+        let w = ui.available_width().clamp(80.0, COMBO_MAX_WIDTH);
+        response = Some(
+            egui::ComboBox::from_id_salt(id)
+                .width(w)
+                .selected_text(selected)
+                .show_ui(ui, add)
+                .response,
+        );
+    });
+    response.expect("combo row")
+}
+
+/// Фиксированная ширина кнопки «Обзор…»: поле получает ровно остаток
+/// строки, поэтому длинный путь не выталкивает кнопку за пределы окна.
+const BROWSE_BUTTON_WIDTH: f32 = 74.0;
+
+/// Ширины (поле, кнопка) для строки пути: сумма + отступ не превышает
+/// доступную ширину. Вынесено для юнит-теста адаптивности.
+fn path_widths(available: f32, spacing: f32) -> (f32, f32) {
+    let field = (available - BROWSE_BUTTON_WIDTH - spacing).max(60.0);
+    (field, BROWSE_BUTTON_WIDTH)
+}
+
+/// Строка пути: поле забирает доступную ширину, «Обзор…» всегда остаётся
+/// внутри строки. Раскладка LTR с явными ширинами (right_to_left в
+/// вложенных UI не гарантировал резерв под кнопку).
+fn path_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut String,
+    pick: impl FnOnce() -> Option<PathBuf>,
+) {
+    ui.horizontal(|ui| {
+        label_cell(ui, label);
+        let avail = ui.available_width();
+        let (field_w, button_w) = path_widths(avail, ui.spacing().item_spacing.x);
+        // desired_width(INFINITY) здесь НЕЛЬЗЯ: TextEdit растягивался до
+        // ширины всей строки, выталкивая «Обзор…» за правый край. Ровно
+        // выделенная add_sized ширина — единственный источник размера.
+        ui.add_sized([field_w, ROW_HEIGHT], egui::TextEdit::singleline(value));
+        if ui
+            .add_sized([button_w, ROW_HEIGHT], egui::Button::new("Обзор…"))
+            .clicked()
+        {
+            if let Some(p) = pick() {
+                *value = p.display().to_string();
+            }
+        }
+    });
+}
+
+/// Строка чекбокса с явной раскладкой: иконка в фиксированной ячейке,
+/// подпись — отдельный виджет. Внутри `ui.columns` (justified-колонка)
+/// стандартный `ui.checkbox` растягивался на всю ширину колонки, и подпись
+/// рисовалась поверх иконки (визуальная приёмка G6.4). Здесь иконка и текст
+/// никогда не пересекаются, клик по подписи тоже переключает значение.
+fn checkbox_row(ui: &mut egui::Ui, checked: &mut bool, label: &str) {
+    let _ = checkbox_row_resp(ui, checked, label);
+}
+
+/// Та же строка, но с rect'ами иконки и подписи — для регрессионного теста
+/// «иконка не наезжает на подпись».
+fn checkbox_row_resp(
+    ui: &mut egui::Ui,
+    checked: &mut bool,
+    label: &str,
+) -> (egui::Response, egui::Response) {
+    ui.horizontal(|ui| {
+        let icon_cell = ui.spacing().icon_width + ui.spacing().icon_spacing;
+        ui.spacing_mut().interact_size.x = icon_cell;
+        let icon = ui.checkbox(checked, "");
+        let text = ui.add(
+            egui::Label::new(label)
+                .selectable(false)
+                .sense(egui::Sense::click()),
+        );
+        if text.clicked() {
+            *checked = !*checked;
+        }
+        (icon, text)
+    })
+    .inner
+}
+
+/// Две адаптивные колонки: при недостатке ширины правая часть переходит под
+/// левую (одна колонка, та же логическая группировка).
+fn two_columns(
+    ui: &mut egui::Ui,
+    left: impl FnOnce(&mut egui::Ui),
+    right: impl FnOnce(&mut egui::Ui),
+) {
+    if uses_two_columns(ui.available_width()) {
+        ui.columns(2, |cols| {
+            left(&mut cols[0]);
+            right(&mut cols[1]);
+        });
+    } else {
+        left(ui);
+        ui.add_space(6.0);
+        right(ui);
+    }
 }
 
 impl eframe::App for ShtormApp {
@@ -833,23 +1580,167 @@ impl eframe::App for ShtormApp {
         if self.job.is_some() || self.close_flow != CloseFlow::Idle {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
+        // G6.4: при смене монитора/разрешения/DPI окно остаётся доступным.
+        // Однократно (ключ монитора), не мешает ручному ресайзу.
+        self.adapt_to_monitor(ctx);
 
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.add_space(4.0);
+        // Валидация — один раз за кадр (ffmpeg-проверка кэшируется внутри).
+        let errors = self.validate();
+        let job_running = self.job.is_some();
+
+        // ---- верхняя область: название + краткий статус загрузки настроек ----
+        egui::TopBottomPanel::top("header").show(ctx, |ui| {
+            ui.add_space(2.0);
             ui.horizontal(|ui| {
-                ui.heading("ShtormTTS (нативный GUI)");
-                ui.separator();
-                ui.label(egui::RichText::new(&self.status).weak());
+                ui.label(egui::RichText::new("ShtormTTS").heading().strong());
+                ui.label(egui::RichText::new("нативный GUI").weak());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let (badge, color) = match self.settings_load {
+                        SettingsLoadState::Loaded => ("настройки загружены", None),
+                        SettingsLoadState::FirstRun => ("настройки по умолчанию", None),
+                        SettingsLoadState::Unreadable => {
+                            ("⚠ настройки не прочитаны", Some(COLOR_WARN))
+                        }
+                    };
+                    let text = match color {
+                        Some(c) => egui::RichText::new(badge).small().color(c),
+                        None => egui::RichText::new(badge).small().weak(),
+                    };
+                    ui.add(egui::Label::new(text).truncate())
+                        .on_hover_text(&self.load_note);
+                });
             });
+            ui.add_space(1.0);
         });
-        egui::TopBottomPanel::bottom("bottom").show(ctx, |ui| {
-            ui.add_space(4.0);
-            let errors = self.validate();
-            let job_running = self.job.is_some();
-            ui.horizontal(|ui| {
+
+        // ---- нижняя закреплённая область: журнал (самая нижняя полоса) ----
+        let screen_h = ctx.screen_rect().height();
+        // На очень низком окне журнал автоматически сворачивается: форма
+        // важнее. Пользовательский выбор log_open сохраняется в сессии.
+        let log_max = if screen_h < 460.0 {
+            0.0
+        } else {
+            (screen_h * 0.35).clamp(90.0, 420.0)
+        };
+        let log_visible = self.log_open && log_max >= 40.0;
+        let content_h = if log_visible {
+            self.log_height.clamp(LOG_MIN_HEIGHT, log_max)
+        } else {
+            0.0
+        };
+        let log_panel_h = LOG_HEADER_HEIGHT
+            + if log_visible {
+                LOG_HANDLE_HEIGHT + content_h
+            } else {
+                0.0
+            }
+            + 6.0;
+
+        egui::TopBottomPanel::bottom("log")
+            .exact_height(log_panel_h)
+            .show(ctx, |ui| {
+                ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+                if log_visible {
+                    // Регулируемая высота: тянем верхнюю кромку журнала.
+                    let handle = ui.allocate_response(
+                        egui::vec2(ui.available_width(), LOG_HANDLE_HEIGHT),
+                        egui::Sense::drag(),
+                    );
+                    if handle.hovered() {
+                        ctx.set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                    }
+                    if handle.dragged() {
+                        self.log_height = (self.log_height - handle.drag_delta().y)
+                            .clamp(LOG_MIN_HEIGHT, log_max);
+                    }
+                    ui.painter().hline(
+                        handle.rect.x_range(),
+                        handle.rect.center().y,
+                        ui.visuals().widgets.noninteractive.bg_stroke,
+                    );
+                }
+                ui.horizontal(|ui| {
+                    let arrow = if log_visible { "▼" } else { "▲" };
+                    if ui
+                        .small_button(arrow)
+                        .on_hover_text(if log_visible {
+                            "Свернуть журнал"
+                        } else {
+                            "Развернуть журнал"
+                        })
+                        .clicked()
+                    {
+                        self.log_open = !self.log_open;
+                    }
+                    ui.label(egui::RichText::new("Журнал выполнения").strong());
+                    if self.log_open && !log_visible {
+                        ui.weak("скрыт: недостаточно высоты окна");
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Очистить").clicked() {
+                            // очищается только отображаемая копия; файлы журналов
+                            // (диагностика/лог чанков) на диске не удаляются
+                            self.log.clear();
+                            self.status = "журнал очищен (файлы на диске не тронуты)".into();
+                        }
+                        if ui.button("Копировать").clicked() {
+                            if self.log.is_empty() {
+                                self.status = "журнал пуст — копировать нечего".into();
+                            } else {
+                                ui.ctx().copy_text(self.log.clone());
+                                self.status = "журнал скопирован в буфер обмена".into();
+                            }
+                        }
+                        if ui.available_width() > 220.0 {
+                            if let Some(p) = &self.last_saved {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(format!("сохранено: {}", p.display()))
+                                            .small()
+                                            .weak(),
+                                    )
+                                    .truncate(),
+                                );
+                            }
+                        }
+                    });
+                });
+                if log_visible {
+                    // Собственная прокрутка журнала; колесо над журналом не
+                    // конфликтует с прокруткой формы (это разные панели).
+                    // stick_to_bottom: авто-прокрутка вниз только пока
+                    // пользователь сам находится внизу; чтение старых
+                    // сообщений не сбрасывается.
+                    egui::ScrollArea::vertical()
+                        .id_salt("log_scroll")
+                        .auto_shrink([false, false])
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            if self.log.is_empty() {
+                                ui.weak("пока пусто");
+                            } else {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut self.log)
+                                        .desired_width(f32::INFINITY)
+                                        .desired_rows(4)
+                                        .font(egui::TextStyle::Monospace)
+                                        .interactive(false),
+                                );
+                            }
+                        });
+                }
+            });
+
+        // ---- нижняя закреплённая область: действия, статус, прогресс ----
+        egui::TopBottomPanel::bottom("actions").show(ctx, |ui| {
+            ui.add_space(2.0);
+            // horizontal_wrapped: на узком окне кнопки переносятся на вторую
+            // строку, а не уезжают за край.
+            ui.horizontal_wrapped(|ui| {
                 let run = ui.add_enabled(
                     errors.is_empty() && !job_running,
-                    egui::Button::new("Запустить синтез"),
+                    egui::Button::new(egui::RichText::new("Запустить синтез").strong())
+                        .min_size(egui::vec2(160.0, 26.0)),
                 );
                 if run.clicked() {
                     self.start_job(ctx);
@@ -860,7 +1751,12 @@ impl eframe::App for ShtormApp {
                     // Finalizing/Publishing (их публикация необратима),
                     // в одиночном режиме — после точки решения.
                     let stop = ui
-                        .add_enabled(self.stop_available(), egui::Button::new("Стоп"))
+                        .add_enabled(
+                            self.stop_available(),
+                            egui::Button::new("Стоп")
+                                .min_size(egui::vec2(72.0, 26.0))
+                                .fill(egui::Color32::from_rgb(150, 45, 45)),
+                        )
                         .on_disabled_hover_text(
                             "идёт сохранение результата — отмена уже не может предотвратить \
                              замену файла; кнопка вернётся после завершения",
@@ -871,33 +1767,46 @@ impl eframe::App for ShtormApp {
                             self.status = "отмена…".into();
                         }
                     }
-                } else if errors.is_empty() {
-                    ui.label(
-                        egui::RichText::new("✓ параметры валидны")
-                            .color(egui::Color32::from_rgb(90, 200, 90)),
-                    );
-                } else {
-                    ui.label(
-                        egui::RichText::new(format!("⚠ {} проблем(ы)", errors.len()))
-                            .color(egui::Color32::from_rgb(230, 120, 60)),
-                    );
                 }
-                if ui.button("Сохранить настройки").clicked() {
+                if ui
+                    .add(egui::Button::new("Сохранить настройки").min_size(egui::vec2(0.0, 26.0)))
+                    .clicked()
+                {
                     // общий метод (используется и тестами) — логика состояния
                     // загрузки не дублируется
                     let _ = self.manual_save();
                 }
                 // G5: переключение темы сохраняется вместе с настройками.
                 ui.checkbox(&mut self.settings.theme_dark, "Тёмная тема");
-            });
-            if !errors.is_empty() {
-                for e in &errors {
+                ui.add_space(10.0);
+                if errors.is_empty() {
                     ui.label(
-                        egui::RichText::new(format!("• {e}"))
-                            .color(egui::Color32::from_rgb(230, 120, 60)),
+                        egui::RichText::new("✓ параметры валидны")
+                            .small()
+                            .color(COLOR_OK),
                     );
+                } else {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("⚠ {} проблем(ы)", errors.len()))
+                                .small()
+                                .color(COLOR_WARN),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(errors.join("\n"));
                 }
+            });
+
+            // Рабочий статус (ход задания / сохранения) — отдельно от статуса
+            // загрузки конфига в верхней панели.
+            if !self.status.is_empty() {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(&self.status).small().weak()).truncate(),
+                )
+                .on_hover_text(&self.status);
             }
+
             // Пакетный режим (G6.1): общий прогресс по файлам K/N + активные
             // файлы пула (каждый со своим прогрессом чанков и фазой);
             // одиночный режим — один бар по чанкам.
@@ -913,19 +1822,41 @@ impl eframe::App for ShtormApp {
                                 ))
                                 .show_percentage(),
                         );
-                        for f in &bs.active {
-                            let phase = match f.phase {
-                                JobPhase::Generating => "генерация",
-                                JobPhase::Finalizing | JobPhase::Publishing => "сохранение",
-                            };
-                            ui.label(format!(
-                                "  [{}/{}] {} — чанки {}/{} ({})",
-                                f.index, bs.total, f.name, f.done, f.total, phase
-                            ));
+                        if !bs.active.is_empty() {
+                            let h = (screen_h * 0.06).clamp(24.0, 48.0);
+                            egui::ScrollArea::vertical()
+                                .id_salt("batch_active")
+                                .max_height(h)
+                                .show(ui, |ui| {
+                                    ui.spacing_mut().item_spacing.y = 2.0;
+                                    for f in &bs.active {
+                                        let phase = match f.phase {
+                                            JobPhase::Generating => "генерация",
+                                            JobPhase::Finalizing | JobPhase::Publishing => {
+                                                "сохранение"
+                                            }
+                                        };
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(format!(
+                                                    "[{}/{}] {} — чанки {}/{} ({})",
+                                                    f.index,
+                                                    bs.total,
+                                                    f.name,
+                                                    f.done,
+                                                    f.total,
+                                                    phase
+                                                ))
+                                                .small(),
+                                            )
+                                            .truncate(),
+                                        );
+                                    }
+                                });
                         }
                     }
                 }
-            } else if self.job.is_some() || self.progress.1 > 0 {
+            } else if job_running || self.progress.1 > 0 {
                 let (done, total) = self.progress;
                 let frac = if total > 0 {
                     done as f32 / total as f32
@@ -938,499 +1869,66 @@ impl eframe::App for ShtormApp {
                         .show_percentage(),
                 );
             }
-        });
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let s = &mut self.settings;
-            let resp = egui::CollapsingHeader::new("Источник и голос")
-                .open(Some(s.source_open))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Режим:");
-                        ui.radio_value(&mut s.batch, false, "Один файл");
-                        ui.radio_value(&mut s.batch, true, "Каталог (пакетно)");
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label(if s.batch {
-                            "Исходный каталог:"
-                        } else {
-                            "Текстовый файл:"
-                        });
-                        ui.text_edit_singleline(&mut s.text_file);
-                        if ui.button("Обзор…").clicked() {
-                            let picked = if s.batch {
-                                rfd::FileDialog::new()
-                                    .set_title("Выберите каталог с .txt/.md/.log")
-                                    .pick_folder()
-                            } else {
-                                rfd::FileDialog::new()
-                                    .set_title("Выберите текстовый файл")
-                                    .add_filter("Текст", &["txt", "md", "log"])
-                                    .pick_file()
-                            };
-                            if let Some(p) = picked {
-                                s.text_file = p.display().to_string();
-                            }
-                        }
-                    });
-                    if s.batch {
-                        ui.weak(
-                            "Рекурсивно .txt/.md/.log без символических ссылок; выходная папка исключается.",
-                        );
-                    }
-                    ui.horizontal(|ui| {
-                        ui.label("WAV-голос:");
-                        ui.text_edit_singleline(&mut s.voice_wav);
-                        if ui.button("Обзор…").clicked() {
-                            if let Some(p) = rfd::FileDialog::new()
-                                .set_title("Выберите WAV-голос (1–30 с чистой речи)")
-                                .add_filter("WAV", &["wav"])
-                                .pick_file()
-                            {
-                                s.voice_wav = p.display().to_string();
-                            }
-                        }
-                    });
-                    ui.weak(
-                        "Голосовой референс: поддерживается WAV (.safetensors — в будущих этапах).",
-                    );
-                });
-            header_clicked(&resp, &mut s.source_open);
-            ui.add_space(4.0);
 
-            let resp = egui::CollapsingHeader::new("Модель и устройство")
-                .open(Some(s.model_open))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Модель:");
-                        // G6.3: один список — вариант сразу задаёт и Fast/Slow,
-                        // и точность графов (FP32/INT8); отдельного поля
-                        // «точность» в интерфейсе нет.
-                        egui::ComboBox::from_id_salt("model")
-                            .selected_text(s.model.label())
-                            .show_ui(ui, |ui| {
-                                for choice in [
-                                    ModelChoice::Fast,
-                                    ModelChoice::FastInt8,
-                                    ModelChoice::Slow,
-                                    ModelChoice::SlowInt8,
-                                    ModelChoice::Custom,
-                                ] {
-                                    ui.selectable_value(&mut s.model, choice, choice.label());
-                                }
-                            });
-                    });
-                    if s.model.precision() == shtorm_engine::ModelPrecision::Int8 {
-                        ui.weak(
-                            "INT8: 3 квантованных графа (flow_lm_main, flow_lm_flow, \
-                             mimi_decoder) + 2 FP32 (mimi_encoder, text_conditioner).",
-                        );
-                        if s.device == DeviceChoice::Cuda {
-                            // G6.3: смешанное выполнение — квантованные узлы
-                            // (MatMulInteger/DynamicQuantizeLinear) CUDA EP не
-                            // поддерживает, они идут на CPU с покадровыми
-                            // копиями через PCIe (замер: ~2.7× медленнее FP32).
-                            // Предупреждение без блокировки и смены выбора.
-                            ui.colored_label(
-                                egui::Color32::from_rgb(230, 160, 60),
-                                "CUDA + INT8: работает, но замеренно ~2.7× медленнее \
-                                 FP32 (квантованные узлы выполняются на CPU); для INT8 \
-                                 рекомендован CPU. Выбор не меняется автоматически.",
-                            );
-                        }
-                    }
-                    if s.model == ModelChoice::Custom {
-                        ui.horizontal(|ui| {
-                            ui.label("Каталог модели:");
-                            ui.text_edit_singleline(&mut s.model_dir);
-                            if ui.button("Обзор…").clicked() {
-                                if let Some(p) = rfd::FileDialog::new()
-                                    .set_title("Каталог модели (flow_lm_main.onnx и др.)")
-                                    .pick_folder()
-                                {
-                                    s.model_dir = p.display().to_string();
-                                }
-                            }
-                        });
-                    } else {
-                        ui.horizontal(|ui| {
-                            ui.label("Каталог ONNX (база):");
-                            ui.text_edit_singleline(&mut s.onnx_base);
-                            if ui.button("Обзор…").clicked() {
-                                if let Some(p) = rfd::FileDialog::new()
-                                    .set_title("Каталог с ru-v2-fast / ru-v2-slow")
-                                    .pick_folder()
-                                {
-                                    s.onnx_base = p.display().to_string();
-                                }
-                            }
-                        });
-                        ui.weak(format!(
-                            "модель: {}",
-                            crate::job::resolve_model_dir(s)
-                                .map(|d| d.display().to_string())
-                                .unwrap_or_else(|e| e.to_string())
-                        ));
-                    }
-                    ui.horizontal(|ui| {
-                        ui.label("Устройство:");
-                        egui::ComboBox::from_id_salt("device")
-                            .selected_text(match s.device {
-                                DeviceChoice::Cpu => "CPU",
-                                DeviceChoice::Cuda => "CUDA",
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut s.device, DeviceChoice::Cpu, "CPU");
-                                ui.selectable_value(&mut s.device, DeviceChoice::Cuda, "CUDA");
-                            });
-                        if s.device == DeviceChoice::Cuda {
+            // Сообщения валидации — в ограниченной по высоте области: большое
+            // их количество не вытесняет прокручиваемую форму.
+            if !errors.is_empty() {
+                let h = (screen_h * 0.08).clamp(26.0, 56.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("validation_errors")
+                    .max_height(h)
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        // Жёсткая ширина переноса: длинный путь в тексте
+                        // ошибки не расширяет внутренний UI ScrollArea и не
+                        // обрезается правым краем панели.
+                        let wrap_w = (ui.ctx().screen_rect().width() - 32.0).max(200.0);
+                        ui.set_max_width(wrap_w);
+                        for e in &errors {
                             ui.add(
-                                egui::DragValue::new(&mut s.device_id)
-                                    .range(0..=8)
-                                    .prefix("GPU "),
+                                egui::Label::new(
+                                    egui::RichText::new(format!("• {}", soft_wrap_paths(e)))
+                                        .small()
+                                        .color(COLOR_WARN),
+                                )
+                                .wrap(),
                             );
                         }
                     });
-                    ui.horizontal(|ui| {
-                        let dll = if s.device == DeviceChoice::Cuda {
-                            &mut s.ort_gpu_dll
-                        } else {
-                            &mut s.ort_cpu_dll
-                        };
-                        ui.label("onnxruntime.dll:");
-                        ui.text_edit_singleline(dll);
-                        ui.weak("(пусто = авто из deps проекта)");
-                    });
-                    ui.weak(format!(
-                        "Воркеров: {} (авто: CPU 2 / CUDA 1)",
-                        s.effective_workers()
-                    ));
-                });
-            header_clicked(&resp, &mut s.model_open);
-            ui.add_space(4.0);
+            }
+        });
 
-            let resp = egui::CollapsingHeader::new("Параметры генерации")
-                .open(Some(s.gen_open))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Температура:");
-                        if ui
-                            .add(egui::Slider::new(&mut s.temperature, 0.05..=1.5).step_by(0.05))
-                            .changed()
-                        {
-                            // значение уже в диапазоне слайдера
-                        }
-                        ui.label(format!("{:.2}", s.temperature));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Шаги декодирования:");
-                        ui.add(egui::Slider::new(&mut s.decode_steps, 1..=8));
-                    });
-                    // G4.1: компактная группа EOS — порог и оба хвоста.
-                    // Значения teratts-android: порог −4, хвосты 5/3 — без
-                    // Python-пересчёта 6/4.
-                    ui.group(|ui| {
-                        ui.vertical(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.label("EOS:").on_hover_text(
-                                    "Параметры конца речи (EOS) движка teratts-android. \
-                                     Дефолты −4/5/3 воспроизводят оригинальную Android-версию.",
-                                );
-                                if ui
-                                    .button("Значения teratts-android")
-                                    .on_hover_text(
-                                        "Установить порог −4 и хвосты 5/3 — встроенные значения \
-                                         оригинального teratts-android (без пересчёта).",
-                                    )
-                                    .clicked()
-                                {
-                                    s.eos_threshold =
-                                        crate::settings::EosThresholdSetting::Fixed(-4.0);
-                                    s.eos_tail_short = shtorm_engine::EosTail::Fixed(5);
-                                    s.eos_tail_long = shtorm_engine::EosTail::Fixed(3);
-                                }
+        // ---- центральная прокручиваемая область: вся форма настроек ----
+        // Форма живёт в ЖЁСТКО ограниченном слоте content_w: без этого
+        // вложенные горизонтальные строки расширяли содержимое ScrollArea
+        // кадр от кадра, форма становилась шире панели, а кнопки «Обзор…»
+        // уезжали за правый край (обнаружено в G6.4 визуальной приёмкой).
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+            let avail = ui.available_size();
+            // 18 точек — зазор под вертикальную полосу прокрутки и края.
+            let content_w = (avail.x - 18.0).clamp(160.0, FORM_MAX_WIDTH);
+            let pad = ((avail.x - content_w) / 2.0).max(0.0);
+            ui.horizontal_top(|ui| {
+                ui.add_space(pad);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(content_w, avail.y),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_width(content_w);
+                        egui::ScrollArea::vertical()
+                            .id_salt("form_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                // полоса прокрутки внутри слота — ещё 12 точек
+                                ui.set_max_width(content_w - 12.0);
+                                self.form_ui(ui);
                             });
-                            ui.horizontal(|ui| {
-                                ui.label("Порог:");
-                                // G5: «Авто» в списке больше нет — выбранное
-                                // значение всегда число. Устаревший Auto из
-                                // старого конфига показываем как −4.0 и при
-                                // любом выборе заменяем числом.
-                                let selected = format!("{}", s.eos_threshold.value());
-                                egui::ComboBox::from_id_salt("eos_threshold")
-                                    .selected_text(selected)
-                                    .show_ui(ui, |ui| {
-                                        for v in crate::settings::EOS_THRESHOLD_CHOICES {
-                                            ui.selectable_value(
-                                                &mut s.eos_threshold,
-                                                crate::settings::EosThresholdSetting::Fixed(*v),
-                                                format!("{v}"),
-                                            );
-                                        }
-                                    })
-                                    .response
-                                    .on_hover_text(
-                                        "Логит EOS выше порога — конец речи. Значение \
-                                         передаётся движку как есть; −4.0 — встроенное \
-                                         значение teratts-android (не читается из runtime.json).",
-                                    );
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("Кадров хвоста EOS:");
-                                ui.label("≤4 слов:").on_hover_text(
-                                    "Хвост для коротких чанков (1–4 слова по подготовленному \
-                                     тексту до добавления служебных пробелов).",
-                                );
-                                egui::ComboBox::from_id_salt("eos_tail_short")
-                                    .selected_text(eos_tail_label(s.eos_tail_short))
-                                    .show_ui(ui, |ui| {
-                                        ui.selectable_value(
-                                            &mut s.eos_tail_short,
-                                            shtorm_engine::EosTail::Default,
-                                            "None",
-                                        );
-                                        for n in crate::settings::EOS_TAIL_CHOICES {
-                                            ui.selectable_value(
-                                                &mut s.eos_tail_short,
-                                                shtorm_engine::EosTail::Fixed(*n),
-                                                n.to_string(),
-                                            );
-                                        }
-                                    })
-                                    .response
-                                    .on_hover_text(EOS_TAIL_TOOLTIP);
-                                ui.label("≥5 слов:").on_hover_text(
-                                    "Хвост для длинных чанков (5 и более слов текущего чанка).",
-                                );
-                                egui::ComboBox::from_id_salt("eos_tail_long")
-                                    .selected_text(eos_tail_label(s.eos_tail_long))
-                                    .show_ui(ui, |ui| {
-                                        ui.selectable_value(
-                                            &mut s.eos_tail_long,
-                                            shtorm_engine::EosTail::Default,
-                                            "None",
-                                        );
-                                        for n in crate::settings::EOS_TAIL_CHOICES {
-                                            ui.selectable_value(
-                                                &mut s.eos_tail_long,
-                                                shtorm_engine::EosTail::Fixed(*n),
-                                                n.to_string(),
-                                            );
-                                        }
-                                    })
-                                    .response
-                                    .on_hover_text(EOS_TAIL_TOOLTIP);
-                            });
-                        });
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Seed:");
-                        ui.add(egui::DragValue::new(&mut s.seed).range(-1..=i64::MAX));
-                        ui.weak("(-1 — случайный)");
-                    });
-                    ui.checkbox(&mut s.anti_repeat, "Защита от повторов (двухпопытная)");
-                    ui.checkbox(&mut s.denoise, "Очистка звука (DPDFNet)");
-                    ui.horizontal(|ui| {
-                        ui.label("Яркость (дБ):");
-                        ui.add(egui::Slider::new(&mut s.brightness_db, 0.0..=12.0));
-                    });
-                });
-            header_clicked(&resp, &mut s.gen_open);
-            ui.add_space(4.0);
-
-            let resp = egui::CollapsingHeader::new("Паузы и воркеры")
-                .open(Some(s.pauses_open))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Масштаб пауз:");
-                        ui.add(egui::Slider::new(&mut s.pause_scale, 0.0..=2.0).step_by(0.05));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Пауза абзаца (с):");
-                        ui.add(
-                            egui::Slider::new(&mut s.paragraph_pause_s, 0.0..=3.0).step_by(0.05),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Макс. токенов:");
-                        ui.add(egui::Slider::new(&mut s.max_tokens, 10..=300).step_by(5.0));
-                    });
-                    let mut manual = s.workers.is_some();
-                    if ui.checkbox(&mut manual, "Воркеров вручную").changed() {
-                        s.workers = if manual {
-                            Some(s.effective_workers().max(1))
-                        } else {
-                            None
-                        };
-                    }
-                    if let Some(w) = &mut s.workers {
-                        ui.add(egui::Slider::new(w, 1..=12));
-                    }
-                    ui.horizontal(|ui| {
-                        ui.label("Потоков ORT (intra-op):");
-                        ui.add(egui::DragValue::new(&mut s.threads).range(1..=16));
-                        ui.weak("(паритет с CLI --threads, по умолчанию 4)");
-                    });
-                    // G6.2: режим пакетного CUDA. Гибрид 2×2 включается ТОЛЬКО
-                    // осознанным выбором (дефолт — экономичный 1×2); выбор
-                    // сохраняется в настройках.
-                    if s.batch && s.device == DeviceChoice::Cuda {
-                        ui.horizontal(|ui| {
-                            ui.label("Пакетный CUDA:");
-                            egui::ComboBox::from_id_salt("batch_cuda_mode")
-                                .selected_text(s.batch_cuda_mode.label())
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut s.batch_cuda_mode,
-                                        crate::settings::BatchCudaMode::Economy,
-                                        crate::settings::BatchCudaMode::Economy.label(),
-                                    );
-                                    ui.selectable_value(
-                                        &mut s.batch_cuda_mode,
-                                        crate::settings::BatchCudaMode::MaxSpeed,
-                                        crate::settings::BatchCudaMode::MaxSpeed.label(),
-                                    );
-                                });
-                        });
-                        ui.weak(match s.batch_cuda_mode {
-                            crate::settings::BatchCudaMode::Economy => {
-                                "1 процесс × 2 постоянных воркера, ~4.9 ГБ VRAM — проверенный режим"
-                            }
-                            crate::settings::BatchCudaMode::MaxSpeed => {
-                                "2 процесса × 2 постоянных воркера, ~9.2 ГБ VRAM: быстрее, но нужен                                  запас свободной VRAM (префлайт; иначе — экономичный режим)"
-                            }
-                        });
-                    }
-                });
-            header_clicked(&resp, &mut s.pauses_open);
-            ui.add_space(4.0);
-
-            let resp = egui::CollapsingHeader::new("Вывод")
-                .open(Some(s.out_open))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Формат:");
-                        egui::ComboBox::from_id_salt("format")
-                            .selected_text(s.format.label())
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut s.format, OutputFormatChoice::Wav, "WAV");
-                                ui.selectable_value(&mut s.format, OutputFormatChoice::Mp3, "MP3");
-                                ui.selectable_value(
-                                    &mut s.format,
-                                    OutputFormatChoice::Opus,
-                                    "Opus",
-                                );
-                            });
-                        // Пресеты раздельные: каждый формат показывает и
-                        // меняет только свой — несовместимый выбор невозможен.
-                        match s.format {
-                            OutputFormatChoice::Mp3 => {
-                                egui::ComboBox::from_id_salt("mp3_preset")
-                                    .selected_text(&s.mp3_preset)
-                                    .show_ui(ui, |ui| {
-                                        for p in crate::settings::MP3_PRESETS {
-                                            ui.selectable_value(
-                                                &mut s.mp3_preset,
-                                                (*p).to_string(),
-                                                *p,
-                                            );
-                                        }
-                                    });
-                            }
-                            OutputFormatChoice::Opus => {
-                                egui::ComboBox::from_id_salt("opus_preset")
-                                    .selected_text(&s.opus_preset)
-                                    .show_ui(ui, |ui| {
-                                        for p in crate::settings::OPUS_PRESETS {
-                                            ui.selectable_value(
-                                                &mut s.opus_preset,
-                                                (*p).to_string(),
-                                                *p,
-                                            );
-                                        }
-                                    });
-                            }
-                            OutputFormatChoice::Wav => {}
-                        }
-                        ui.checkbox(&mut s.chunk_log, "Лог чанков");
-                    });
-                    if s.format.needs_ffmpeg() {
-                        ui.horizontal(|ui| {
-                            ui.label("ffmpeg:");
-                            ui.text_edit_singleline(&mut s.ffmpeg_path);
-                            if ui.button("Обзор…").clicked() {
-                                if let Some(p) = rfd::FileDialog::new()
-                                    .set_title("ffmpeg.exe")
-                                    .add_filter("ffmpeg", &["exe"])
-                                    .pick_file()
-                                {
-                                    s.ffmpeg_path = p.display().to_string();
-                                }
-                            }
-                        });
-                    }
-                    ui.horizontal(|ui| {
-                        ui.label("Папка результата:");
-                        ui.text_edit_singleline(&mut s.out_dir);
-                        if ui.button("Обзор…").clicked() {
-                            if let Some(p) = rfd::FileDialog::new()
-                                .set_title("Папка результата")
-                                .pick_folder()
-                            {
-                                s.out_dir = p.display().to_string();
-                            }
-                        }
-                    });
-                    // G5: замена готового аудиофайла — только явное согласие.
-                    // Старый файл не удаляется до успешного синтеза; замена
-                    // выполняется атомарно после финализации sink.
-                    ui.checkbox(
-                        &mut s.overwrite_existing,
-                        "Перезаписывать существующие файлы",
-                    )
-                    .on_hover_text(
-                        "Выключено (по умолчанию): существующий результат \
-                         пропускается без изменений. Включено: новый аудиофайл \
-                         пишется в уникальный .partial и заменяет готовый только \
-                         после успешного завершения синтеза; при ошибке/отмене \
-                         старый файл остаётся. Защита входных файлов, моделей и \
-                         настроек не ослабляется.",
-                    );
-                });
-            header_clicked(&resp, &mut s.out_open);
-            ui.add_space(6.0);
-            ui.separator();
-            ui.label("Журнал:");
-            egui::ScrollArea::vertical()
-                .max_height(ui.available_height() - 28.0)
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut self.log)
-                            .desired_rows(6)
-                            .interactive(false),
-                    );
-                });
-            ui.horizontal(|ui| {
-                // G5: журнал удобно скопировать в буфер обмена целиком.
-                if ui.button("Копировать журнал").clicked() {
-                    if self.log.is_empty() {
-                        self.status = "журнал пуст — копировать нечего".into();
-                    } else {
-                        ui.ctx().copy_text(self.log.clone());
-                        self.status = "журнал скопирован в буфер обмена".into();
-                    }
-                }
-                if ui.button("Очистить журнал").clicked() {
-                    // очищается только отображаемая копия; файлы журналов
-                    // (диагностика/лог чанков) на диске не удаляются
-                    self.log.clear();
-                    self.status = "журнал очищен (файлы на диске не тронуты)".into();
-                }
-                if let Some(p) = &self.last_saved {
-                    ui.weak(format!("последнее сохранение: {}", p.display()));
-                }
+                    },
+                );
             });
         });
+
         // G6.2.3: диалог ошибки автосохранения — поверх панелей
         self.show_autosave_dialog(ctx);
     }
@@ -2599,6 +3097,74 @@ mod tests {
             std::fs::read(&conf).unwrap(),
             after_manual,
             "повторной записи при закрытии нет"
+        );
+    }
+
+    /// G6.4: поле + «Обзор…» + отступ всегда помещаются в доступную ширину
+    /// (на узком окне поле ужимается, кнопка не уезжает за край).
+    #[test]
+    fn path_row_reserves_space_for_browse_button() {
+        for available in [280.0, 360.0, 500.0, 820.0, 1160.0] {
+            let spacing = 8.0;
+            let (field, button) = path_widths(available, spacing);
+            assert!(field >= 60.0, "поле слишком узкое: {field}");
+            assert_eq!(button, BROWSE_BUTTON_WIDTH);
+            assert!(
+                field + button + spacing <= available + 0.01,
+                "строка {available}: поле {field} + кнопка {button} не помещаются"
+            );
+        }
+        // ниже минимума строка вырождается в минимальное поле — но окно
+        // меньше 560 точек недоступно (min_inner_size), см. window.rs
+        let (field, button) = path_widths(120.0, 8.0);
+        assert_eq!((field, button), (60.0, BROWSE_BUTTON_WIDTH));
+    }
+
+    /// G6.4 (визуальная приёмка): иконка чекбокса и подпись — разные
+    /// виджеты, их прямоугольники не пересекаются даже внутри колонки.
+    #[test]
+    fn checkbox_row_icon_and_label_do_not_overlap() {
+        let ctx = egui::Context::default();
+        let mut rects = None;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(500.0);
+                    let mut checked = true;
+                    let (icon, text) =
+                        checkbox_row_resp(ui, &mut checked, "Защита от повторов (двухпопытная)");
+                    rects = Some((icon.rect, text.rect));
+                });
+            });
+        });
+        let (icon, text) = rects.expect("строка чекбокса отрисована");
+        assert!(
+            icon.right() <= text.left() + 0.5,
+            "иконка {icon:?} пересекает подпись {text:?}"
+        );
+        assert!(text.width() > 20.0, "подпись не отрисована: {text:?}");
+    }
+
+    /// G6.4: порог 2→1 колонки зависит только от фактической ширины панели.
+    #[test]
+    fn two_column_threshold_follows_panel_width() {
+        assert!(!uses_two_columns(TWO_COLUMN_MIN_WIDTH - 1.0));
+        assert!(uses_two_columns(TWO_COLUMN_MIN_WIDTH));
+        assert!(uses_two_columns(FORM_MAX_WIDTH));
+    }
+
+    /// G6.4: мягкие переносы не меняют видимый текст (ZWSP невидим), но
+    /// дают возможность перенести длинный неразрывный токен пути.
+    #[test]
+    fn soft_wrap_paths_keeps_text_and_adds_break_points() {
+        let token = "a".repeat(60);
+        let wrapped = soft_wrap_paths(&token);
+        assert!(wrapped.contains('\u{200B}'), "нет точек переноса");
+        let restored: String = wrapped.chars().filter(|c| *c != '\u{200B}').collect();
+        assert_eq!(restored, token, "видимый текст изменился");
+        assert!(
+            !soft_wrap_paths("короткий путь").contains('\u{200B}'),
+            "короткий текст не должен разрываться"
         );
     }
 }

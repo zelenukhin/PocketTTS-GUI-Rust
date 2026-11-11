@@ -118,10 +118,16 @@ fn main() -> eframe::Result<()> {
         }
     }
 
+    // G6.4: стартовый размер — по рабочей области монитора запуска и его
+    // DPI (не фиксированные 980×860). Окно не выходит за экран, на большом
+    // мониторе не растягивается на весь экран, min_inner_size уменьшается
+    // на маленьких дисплеях. Позиционирование — однократно в creation
+    // callback (см. window.rs), без resize-циклов в update().
+    let plan = shtorm_gui::window::initial_plan();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([980.0, 860.0])
-            .with_min_inner_size([760.0, 560.0])
+            .with_inner_size(plan.inner_size)
+            .with_min_inner_size(plan.min_inner_size)
             .with_title("ShtormTTS — нативный GUI"),
         ..Default::default()
     };
@@ -130,6 +136,10 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             install_cyrillic_fonts(&cc.egui_ctx);
+            // Окно ещё скрыто (eframe показывает его после первого кадра):
+            // переносим на монитор запуска и выравниваем размер до первого
+            // отображения — без мерцания и повторных подстроек.
+            shtorm_gui::window::place_on_launch_monitor(cc);
             Ok(Box::new(shtorm_gui::app::ShtormApp::new()))
         }),
     )

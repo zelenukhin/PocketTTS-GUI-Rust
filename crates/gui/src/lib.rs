@@ -10,3 +10,4 @@ pub mod ipc;
 pub mod job;
 pub mod resources;
 pub mod settings;
+pub mod window;
