@@ -842,7 +842,7 @@ impl ShtormApp {
                 secondary_label(ui, "рекурсивно .txt/.md/.log");
             }
         });
-        ui.add_space(6.0);
+        ui.add_space(4.0);
 
         // ---- Источник и голос ----
         let batch = s.batch;
@@ -888,7 +888,7 @@ impl ShtormApp {
                 );
             });
         header_clicked(&resp, &mut s.source_open);
-        ui.add_space(10.0);
+        ui.add_space(8.0);
 
         // ---- Модель и устройство ----
         let resp = egui::CollapsingHeader::new(
@@ -904,103 +904,100 @@ impl ShtormApp {
             let model_note = crate::job::resolve_model_dir(s)
                 .map(|d| d.display().to_string())
                 .unwrap_or_else(|e| e.to_string());
-            two_columns(
-                ui,
-                |ui| {
-                    // G6.3: один список — вариант сразу задаёт и Fast/Slow,
-                    // и точность графов (FP32/INT8); отдельного поля
-                    // «точность» в интерфейсе нет.
-                    combo_row(ui, "Модель:", "model", s.model.label(), |ui| {
-                        for choice in [
-                            ModelChoice::Fast,
-                            ModelChoice::FastInt8,
-                            ModelChoice::Slow,
-                            ModelChoice::SlowInt8,
-                            ModelChoice::Custom,
-                        ] {
-                            ui.selectable_value(&mut s.model, choice, choice.label());
-                        }
-                    });
-                    if s.model == ModelChoice::Custom {
-                        path_row(ui, "Каталог модели:", &mut s.model_dir, || {
-                            rfd::FileDialog::new()
-                                .set_title("Каталог модели (flow_lm_main.onnx и др.)")
-                                .pick_folder()
-                        });
-                    } else {
-                        path_row(ui, "Каталог ONNX:", &mut s.onnx_base, || {
-                            rfd::FileDialog::new()
-                                .set_title("Каталог с ru-v2-fast / ru-v2-slow")
-                                .pick_folder()
-                        });
-                    }
-                    ui.horizontal(|ui| {
-                        label_cell(ui, "Устройство:");
-                        let selected = match s.device {
-                            DeviceChoice::Cpu => "CPU",
-                            DeviceChoice::Cuda => "CUDA",
-                        };
-                        egui::ComboBox::from_id_salt("device")
-                            .width(110.0)
-                            .selected_text(selected)
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut s.device, DeviceChoice::Cpu, "CPU");
-                                ui.selectable_value(&mut s.device, DeviceChoice::Cuda, "CUDA");
-                            });
-                        if is_cuda {
-                            ui.add(
-                                egui::DragValue::new(&mut s.device_id)
-                                    .range(0..=8)
-                                    .prefix("GPU "),
-                            );
-                        }
-                    });
-                },
-                |ui| {
-                    let dll = if is_cuda {
-                        &mut s.ort_gpu_dll
-                    } else {
-                        &mut s.ort_cpu_dll
-                    };
-                    path_row(ui, "onnxruntime.dll:", dll, || {
+            // Строгий вертикальный порядок Python GUI: модель → каталог →
+            // разрешённый путь → устройство → DLL → подсказка → воркеры.
+            // Две независимые колонки в этом блоке запрещены ТЗ G6.4.
+            // G6.3: один список — вариант сразу задаёт и Fast/Slow,
+            // и точность графов; отдельного поля «точность» нет.
+            combo_row(ui, "Модель:", "model", s.model.label(), |ui| {
+                for choice in [
+                    ModelChoice::Fast,
+                    ModelChoice::FastInt8,
+                    ModelChoice::Slow,
+                    ModelChoice::SlowInt8,
+                    ModelChoice::Custom,
+                ] {
+                    ui.selectable_value(&mut s.model, choice, choice.label());
+                }
+            });
+            if s.model == ModelChoice::Custom {
+                path_row(ui, "Каталог модели:", &mut s.model_dir, || {
+                    rfd::FileDialog::new()
+                        .set_title("Каталог модели (flow_lm_main.onnx и др.)")
+                        .pick_folder()
+                });
+            } else {
+                path_row(
+                    ui,
+                    "Каталог ONNX (база):",
+                    &mut s.onnx_base,
+                    || {
                         rfd::FileDialog::new()
-                            .set_title("onnxruntime.dll")
-                            .add_filter("DLL", &["dll"])
-                            .pick_file()
-                    });
-                    hint(ui, "(пусто = авто из deps проекта)");
-                    hint(
-                        ui,
-                        format!("Воркеров: {effective_workers} (авто: CPU 2 / CUDA 1)"),
-                    );
-                },
-            );
-            ui.add_space(2.0);
+                            .set_title("Каталог с ru-v2-fast / ru-v2-slow")
+                            .pick_folder()
+                    },
+                );
+            }
             hint(ui, format!("модель: {model_note}"));
+            ui.horizontal(|ui| {
+                label_cell(ui, "Устройство:");
+                let selected = match s.device {
+                    DeviceChoice::Cpu => "CPU",
+                    DeviceChoice::Cuda => "CUDA",
+                };
+                egui::ComboBox::from_id_salt("device")
+                    .width(110.0)
+                    .selected_text(selected)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut s.device, DeviceChoice::Cpu, "CPU");
+                        ui.selectable_value(&mut s.device, DeviceChoice::Cuda, "CUDA");
+                    });
+                if is_cuda {
+                    ui.add(
+                        egui::DragValue::new(&mut s.device_id)
+                            .range(0..=8)
+                            .prefix("GPU "),
+                    );
+                }
+            });
+            let dll = if is_cuda {
+                &mut s.ort_gpu_dll
+            } else {
+                &mut s.ort_cpu_dll
+            };
+            path_row(ui, "onnxruntime.dll:", dll, || {
+                rfd::FileDialog::new()
+                    .set_title("onnxruntime.dll")
+                    .add_filter("DLL", &["dll"])
+                    .pick_file()
+            });
+            hint(ui, "(пусто = авто из deps проекта)");
+            hint(
+                ui,
+                format!("Воркеров: {effective_workers} (авто: CPU 2 / CUDA 1)"),
+            );
             if int8 {
                 hint(
                     ui,
                     "INT8: 3 квантованных графа (flow_lm_main, flow_lm_flow, \
-                         mimi_decoder) + 2 FP32 (mimi_encoder, text_conditioner).",
+                     mimi_decoder) + 2 FP32 (mimi_encoder, text_conditioner).",
                 );
                 if is_cuda {
-                    // G6.3: смешанное выполнение — квантованные узлы
-                    // (MatMulInteger/DynamicQuantizeLinear) CUDA EP не
-                    // поддерживает, они идут на CPU с покадровыми
-                    // копиями через PCIe (замер: ~2.7× медленнее FP32).
-                    // Предупреждение без блокировки и смены выбора.
+                    // G6.3: квантованные узлы CUDA EP не поддерживает — они
+                    // идут на CPU с покадровыми копиями; предупреждение без
+                    // блокировки и смены выбора.
                     hint_colored(
                         ui,
                         "CUDA + INT8: работает, но замеренно ~2.7× медленнее \
-                             FP32 (квантованные узлы выполняются на CPU); для INT8 \
-                             рекомендован CPU. Выбор не меняется автоматически.",
+                         FP32 (квантованные узлы выполняются на CPU); для INT8 \
+                         рекомендован CPU. Выбор не меняется автоматически.",
                         caution_color(ui),
                     );
                 }
             }
         });
         header_clicked(&resp, &mut s.model_open);
-        ui.add_space(10.0);
+        ui.add_space(8.0);
 
         // ---- Параметры генерации ----
         let resp = egui::CollapsingHeader::new(
@@ -1134,7 +1131,7 @@ impl ShtormApp {
             });
         });
         header_clicked(&resp, &mut s.gen_open);
-        ui.add_space(10.0);
+        ui.add_space(8.0);
 
         // ---- Паузы и воркеры ----
         let resp =
@@ -1220,7 +1217,7 @@ impl ShtormApp {
                     );
                 });
         header_clicked(&resp, &mut s.pauses_open);
-        ui.add_space(10.0);
+        ui.add_space(8.0);
 
         // ---- Вывод и формат ----
         let resp =
@@ -1327,7 +1324,7 @@ impl ShtormApp {
                     );
                 });
         header_clicked(&resp, &mut s.out_open);
-        ui.add_space(10.0);
+        ui.add_space(8.0);
     }
 
     /// G6.4: однократная реакция на смену монитора/разрешения/DPI: минимум
@@ -1376,26 +1373,34 @@ impl ShtormApp {
 /// Максимальная ширина формы: на широком мониторе поля не растягиваются на
 /// всю ширину, а форма центрируется.
 const FORM_MAX_WIDTH: f32 = 1160.0;
-/// Порог перехода «две колонки → одна» по ФАКТИЧЕСКОЙ ширине центральной
-/// панели (не по разрешению монитора).
-const TWO_COLUMN_MIN_WIDTH: f32 = 820.0;
-const LABEL_WIDTH: f32 = 165.0;
-/// Высота строки параметра — под основной текст 15 пт с полями.
-const ROW_HEIGHT: f32 = 26.0;
+const LABEL_WIDTH: f32 = 150.0;
+/// Высота строки параметра — под основной текст 13 пт с полями.
+const ROW_HEIGHT: f32 = 24.0;
 const SLIDER_MIN_WIDTH: f32 = 80.0;
 const SLIDER_MAX_WIDTH: f32 = 360.0;
 /// Запас справа под значение ползунка («0.30», «300», «8.0»), чтобы оно
 /// не обрезалось краем колонки.
-const SLIDER_VALUE_RESERVE: f32 = 64.0;
+const SLIDER_VALUE_RESERVE: f32 = 56.0;
 const COMBO_MAX_WIDTH: f32 = 300.0;
 const LOG_MIN_HEIGHT: f32 = 48.0;
-const LOG_HEADER_HEIGHT: f32 = 34.0;
+const LOG_HEADER_HEIGHT: f32 = 30.0;
 const LOG_HANDLE_HEIGHT: f32 = 6.0;
 
-// Единая типографика в ЛОГИЧЕСКИХ пунктах: egui сам умножает их на DPI.
-const BODY_SIZE: f32 = 15.0;
-const SMALL_SIZE: f32 = 14.0;
-const HEADING_SIZE: f32 = 19.0;
+// Компактная типографика Python GUI в ЛОГИЧЕСКИХ пунктах (egui × DPI).
+const BODY_SIZE: f32 = 13.0;
+const SMALL_SIZE: f32 = 12.0;
+const HEADING_SIZE: f32 = 15.0;
+
+/// Минимальная ширина одной колонки параметров: подпись + ползунок
+/// минимальной ширины + значение + два горизонтальных отступа. Порог
+/// 2→1 колонки выводится из неё, а не из конкретного разрешения монитора.
+const COLUMN_MIN_WIDTH: f32 = LABEL_WIDTH + SLIDER_MIN_WIDTH + SLIDER_VALUE_RESERVE + 2.0 * 8.0;
+/// Дополнительный зазор/запас для двух колонок.
+const COLUMN_GAP: f32 = 12.0;
+
+fn two_columns_threshold() -> f32 {
+    COLUMN_MIN_WIDTH * 2.0 + COLUMN_GAP
+}
 
 /// Типографика и отступы — один раз при старте. Размеры логические:
 /// при 125/150/200 % Windows масштабирование делает egui, а не мы.
@@ -1421,17 +1426,17 @@ fn configure_style(ctx: &egui::Context) {
         ),
     ]
     .into();
-    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
-    style.spacing.button_padding = egui::vec2(10.0, 5.0);
-    style.spacing.interact_size = egui::vec2(40.0, ROW_HEIGHT);
-    style.spacing.icon_width = 16.0;
-    style.spacing.icon_width_inner = 9.0;
-    style.spacing.icon_spacing = 5.0;
-    style.spacing.indent = 20.0;
+    style.spacing.item_spacing = egui::vec2(8.0, 4.0);
+    style.spacing.button_padding = egui::vec2(8.0, 4.0);
+    style.spacing.interact_size = egui::vec2(36.0, ROW_HEIGHT);
+    style.spacing.icon_width = 14.0;
+    style.spacing.icon_width_inner = 8.0;
+    style.spacing.icon_spacing = 4.0;
+    style.spacing.indent = 18.0;
     ctx.set_style(style);
 }
 
-/// Второстепенный текст: 14 пт и достаточный контраст в обеих темах
+/// Второстепенный текст: 12 пт и достаточный контраст в обеих темах
 /// (вместо `.small().weak()`, который на тёмной теме был слишком тусклым).
 fn secondary_text_color(ui: &egui::Ui) -> egui::Color32 {
     if ui.visuals().dark_mode {
@@ -1473,9 +1478,10 @@ fn caution_color(ui: &egui::Ui) -> egui::Color32 {
     }
 }
 
-/// Две колонки только при достаточной ширине панели.
+/// Две колонки только при фактической ширине, достаточной для двух
+/// колонок минимального содержимого (не по разрешению монитора).
 fn uses_two_columns(available_width: f32) -> bool {
-    available_width >= TWO_COLUMN_MIN_WIDTH
+    available_width >= two_columns_threshold()
 }
 
 /// Подпись параметра фиксированной ширины — значения в строках выровнены
@@ -1483,8 +1489,20 @@ fn uses_two_columns(available_width: f32) -> bool {
 /// к левому краю ячейки: `add_sized` центрирует содержимое и давал
 /// «плавающие» подписи.
 fn label_cell(ui: &mut egui::Ui, text: &str) {
+    // Ширина подписи измеряется реальным шрифтом: 150 пт — базовая, но
+    // длинная локализованная подпись не обрезается, если её можно
+    // разместить (не более 45 % доступной ширины).
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let measured = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), font, egui::Color32::WHITE)
+        .size()
+        .x
+        + 8.0;
+    let cap = (ui.available_width() * 0.45).max(120.0);
+    let width = measured.clamp(LABEL_WIDTH.min(cap), cap);
     ui.allocate_ui_with_layout(
-        egui::vec2(LABEL_WIDTH, ROW_HEIGHT),
+        egui::vec2(width, ROW_HEIGHT),
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
             ui.add(egui::Label::new(text).truncate())
@@ -1494,9 +1512,12 @@ fn label_cell(ui: &mut egui::Ui, text: &str) {
 }
 
 fn hint(ui: &mut egui::Ui, text: impl Into<String>) {
+    // Мягкие точки переноса: длинный путь переносится, а не выходит за
+    // правую границу колонки/окна.
+    let text = soft_wrap_paths(&text.into());
     ui.add(
         egui::Label::new(
-            egui::RichText::new(text.into())
+            egui::RichText::new(text)
                 .size(SMALL_SIZE)
                 .color(secondary_text_color(ui)),
         )
@@ -1505,14 +1526,8 @@ fn hint(ui: &mut egui::Ui, text: impl Into<String>) {
 }
 
 fn hint_colored(ui: &mut egui::Ui, text: impl Into<String>, color: egui::Color32) {
-    ui.add(
-        egui::Label::new(
-            egui::RichText::new(text.into())
-                .size(SMALL_SIZE)
-                .color(color),
-        )
-        .wrap(),
-    );
+    let text = soft_wrap_paths(&text.into());
+    ui.add(egui::Label::new(egui::RichText::new(text).size(SMALL_SIZE).color(color)).wrap());
 }
 
 /// Мягкие точки переноса для длинных путей: невидимый U+200B после
@@ -1574,7 +1589,7 @@ fn combo_row(
 
 /// Фиксированная ширина кнопки «Обзор…»: поле получает ровно остаток
 /// строки, поэтому длинный путь не выталкивает кнопку за пределы окна.
-const BROWSE_BUTTON_WIDTH: f32 = 92.0;
+const BROWSE_BUTTON_WIDTH: f32 = 84.0;
 
 /// Ширины (поле, кнопка) для строки пути: сумма + отступ не превышает
 /// доступную ширину. Вынесено для юнит-теста адаптивности.
@@ -1661,7 +1676,7 @@ fn two_columns(
         });
     } else {
         left(ui);
-        ui.add_space(10.0);
+        ui.add_space(8.0);
         right(ui);
     }
 }
@@ -1858,7 +1873,7 @@ impl eframe::App for ShtormApp {
                 let run = ui.add_enabled(
                     errors.is_empty() && !job_running,
                     egui::Button::new(egui::RichText::new("Запустить синтез").strong())
-                        .min_size(egui::vec2(160.0, 26.0)),
+                        .min_size(egui::vec2(160.0, 24.0)),
                 );
                 if run.clicked() {
                     self.start_job(ctx);
@@ -1872,7 +1887,7 @@ impl eframe::App for ShtormApp {
                         .add_enabled(
                             self.stop_available(),
                             egui::Button::new("Стоп")
-                                .min_size(egui::vec2(72.0, 26.0))
+                                .min_size(egui::vec2(72.0, 24.0))
                                 .fill(egui::Color32::from_rgb(150, 45, 45)),
                         )
                         .on_disabled_hover_text(
@@ -1887,7 +1902,7 @@ impl eframe::App for ShtormApp {
                     }
                 }
                 if ui
-                    .add(egui::Button::new("Сохранить настройки").min_size(egui::vec2(0.0, 26.0)))
+                    .add(egui::Button::new("Сохранить настройки").min_size(egui::vec2(0.0, 24.0)))
                     .clicked()
                 {
                     // общий метод (используется и тестами) — логика состояния
@@ -3250,17 +3265,19 @@ mod tests {
         configure_style(&ctx);
         let st = ctx.style();
         let size = |style: egui::TextStyle| st.text_styles[&style].size;
-        assert!(size(egui::TextStyle::Body) >= 15.0);
-        assert!(size(egui::TextStyle::Button) >= 15.0);
-        assert!(size(egui::TextStyle::Small) >= 14.0);
+        // Компактный масштаб Python GUI: 13/12/15, не 15–16.
+        assert!((13.0..=14.0).contains(&size(egui::TextStyle::Body)));
+        assert!((13.0..=14.0).contains(&size(egui::TextStyle::Button)));
+        assert!((12.0..=13.0).contains(&size(egui::TextStyle::Small)));
+        assert!((14.0..=16.0).contains(&size(egui::TextStyle::Heading)));
         assert!(
-            size(egui::TextStyle::Heading) >= size(egui::TextStyle::Body) + 3.0,
+            size(egui::TextStyle::Heading) >= size(egui::TextStyle::Body) + 2.0,
             "заголовки должны быть заметно крупнее основного текста"
         );
-        assert!(st.spacing.interact_size.y >= 24.0);
-        assert!(st.spacing.icon_width >= 16.0);
-        assert!(st.spacing.item_spacing.y >= 8.0);
-        assert!(st.spacing.indent >= 18.0);
+        assert!((24.0..=28.0).contains(&st.spacing.interact_size.y));
+        assert!((14.0..=16.0).contains(&st.spacing.icon_width));
+        assert!((3.0..=5.0).contains(&st.spacing.item_spacing.y));
+        assert!(st.spacing.indent >= 16.0);
     }
 
     /// G6.4 (визуальная приёмка): иконка чекбокса и подпись — разные
@@ -3292,9 +3309,16 @@ mod tests {
     /// G6.4: порог 2→1 колонки зависит только от фактической ширины панели.
     #[test]
     fn two_column_threshold_follows_panel_width() {
-        assert!(!uses_two_columns(TWO_COLUMN_MIN_WIDTH - 1.0));
-        assert!(uses_two_columns(TWO_COLUMN_MIN_WIDTH));
+        let threshold = two_columns_threshold();
+        assert!(!uses_two_columns(threshold - 1.0));
+        assert!(uses_two_columns(threshold));
         assert!(uses_two_columns(FORM_MAX_WIDTH));
+        // Порог выведен из минимальных размеров содержимого, а не из
+        // конкретного разрешения монитора.
+        assert!(
+            (560.0..=760.0).contains(&threshold),
+            "threshold={threshold}"
+        );
     }
 
     /// G6.4: мягкие переносы не меняют видимый текст (ZWSP невидим), но
