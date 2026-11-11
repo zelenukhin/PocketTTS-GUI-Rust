@@ -165,6 +165,8 @@ pub struct ShtormApp {
     ffmpeg_checked_at: std::time::Instant,
     /// G5: последняя применённая тема (переключатель без лишних set_visuals).
     theme_applied: bool,
+    /// G6.4: типографика и отступы применены (один раз за процесс).
+    style_applied: bool,
     /// G6.4: полный текст статуса загрузки настроек (tooltip верхней панели;
     /// сама панель показывает короткую метку).
     load_note: String,
@@ -268,6 +270,7 @@ impl ShtormApp {
             ffmpeg_check_err: None,
             ffmpeg_checked_at: std::time::Instant::now(),
             theme_applied,
+            style_applied: false,
             log_height: 120.0,
             log_open: true,
             monitor_key: None,
@@ -697,7 +700,7 @@ impl ShtormApp {
             .show(ctx, |ui| {
                 ui.label("Не удалось автоматически сохранить настройки:");
                 ui.add_space(4.0);
-                ui.label(egui::RichText::new(&err).small());
+                ui.label(egui::RichText::new(&err).size(SMALL_SIZE));
                 ui.add_space(4.0);
                 ui.label("Файл настроек не изменён.");
                 ui.add_space(6.0);
@@ -836,14 +839,14 @@ impl ShtormApp {
             ui.radio_value(&mut s.batch, false, "Один файл");
             ui.radio_value(&mut s.batch, true, "Каталог (пакетно)");
             if s.batch {
-                ui.weak("рекурсивно .txt/.md/.log");
+                secondary_label(ui, "рекурсивно .txt/.md/.log");
             }
         });
         ui.add_space(6.0);
 
         // ---- Источник и голос ----
         let batch = s.batch;
-        let resp = egui::CollapsingHeader::new(egui::RichText::new("Источник и голос").strong())
+        let resp = egui::CollapsingHeader::new(egui::RichText::new("Источник и голос").heading().strong())
             .open(Some(s.source_open))
             .show(ui, |ui| {
                 path_row(
@@ -885,437 +888,446 @@ impl ShtormApp {
                 );
             });
         header_clicked(&resp, &mut s.source_open);
-        ui.add_space(8.0);
+        ui.add_space(10.0);
 
         // ---- Модель и устройство ----
-        let resp = egui::CollapsingHeader::new(egui::RichText::new("Модель и устройство").strong())
-            .open(Some(s.model_open))
-            .show(ui, |ui| {
-                let is_cuda = s.device == DeviceChoice::Cuda;
-                let int8 = s.model.precision() == shtorm_engine::ModelPrecision::Int8;
-                let effective_workers = s.effective_workers();
-                let model_note = crate::job::resolve_model_dir(s)
-                    .map(|d| d.display().to_string())
-                    .unwrap_or_else(|e| e.to_string());
-                two_columns(
-                    ui,
-                    |ui| {
-                        // G6.3: один список — вариант сразу задаёт и Fast/Slow,
-                        // и точность графов (FP32/INT8); отдельного поля
-                        // «точность» в интерфейсе нет.
-                        combo_row(ui, "Модель:", "model", s.model.label(), |ui| {
-                            for choice in [
-                                ModelChoice::Fast,
-                                ModelChoice::FastInt8,
-                                ModelChoice::Slow,
-                                ModelChoice::SlowInt8,
-                                ModelChoice::Custom,
-                            ] {
-                                ui.selectable_value(&mut s.model, choice, choice.label());
-                            }
-                        });
-                        if s.model == ModelChoice::Custom {
-                            path_row(ui, "Каталог модели:", &mut s.model_dir, || {
-                                rfd::FileDialog::new()
-                                    .set_title("Каталог модели (flow_lm_main.onnx и др.)")
-                                    .pick_folder()
-                            });
-                        } else {
-                            path_row(ui, "Каталог ONNX:", &mut s.onnx_base, || {
-                                rfd::FileDialog::new()
-                                    .set_title("Каталог с ru-v2-fast / ru-v2-slow")
-                                    .pick_folder()
-                            });
+        let resp = egui::CollapsingHeader::new(
+            egui::RichText::new("Модель и устройство")
+                .heading()
+                .strong(),
+        )
+        .open(Some(s.model_open))
+        .show(ui, |ui| {
+            let is_cuda = s.device == DeviceChoice::Cuda;
+            let int8 = s.model.precision() == shtorm_engine::ModelPrecision::Int8;
+            let effective_workers = s.effective_workers();
+            let model_note = crate::job::resolve_model_dir(s)
+                .map(|d| d.display().to_string())
+                .unwrap_or_else(|e| e.to_string());
+            two_columns(
+                ui,
+                |ui| {
+                    // G6.3: один список — вариант сразу задаёт и Fast/Slow,
+                    // и точность графов (FP32/INT8); отдельного поля
+                    // «точность» в интерфейсе нет.
+                    combo_row(ui, "Модель:", "model", s.model.label(), |ui| {
+                        for choice in [
+                            ModelChoice::Fast,
+                            ModelChoice::FastInt8,
+                            ModelChoice::Slow,
+                            ModelChoice::SlowInt8,
+                            ModelChoice::Custom,
+                        ] {
+                            ui.selectable_value(&mut s.model, choice, choice.label());
                         }
-                        ui.horizontal(|ui| {
-                            label_cell(ui, "Устройство:");
-                            let selected = match s.device {
-                                DeviceChoice::Cpu => "CPU",
-                                DeviceChoice::Cuda => "CUDA",
-                            };
-                            egui::ComboBox::from_id_salt("device")
-                                .width(110.0)
-                                .selected_text(selected)
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut s.device, DeviceChoice::Cpu, "CPU");
-                                    ui.selectable_value(&mut s.device, DeviceChoice::Cuda, "CUDA");
-                                });
-                            if is_cuda {
-                                ui.add(
-                                    egui::DragValue::new(&mut s.device_id)
-                                        .range(0..=8)
-                                        .prefix("GPU "),
-                                );
-                            }
-                        });
-                    },
-                    |ui| {
-                        let dll = if is_cuda {
-                            &mut s.ort_gpu_dll
-                        } else {
-                            &mut s.ort_cpu_dll
-                        };
-                        path_row(ui, "onnxruntime.dll:", dll, || {
+                    });
+                    if s.model == ModelChoice::Custom {
+                        path_row(ui, "Каталог модели:", &mut s.model_dir, || {
                             rfd::FileDialog::new()
-                                .set_title("onnxruntime.dll")
-                                .add_filter("DLL", &["dll"])
-                                .pick_file()
+                                .set_title("Каталог модели (flow_lm_main.onnx и др.)")
+                                .pick_folder()
                         });
-                        hint(ui, "(пусто = авто из deps проекта)");
-                        hint(
-                            ui,
-                            format!("Воркеров: {effective_workers} (авто: CPU 2 / CUDA 1)"),
-                        );
-                    },
-                );
-                ui.add_space(2.0);
-                hint(ui, format!("модель: {model_note}"));
-                if int8 {
+                    } else {
+                        path_row(ui, "Каталог ONNX:", &mut s.onnx_base, || {
+                            rfd::FileDialog::new()
+                                .set_title("Каталог с ru-v2-fast / ru-v2-slow")
+                                .pick_folder()
+                        });
+                    }
+                    ui.horizontal(|ui| {
+                        label_cell(ui, "Устройство:");
+                        let selected = match s.device {
+                            DeviceChoice::Cpu => "CPU",
+                            DeviceChoice::Cuda => "CUDA",
+                        };
+                        egui::ComboBox::from_id_salt("device")
+                            .width(110.0)
+                            .selected_text(selected)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut s.device, DeviceChoice::Cpu, "CPU");
+                                ui.selectable_value(&mut s.device, DeviceChoice::Cuda, "CUDA");
+                            });
+                        if is_cuda {
+                            ui.add(
+                                egui::DragValue::new(&mut s.device_id)
+                                    .range(0..=8)
+                                    .prefix("GPU "),
+                            );
+                        }
+                    });
+                },
+                |ui| {
+                    let dll = if is_cuda {
+                        &mut s.ort_gpu_dll
+                    } else {
+                        &mut s.ort_cpu_dll
+                    };
+                    path_row(ui, "onnxruntime.dll:", dll, || {
+                        rfd::FileDialog::new()
+                            .set_title("onnxruntime.dll")
+                            .add_filter("DLL", &["dll"])
+                            .pick_file()
+                    });
+                    hint(ui, "(пусто = авто из deps проекта)");
                     hint(
                         ui,
-                        "INT8: 3 квантованных графа (flow_lm_main, flow_lm_flow, \
-                         mimi_decoder) + 2 FP32 (mimi_encoder, text_conditioner).",
+                        format!("Воркеров: {effective_workers} (авто: CPU 2 / CUDA 1)"),
                     );
-                    if is_cuda {
-                        // G6.3: смешанное выполнение — квантованные узлы
-                        // (MatMulInteger/DynamicQuantizeLinear) CUDA EP не
-                        // поддерживает, они идут на CPU с покадровыми
-                        // копиями через PCIe (замер: ~2.7× медленнее FP32).
-                        // Предупреждение без блокировки и смены выбора.
-                        hint_colored(
-                            ui,
-                            "CUDA + INT8: работает, но замеренно ~2.7× медленнее \
+                },
+            );
+            ui.add_space(2.0);
+            hint(ui, format!("модель: {model_note}"));
+            if int8 {
+                hint(
+                    ui,
+                    "INT8: 3 квантованных графа (flow_lm_main, flow_lm_flow, \
+                         mimi_decoder) + 2 FP32 (mimi_encoder, text_conditioner).",
+                );
+                if is_cuda {
+                    // G6.3: смешанное выполнение — квантованные узлы
+                    // (MatMulInteger/DynamicQuantizeLinear) CUDA EP не
+                    // поддерживает, они идут на CPU с покадровыми
+                    // копиями через PCIe (замер: ~2.7× медленнее FP32).
+                    // Предупреждение без блокировки и смены выбора.
+                    hint_colored(
+                        ui,
+                        "CUDA + INT8: работает, но замеренно ~2.7× медленнее \
                              FP32 (квантованные узлы выполняются на CPU); для INT8 \
                              рекомендован CPU. Выбор не меняется автоматически.",
-                            COLOR_CAUTION,
-                        );
-                    }
+                        caution_color(ui),
+                    );
                 }
-            });
+            }
+        });
         header_clicked(&resp, &mut s.model_open);
-        ui.add_space(8.0);
+        ui.add_space(10.0);
 
         // ---- Параметры генерации ----
-        let resp = egui::CollapsingHeader::new(egui::RichText::new("Параметры генерации").strong())
-            .open(Some(s.gen_open))
-            .show(ui, |ui| {
-                two_columns(
-                    ui,
-                    |ui| {
-                        slider_row(ui, "Температура:", |ui| {
-                            ui.add(
-                                egui::Slider::new(&mut s.temperature, 0.05..=1.5)
-                                    .step_by(0.05)
-                                    .fixed_decimals(2),
-                            );
-                        });
-                        slider_row(ui, "Шаги декодирования:", |ui| {
-                            ui.add(egui::Slider::new(&mut s.decode_steps, 1..=8));
-                        });
-                        slider_row(ui, "Макс. токенов:", |ui| {
-                            ui.add(egui::Slider::new(&mut s.max_tokens, 10..=300).step_by(5.0));
-                        });
-                        ui.horizontal(|ui| {
-                            label_cell(ui, "Seed:");
-                            ui.add(egui::DragValue::new(&mut s.seed).range(-1..=i64::MAX));
-                            ui.weak("(-1 — случайный)");
-                        });
-                    },
-                    |ui| {
-                        checkbox_row(ui, &mut s.anti_repeat, "Защита от повторов (двухпопытная)");
-                        checkbox_row(ui, &mut s.denoise, "Очистка звука (DPDFNet)");
-                        slider_row(ui, "Яркость (дБ):", |ui| {
-                            ui.add(
-                                egui::Slider::new(&mut s.brightness_db, 0.0..=12.0)
-                                    .fixed_decimals(1),
-                            );
-                        });
-                    },
-                );
-                ui.add_space(4.0);
-                // G4.1: компактная группа EOS — порог и оба хвоста.
-                // Значения teratts-android: порог −4, хвосты 5/3 — без
-                // Python-пересчёта 6/4.
-                ui.group(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("EOS (конец речи)").strong())
-                            .on_hover_text(
-                                "Параметры конца речи (EOS) движка teratts-android. \
-                                     Дефолты −4/5/3 воспроизводят оригинальную Android-версию.",
-                            );
-                        if ui
-                            .button("Значения teratts-android")
-                            .on_hover_text(
-                                "Установить порог −4 и хвосты 5/3 — встроенные значения \
-                                     оригинального teratts-android (без пересчёта).",
-                            )
-                            .clicked()
-                        {
-                            s.eos_threshold = crate::settings::EosThresholdSetting::Fixed(-4.0);
-                            s.eos_tail_short = shtorm_engine::EosTail::Fixed(5);
-                            s.eos_tail_long = shtorm_engine::EosTail::Fixed(3);
-                        }
+        let resp = egui::CollapsingHeader::new(
+            egui::RichText::new("Параметры генерации")
+                .heading()
+                .strong(),
+        )
+        .open(Some(s.gen_open))
+        .show(ui, |ui| {
+            two_columns(
+                ui,
+                |ui| {
+                    slider_row(ui, "Температура:", |ui| {
+                        ui.add(
+                            egui::Slider::new(&mut s.temperature, 0.05..=1.5)
+                                .step_by(0.05)
+                                .fixed_decimals(2),
+                        );
                     });
-                    // G5: «Авто» в списке больше нет — выбранное значение
-                    // всегда число. Устаревший Auto из старого конфига
-                    // показываем как −4.0 и при любом выборе заменяем числом.
-                    let threshold_label = format!("{}", s.eos_threshold.value());
-                    combo_row(ui, "Порог:", "eos_threshold", &threshold_label, |ui| {
-                        for v in crate::settings::EOS_THRESHOLD_CHOICES {
-                            ui.selectable_value(
-                                &mut s.eos_threshold,
-                                crate::settings::EosThresholdSetting::Fixed(*v),
-                                format!("{v}"),
-                            );
-                        }
-                    })
-                    .on_hover_text(
-                        "Логит EOS выше порога — конец речи. Значение \
+                    slider_row(ui, "Шаги декодирования:", |ui| {
+                        ui.add(egui::Slider::new(&mut s.decode_steps, 1..=8));
+                    });
+                    slider_row(ui, "Макс. токенов:", |ui| {
+                        ui.add(egui::Slider::new(&mut s.max_tokens, 10..=300).step_by(5.0));
+                    });
+                    ui.horizontal(|ui| {
+                        label_cell(ui, "Seed:");
+                        ui.add(egui::DragValue::new(&mut s.seed).range(-1..=i64::MAX));
+                        secondary_label(ui, "(-1 — случайный)");
+                    });
+                },
+                |ui| {
+                    checkbox_row(ui, &mut s.anti_repeat, "Защита от повторов (двухпопытная)");
+                    checkbox_row(ui, &mut s.denoise, "Очистка звука (DPDFNet)");
+                    slider_row(ui, "Яркость (дБ):", |ui| {
+                        ui.add(
+                            egui::Slider::new(&mut s.brightness_db, 0.0..=12.0).fixed_decimals(1),
+                        );
+                    });
+                },
+            );
+            ui.add_space(4.0);
+            // G4.1: компактная группа EOS — порог и оба хвоста.
+            // Значения teratts-android: порог −4, хвосты 5/3 — без
+            // Python-пересчёта 6/4.
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("EOS (конец речи)").strong())
+                        .on_hover_text(
+                            "Параметры конца речи (EOS) движка teratts-android. \
+                                     Дефолты −4/5/3 воспроизводят оригинальную Android-версию.",
+                        );
+                    if ui
+                        .button("Значения teratts-android")
+                        .on_hover_text(
+                            "Установить порог −4 и хвосты 5/3 — встроенные значения \
+                                     оригинального teratts-android (без пересчёта).",
+                        )
+                        .clicked()
+                    {
+                        s.eos_threshold = crate::settings::EosThresholdSetting::Fixed(-4.0);
+                        s.eos_tail_short = shtorm_engine::EosTail::Fixed(5);
+                        s.eos_tail_long = shtorm_engine::EosTail::Fixed(3);
+                    }
+                });
+                // G5: «Авто» в списке больше нет — выбранное значение
+                // всегда число. Устаревший Auto из старого конфига
+                // показываем как −4.0 и при любом выборе заменяем числом.
+                let threshold_label = format!("{}", s.eos_threshold.value());
+                combo_row(ui, "Порог:", "eos_threshold", &threshold_label, |ui| {
+                    for v in crate::settings::EOS_THRESHOLD_CHOICES {
+                        ui.selectable_value(
+                            &mut s.eos_threshold,
+                            crate::settings::EosThresholdSetting::Fixed(*v),
+                            format!("{v}"),
+                        );
+                    }
+                })
+                .on_hover_text(
+                    "Логит EOS выше порога — конец речи. Значение \
                              передаётся движку как есть; −4.0 — встроенное \
                              значение teratts-android (не читается из runtime.json).",
-                    );
-                    ui.horizontal(|ui| {
-                        label_cell(ui, "Кадров хвоста EOS:");
-                        ui.label("≤4 слов:").on_hover_text(
-                            "Хвост для коротких чанков (1–4 слова по подготовленному \
+                );
+                ui.horizontal(|ui| {
+                    label_cell(ui, "Кадров хвоста EOS:");
+                    ui.label("≤4 слов:").on_hover_text(
+                        "Хвост для коротких чанков (1–4 слова по подготовленному \
                                  тексту до добавления служебных пробелов).",
-                        );
-                        egui::ComboBox::from_id_salt("eos_tail_short")
-                            .width(64.0)
-                            .selected_text(eos_tail_label(s.eos_tail_short))
-                            .show_ui(ui, |ui| {
+                    );
+                    egui::ComboBox::from_id_salt("eos_tail_short")
+                        .width(64.0)
+                        .selected_text(eos_tail_label(s.eos_tail_short))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut s.eos_tail_short,
+                                shtorm_engine::EosTail::Default,
+                                "None",
+                            );
+                            for n in crate::settings::EOS_TAIL_CHOICES {
                                 ui.selectable_value(
                                     &mut s.eos_tail_short,
-                                    shtorm_engine::EosTail::Default,
-                                    "None",
+                                    shtorm_engine::EosTail::Fixed(*n),
+                                    n.to_string(),
                                 );
-                                for n in crate::settings::EOS_TAIL_CHOICES {
-                                    ui.selectable_value(
-                                        &mut s.eos_tail_short,
-                                        shtorm_engine::EosTail::Fixed(*n),
-                                        n.to_string(),
-                                    );
-                                }
-                            })
-                            .response
-                            .on_hover_text(EOS_TAIL_TOOLTIP);
-                        ui.label("≥5 слов:").on_hover_text(
-                            "Хвост для длинных чанков (5 и более слов текущего чанка).",
-                        );
-                        egui::ComboBox::from_id_salt("eos_tail_long")
-                            .width(64.0)
-                            .selected_text(eos_tail_label(s.eos_tail_long))
-                            .show_ui(ui, |ui| {
+                            }
+                        })
+                        .response
+                        .on_hover_text(EOS_TAIL_TOOLTIP);
+                    ui.label("≥5 слов:")
+                        .on_hover_text("Хвост для длинных чанков (5 и более слов текущего чанка).");
+                    egui::ComboBox::from_id_salt("eos_tail_long")
+                        .width(64.0)
+                        .selected_text(eos_tail_label(s.eos_tail_long))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut s.eos_tail_long,
+                                shtorm_engine::EosTail::Default,
+                                "None",
+                            );
+                            for n in crate::settings::EOS_TAIL_CHOICES {
                                 ui.selectable_value(
                                     &mut s.eos_tail_long,
-                                    shtorm_engine::EosTail::Default,
-                                    "None",
+                                    shtorm_engine::EosTail::Fixed(*n),
+                                    n.to_string(),
                                 );
-                                for n in crate::settings::EOS_TAIL_CHOICES {
-                                    ui.selectable_value(
-                                        &mut s.eos_tail_long,
-                                        shtorm_engine::EosTail::Fixed(*n),
-                                        n.to_string(),
-                                    );
-                                }
-                            })
-                            .response
-                            .on_hover_text(EOS_TAIL_TOOLTIP);
-                    });
+                            }
+                        })
+                        .response
+                        .on_hover_text(EOS_TAIL_TOOLTIP);
                 });
             });
+        });
         header_clicked(&resp, &mut s.gen_open);
-        ui.add_space(8.0);
+        ui.add_space(10.0);
 
         // ---- Паузы и воркеры ----
-        let resp = egui::CollapsingHeader::new(egui::RichText::new("Паузы и воркеры").strong())
-            .open(Some(s.pauses_open))
-            .show(ui, |ui| {
-                let auto_workers = s.effective_workers();
-                // G6.2: режим пакетного CUDA. Гибрид 2×2 включается ТОЛЬКО
-                // осознанным выбором (дефолт — экономичный 1×2); выбор
-                // сохраняется в настройках.
-                let batch_cuda = s.batch && s.device == DeviceChoice::Cuda;
-                two_columns(
-                    ui,
-                    |ui| {
-                        slider_row(ui, "Масштаб пауз:", |ui| {
-                            ui.add(
-                                egui::Slider::new(&mut s.pause_scale, 0.0..=2.0)
-                                    .step_by(0.05)
-                                    .fixed_decimals(2),
-                            );
-                        });
-                        slider_row(ui, "Пауза абзаца (с):", |ui| {
-                            ui.add(
-                                egui::Slider::new(&mut s.paragraph_pause_s, 0.0..=3.0)
-                                    .step_by(0.05)
-                                    .fixed_decimals(2),
-                            );
-                        });
-                        let mut manual = s.workers.is_some();
-                        if ui.checkbox(&mut manual, "Воркеров вручную").changed() {
-                            s.workers = if manual {
-                                Some(auto_workers.max(1))
-                            } else {
-                                None
-                            };
-                        }
-                        if let Some(w) = &mut s.workers {
-                            ui.add(egui::Slider::new(w, 1..=12));
-                        }
-                    },
-                    |ui| {
-                        ui.horizontal(|ui| {
-                            label_cell(ui, "Потоков ORT:");
-                            ui.add(egui::DragValue::new(&mut s.threads).range(1..=16));
-                        });
-                        hint(ui, "intra-op, паритет с CLI --threads (по умолчанию 4)");
-                        if batch_cuda {
-                            combo_row(
-                                ui,
-                                "Пакетный CUDA:",
-                                "batch_cuda_mode",
-                                s.batch_cuda_mode.label(),
-                                |ui| {
-                                    ui.selectable_value(
-                                        &mut s.batch_cuda_mode,
-                                        crate::settings::BatchCudaMode::Economy,
-                                        crate::settings::BatchCudaMode::Economy.label(),
-                                    );
-                                    ui.selectable_value(
-                                        &mut s.batch_cuda_mode,
-                                        crate::settings::BatchCudaMode::MaxSpeed,
-                                        crate::settings::BatchCudaMode::MaxSpeed.label(),
-                                    );
-                                },
-                            );
-                            hint(
-                                ui,
-                                match s.batch_cuda_mode {
-                                    crate::settings::BatchCudaMode::Economy => {
-                                        "1 процесс × 2 постоянных воркера, ~4.9 ГБ VRAM — \
+        let resp =
+            egui::CollapsingHeader::new(egui::RichText::new("Паузы и воркеры").heading().strong())
+                .open(Some(s.pauses_open))
+                .show(ui, |ui| {
+                    let auto_workers = s.effective_workers();
+                    // G6.2: режим пакетного CUDA. Гибрид 2×2 включается ТОЛЬКО
+                    // осознанным выбором (дефолт — экономичный 1×2); выбор
+                    // сохраняется в настройках.
+                    let batch_cuda = s.batch && s.device == DeviceChoice::Cuda;
+                    two_columns(
+                        ui,
+                        |ui| {
+                            slider_row(ui, "Масштаб пауз:", |ui| {
+                                ui.add(
+                                    egui::Slider::new(&mut s.pause_scale, 0.0..=2.0)
+                                        .step_by(0.05)
+                                        .fixed_decimals(2),
+                                );
+                            });
+                            slider_row(ui, "Пауза абзаца (с):", |ui| {
+                                ui.add(
+                                    egui::Slider::new(&mut s.paragraph_pause_s, 0.0..=3.0)
+                                        .step_by(0.05)
+                                        .fixed_decimals(2),
+                                );
+                            });
+                            let mut manual = s.workers.is_some();
+                            if ui.checkbox(&mut manual, "Воркеров вручную").changed()
+                            {
+                                s.workers = if manual {
+                                    Some(auto_workers.max(1))
+                                } else {
+                                    None
+                                };
+                            }
+                            if let Some(w) = &mut s.workers {
+                                ui.add(egui::Slider::new(w, 1..=12));
+                            }
+                        },
+                        |ui| {
+                            ui.horizontal(|ui| {
+                                label_cell(ui, "Потоков ORT:");
+                                ui.add(egui::DragValue::new(&mut s.threads).range(1..=16));
+                            });
+                            hint(ui, "intra-op, паритет с CLI --threads (по умолчанию 4)");
+                            if batch_cuda {
+                                combo_row(
+                                    ui,
+                                    "Пакетный CUDA:",
+                                    "batch_cuda_mode",
+                                    s.batch_cuda_mode.label(),
+                                    |ui| {
+                                        ui.selectable_value(
+                                            &mut s.batch_cuda_mode,
+                                            crate::settings::BatchCudaMode::Economy,
+                                            crate::settings::BatchCudaMode::Economy.label(),
+                                        );
+                                        ui.selectable_value(
+                                            &mut s.batch_cuda_mode,
+                                            crate::settings::BatchCudaMode::MaxSpeed,
+                                            crate::settings::BatchCudaMode::MaxSpeed.label(),
+                                        );
+                                    },
+                                );
+                                hint(
+                                    ui,
+                                    match s.batch_cuda_mode {
+                                        crate::settings::BatchCudaMode::Economy => {
+                                            "1 процесс × 2 постоянных воркера, ~4.9 ГБ VRAM — \
                                          проверенный режим"
-                                    }
-                                    crate::settings::BatchCudaMode::MaxSpeed => {
-                                        "2 процесса × 2 постоянных воркера, ~9.2 ГБ VRAM: \
+                                        }
+                                        crate::settings::BatchCudaMode::MaxSpeed => {
+                                            "2 процесса × 2 постоянных воркера, ~9.2 ГБ VRAM: \
                                          быстрее, но нужен запас свободной VRAM (префлайт; \
                                          иначе — экономичный режим)"
-                                    }
-                                },
-                            );
-                        }
-                    },
-                );
-            });
+                                        }
+                                    },
+                                );
+                            }
+                        },
+                    );
+                });
         header_clicked(&resp, &mut s.pauses_open);
-        ui.add_space(8.0);
+        ui.add_space(10.0);
 
         // ---- Вывод и формат ----
-        let resp = egui::CollapsingHeader::new(egui::RichText::new("Вывод и формат").strong())
-            .open(Some(s.out_open))
-            .show(ui, |ui| {
-                let needs_ffmpeg = s.format.needs_ffmpeg();
-                two_columns(
-                    ui,
-                    |ui| {
-                        ui.horizontal(|ui| {
-                            label_cell(ui, "Формат:");
-                            egui::ComboBox::from_id_salt("format")
-                                .width(90.0)
-                                .selected_text(s.format.label())
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut s.format,
-                                        OutputFormatChoice::Wav,
-                                        "WAV",
-                                    );
-                                    ui.selectable_value(
-                                        &mut s.format,
-                                        OutputFormatChoice::Mp3,
-                                        "MP3",
-                                    );
-                                    ui.selectable_value(
-                                        &mut s.format,
-                                        OutputFormatChoice::Opus,
-                                        "Opus",
-                                    );
-                                });
-                            // Пресеты раздельные: каждый формат показывает и
-                            // меняет только свой — несовместимый выбор невозможен.
-                            match s.format {
-                                OutputFormatChoice::Mp3 => {
-                                    egui::ComboBox::from_id_salt("mp3_preset")
-                                        .width(170.0)
-                                        .selected_text(&s.mp3_preset)
-                                        .show_ui(ui, |ui| {
-                                            for p in crate::settings::MP3_PRESETS {
-                                                ui.selectable_value(
-                                                    &mut s.mp3_preset,
-                                                    (*p).to_string(),
-                                                    *p,
-                                                );
-                                            }
-                                        });
+        let resp =
+            egui::CollapsingHeader::new(egui::RichText::new("Вывод и формат").heading().strong())
+                .open(Some(s.out_open))
+                .show(ui, |ui| {
+                    let needs_ffmpeg = s.format.needs_ffmpeg();
+                    two_columns(
+                        ui,
+                        |ui| {
+                            ui.horizontal(|ui| {
+                                label_cell(ui, "Формат:");
+                                egui::ComboBox::from_id_salt("format")
+                                    .width(90.0)
+                                    .selected_text(s.format.label())
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut s.format,
+                                            OutputFormatChoice::Wav,
+                                            "WAV",
+                                        );
+                                        ui.selectable_value(
+                                            &mut s.format,
+                                            OutputFormatChoice::Mp3,
+                                            "MP3",
+                                        );
+                                        ui.selectable_value(
+                                            &mut s.format,
+                                            OutputFormatChoice::Opus,
+                                            "Opus",
+                                        );
+                                    });
+                                // Пресеты раздельные: каждый формат показывает и
+                                // меняет только свой — несовместимый выбор невозможен.
+                                match s.format {
+                                    OutputFormatChoice::Mp3 => {
+                                        egui::ComboBox::from_id_salt("mp3_preset")
+                                            .width(170.0)
+                                            .selected_text(&s.mp3_preset)
+                                            .show_ui(ui, |ui| {
+                                                for p in crate::settings::MP3_PRESETS {
+                                                    ui.selectable_value(
+                                                        &mut s.mp3_preset,
+                                                        (*p).to_string(),
+                                                        *p,
+                                                    );
+                                                }
+                                            });
+                                    }
+                                    OutputFormatChoice::Opus => {
+                                        egui::ComboBox::from_id_salt("opus_preset")
+                                            .width(140.0)
+                                            .selected_text(&s.opus_preset)
+                                            .show_ui(ui, |ui| {
+                                                for p in crate::settings::OPUS_PRESETS {
+                                                    ui.selectable_value(
+                                                        &mut s.opus_preset,
+                                                        (*p).to_string(),
+                                                        *p,
+                                                    );
+                                                }
+                                            });
+                                    }
+                                    OutputFormatChoice::Wav => {}
                                 }
-                                OutputFormatChoice::Opus => {
-                                    egui::ComboBox::from_id_salt("opus_preset")
-                                        .width(140.0)
-                                        .selected_text(&s.opus_preset)
-                                        .show_ui(ui, |ui| {
-                                            for p in crate::settings::OPUS_PRESETS {
-                                                ui.selectable_value(
-                                                    &mut s.opus_preset,
-                                                    (*p).to_string(),
-                                                    *p,
-                                                );
-                                            }
-                                        });
-                                }
-                                OutputFormatChoice::Wav => {}
-                            }
-                        });
-                    },
-                    |ui| {
-                        ui.checkbox(&mut s.chunk_log, "Лог чанков");
-                        // G5: замена готового аудиофайла — только явное согласие.
-                        // Старый файл не удаляется до успешного синтеза; замена
-                        // выполняется атомарно после финализации sink.
-                        ui.checkbox(
-                            &mut s.overwrite_existing,
-                            "Перезаписывать существующие файлы",
-                        )
-                        .on_hover_text(
-                            "Выключено (по умолчанию): существующий результат \
+                            });
+                        },
+                        |ui| {
+                            ui.checkbox(&mut s.chunk_log, "Лог чанков");
+                            // G5: замена готового аудиофайла — только явное согласие.
+                            // Старый файл не удаляется до успешного синтеза; замена
+                            // выполняется атомарно после финализации sink.
+                            ui.checkbox(
+                                &mut s.overwrite_existing,
+                                "Перезаписывать существующие файлы",
+                            )
+                            .on_hover_text(
+                                "Выключено (по умолчанию): существующий результат \
                              пропускается без изменений. Включено: новый аудиофайл \
                              пишется в уникальный .partial и заменяет готовый только \
                              после успешного завершения синтеза; при ошибке/отмене \
                              старый файл остаётся. Защита входных файлов, моделей и \
                              настроек не ослабляется.",
-                        );
-                    },
-                );
-                if needs_ffmpeg {
-                    path_row(ui, "ffmpeg:", &mut s.ffmpeg_path, || {
-                        rfd::FileDialog::new()
-                            .set_title("ffmpeg.exe")
-                            .add_filter("ffmpeg", &["exe"])
-                            .pick_file()
-                    });
-                }
-                path_row(
-                    ui,
-                    "Папка результата:",
-                    &mut s.out_dir,
-                    || {
-                        rfd::FileDialog::new()
-                            .set_title("Папка результата")
-                            .pick_folder()
-                    },
-                );
-            });
+                            );
+                        },
+                    );
+                    if needs_ffmpeg {
+                        path_row(ui, "ffmpeg:", &mut s.ffmpeg_path, || {
+                            rfd::FileDialog::new()
+                                .set_title("ffmpeg.exe")
+                                .add_filter("ffmpeg", &["exe"])
+                                .pick_file()
+                        });
+                    }
+                    path_row(
+                        ui,
+                        "Папка результата:",
+                        &mut s.out_dir,
+                        || {
+                            rfd::FileDialog::new()
+                                .set_title("Папка результата")
+                                .pick_folder()
+                        },
+                    );
+                });
         header_clicked(&resp, &mut s.out_open);
-        ui.add_space(8.0);
+        ui.add_space(10.0);
     }
 
     /// G6.4: однократная реакция на смену монитора/разрешения/DPI: минимум
@@ -1367,17 +1379,99 @@ const FORM_MAX_WIDTH: f32 = 1160.0;
 /// Порог перехода «две колонки → одна» по ФАКТИЧЕСКОЙ ширине центральной
 /// панели (не по разрешению монитора).
 const TWO_COLUMN_MIN_WIDTH: f32 = 820.0;
-const LABEL_WIDTH: f32 = 150.0;
-const ROW_HEIGHT: f32 = 22.0;
+const LABEL_WIDTH: f32 = 165.0;
+/// Высота строки параметра — под основной текст 15 пт с полями.
+const ROW_HEIGHT: f32 = 26.0;
 const SLIDER_MIN_WIDTH: f32 = 80.0;
 const SLIDER_MAX_WIDTH: f32 = 360.0;
+/// Запас справа под значение ползунка («0.30», «300», «8.0»), чтобы оно
+/// не обрезалось краем колонки.
+const SLIDER_VALUE_RESERVE: f32 = 64.0;
 const COMBO_MAX_WIDTH: f32 = 300.0;
 const LOG_MIN_HEIGHT: f32 = 48.0;
-const LOG_HEADER_HEIGHT: f32 = 30.0;
+const LOG_HEADER_HEIGHT: f32 = 34.0;
 const LOG_HANDLE_HEIGHT: f32 = 6.0;
-const COLOR_OK: egui::Color32 = egui::Color32::from_rgb(90, 200, 90);
-const COLOR_WARN: egui::Color32 = egui::Color32::from_rgb(230, 120, 60);
-const COLOR_CAUTION: egui::Color32 = egui::Color32::from_rgb(230, 160, 60);
+
+// Единая типографика в ЛОГИЧЕСКИХ пунктах: egui сам умножает их на DPI.
+const BODY_SIZE: f32 = 15.0;
+const SMALL_SIZE: f32 = 14.0;
+const HEADING_SIZE: f32 = 19.0;
+
+/// Типографика и отступы — один раз при старте. Размеры логические:
+/// при 125/150/200 % Windows масштабирование делает egui, а не мы.
+fn configure_style(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+    style.text_styles = [
+        (
+            egui::TextStyle::Heading,
+            egui::FontId::proportional(HEADING_SIZE),
+        ),
+        (egui::TextStyle::Body, egui::FontId::proportional(BODY_SIZE)),
+        (
+            egui::TextStyle::Button,
+            egui::FontId::proportional(BODY_SIZE),
+        ),
+        (
+            egui::TextStyle::Small,
+            egui::FontId::proportional(SMALL_SIZE),
+        ),
+        (
+            egui::TextStyle::Monospace,
+            egui::FontId::monospace(SMALL_SIZE),
+        ),
+    ]
+    .into();
+    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+    style.spacing.button_padding = egui::vec2(10.0, 5.0);
+    style.spacing.interact_size = egui::vec2(40.0, ROW_HEIGHT);
+    style.spacing.icon_width = 16.0;
+    style.spacing.icon_width_inner = 9.0;
+    style.spacing.icon_spacing = 5.0;
+    style.spacing.indent = 20.0;
+    ctx.set_style(style);
+}
+
+/// Второстепенный текст: 14 пт и достаточный контраст в обеих темах
+/// (вместо `.small().weak()`, который на тёмной теме был слишком тусклым).
+fn secondary_text_color(ui: &egui::Ui) -> egui::Color32 {
+    if ui.visuals().dark_mode {
+        egui::Color32::from_gray(178)
+    } else {
+        egui::Color32::from_gray(88)
+    }
+}
+
+fn secondary_label(ui: &mut egui::Ui, text: impl Into<String>) {
+    ui.add(egui::Label::new(
+        egui::RichText::new(text.into())
+            .size(SMALL_SIZE)
+            .color(secondary_text_color(ui)),
+    ));
+}
+
+fn ok_color(ui: &egui::Ui) -> egui::Color32 {
+    if ui.visuals().dark_mode {
+        egui::Color32::from_rgb(100, 220, 110)
+    } else {
+        egui::Color32::from_rgb(20, 110, 30)
+    }
+}
+
+fn warn_color(ui: &egui::Ui) -> egui::Color32 {
+    if ui.visuals().dark_mode {
+        egui::Color32::from_rgb(245, 150, 80)
+    } else {
+        egui::Color32::from_rgb(165, 65, 0)
+    }
+}
+
+fn caution_color(ui: &egui::Ui) -> egui::Color32 {
+    if ui.visuals().dark_mode {
+        egui::Color32::from_rgb(245, 185, 90)
+    } else {
+        egui::Color32::from_rgb(145, 85, 0)
+    }
+}
 
 /// Две колонки только при достаточной ширине панели.
 fn uses_two_columns(available_width: f32) -> bool {
@@ -1400,11 +1494,25 @@ fn label_cell(ui: &mut egui::Ui, text: &str) {
 }
 
 fn hint(ui: &mut egui::Ui, text: impl Into<String>) {
-    ui.add(egui::Label::new(egui::RichText::new(text.into()).small().weak()).wrap());
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(text.into())
+                .size(SMALL_SIZE)
+                .color(secondary_text_color(ui)),
+        )
+        .wrap(),
+    );
 }
 
 fn hint_colored(ui: &mut egui::Ui, text: impl Into<String>, color: egui::Color32) {
-    ui.add(egui::Label::new(egui::RichText::new(text.into()).small().color(color)).wrap());
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(text.into())
+                .size(SMALL_SIZE)
+                .color(color),
+        )
+        .wrap(),
+    );
 }
 
 /// Мягкие точки переноса для длинных путей: невидимый U+200B после
@@ -1434,9 +1542,8 @@ fn soft_wrap_paths(text: &str) -> String {
 fn slider_row(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
     ui.horizontal(|ui| {
         label_cell(ui, label);
-        let w = ui
-            .available_width()
-            .clamp(SLIDER_MIN_WIDTH, SLIDER_MAX_WIDTH);
+        let w =
+            (ui.available_width() - SLIDER_VALUE_RESERVE).clamp(SLIDER_MIN_WIDTH, SLIDER_MAX_WIDTH);
         ui.spacing_mut().slider_width = w;
         add(ui);
     });
@@ -1467,7 +1574,7 @@ fn combo_row(
 
 /// Фиксированная ширина кнопки «Обзор…»: поле получает ровно остаток
 /// строки, поэтому длинный путь не выталкивает кнопку за пределы окна.
-const BROWSE_BUTTON_WIDTH: f32 = 74.0;
+const BROWSE_BUTTON_WIDTH: f32 = 92.0;
 
 /// Ширины (поле, кнопка) для строки пути: сумма + отступ не превышает
 /// доступную ширину. Вынесено для юнит-теста адаптивности.
@@ -1524,11 +1631,14 @@ fn checkbox_row_resp(
         let icon_cell = ui.spacing().icon_width + ui.spacing().icon_spacing;
         ui.spacing_mut().interact_size.x = icon_cell;
         let icon = ui.checkbox(checked, "");
-        let text = ui.add(
-            egui::Label::new(label)
-                .selectable(false)
-                .sense(egui::Sense::click()),
-        );
+        let text = ui
+            .add(
+                egui::Label::new(egui::RichText::new(label).size(BODY_SIZE))
+                    .selectable(false)
+                    .truncate()
+                    .sense(egui::Sense::click()),
+            )
+            .on_hover_text(label);
         if text.clicked() {
             *checked = !*checked;
         }
@@ -1551,7 +1661,7 @@ fn two_columns(
         });
     } else {
         left(ui);
-        ui.add_space(6.0);
+        ui.add_space(10.0);
         right(ui);
     }
 }
@@ -1566,6 +1676,12 @@ impl eframe::App for ShtormApp {
                 egui::Visuals::light()
             });
             self.theme_applied = self.settings.theme_dark;
+        }
+        // G6.4: единая типографика и отступы — один раз, после применения
+        // темы (configure_style клонирует текущий Style с её visuals).
+        if !self.style_applied {
+            configure_style(ctx);
+            self.style_applied = true;
         }
         // события фонового задания (прогресс/логи/итог) — каждый кадр
         self.poll_job();
@@ -1593,18 +1709,20 @@ impl eframe::App for ShtormApp {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("ShtormTTS").heading().strong());
-                ui.label(egui::RichText::new("нативный GUI").weak());
+                secondary_label(ui, "нативный GUI");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let (badge, color) = match self.settings_load {
                         SettingsLoadState::Loaded => ("настройки загружены", None),
                         SettingsLoadState::FirstRun => ("настройки по умолчанию", None),
                         SettingsLoadState::Unreadable => {
-                            ("⚠ настройки не прочитаны", Some(COLOR_WARN))
+                            ("⚠ настройки не прочитаны", Some(warn_color(ui)))
                         }
                     };
                     let text = match color {
-                        Some(c) => egui::RichText::new(badge).small().color(c),
-                        None => egui::RichText::new(badge).small().weak(),
+                        Some(c) => egui::RichText::new(badge).size(SMALL_SIZE).color(c),
+                        None => egui::RichText::new(badge)
+                            .size(SMALL_SIZE)
+                            .color(secondary_text_color(ui)),
                     };
                     ui.add(egui::Label::new(text).truncate())
                         .on_hover_text(&self.load_note);
@@ -1674,7 +1792,7 @@ impl eframe::App for ShtormApp {
                     }
                     ui.label(egui::RichText::new("Журнал выполнения").strong());
                     if self.log_open && !log_visible {
-                        ui.weak("скрыт: недостаточно высоты окна");
+                        secondary_label(ui, "скрыт: недостаточно высоты окна");
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Очистить").clicked() {
@@ -1696,8 +1814,8 @@ impl eframe::App for ShtormApp {
                                 ui.add(
                                     egui::Label::new(
                                         egui::RichText::new(format!("сохранено: {}", p.display()))
-                                            .small()
-                                            .weak(),
+                                            .size(SMALL_SIZE)
+                                            .color(secondary_text_color(ui)),
                                     )
                                     .truncate(),
                                 );
@@ -1717,7 +1835,7 @@ impl eframe::App for ShtormApp {
                         .stick_to_bottom(true)
                         .show(ui, |ui| {
                             if self.log.is_empty() {
-                                ui.weak("пока пусто");
+                                secondary_label(ui, "пока пусто");
                             } else {
                                 ui.add(
                                     egui::TextEdit::multiline(&mut self.log)
@@ -1782,15 +1900,15 @@ impl eframe::App for ShtormApp {
                 if errors.is_empty() {
                     ui.label(
                         egui::RichText::new("✓ параметры валидны")
-                            .small()
-                            .color(COLOR_OK),
+                            .size(SMALL_SIZE)
+                            .color(ok_color(ui)),
                     );
                 } else {
                     ui.add(
                         egui::Label::new(
                             egui::RichText::new(format!("⚠ {} проблем(ы)", errors.len()))
-                                .small()
-                                .color(COLOR_WARN),
+                                .size(SMALL_SIZE)
+                                .color(warn_color(ui)),
                         )
                         .truncate(),
                     )
@@ -1802,7 +1920,12 @@ impl eframe::App for ShtormApp {
             // загрузки конфига в верхней панели.
             if !self.status.is_empty() {
                 ui.add(
-                    egui::Label::new(egui::RichText::new(&self.status).small().weak()).truncate(),
+                    egui::Label::new(
+                        egui::RichText::new(&self.status)
+                            .size(SMALL_SIZE)
+                            .color(secondary_text_color(ui)),
+                    )
+                    .truncate(),
                 )
                 .on_hover_text(&self.status);
             }
@@ -1847,7 +1970,7 @@ impl eframe::App for ShtormApp {
                                                     f.total,
                                                     phase
                                                 ))
-                                                .small(),
+                                                .size(SMALL_SIZE),
                                             )
                                             .truncate(),
                                         );
@@ -1888,8 +2011,8 @@ impl eframe::App for ShtormApp {
                             ui.add(
                                 egui::Label::new(
                                     egui::RichText::new(format!("• {}", soft_wrap_paths(e)))
-                                        .small()
-                                        .color(COLOR_WARN),
+                                        .size(SMALL_SIZE)
+                                        .color(warn_color(ui)),
                                 )
                                 .wrap(),
                             );
@@ -3120,11 +3243,32 @@ mod tests {
         assert_eq!((field, button), (60.0, BROWSE_BUTTON_WIDTH));
     }
 
+    /// G6.4: единый читаемый масштаб типографики и отступов.
+    #[test]
+    fn typography_and_spacing_are_readable() {
+        let ctx = egui::Context::default();
+        configure_style(&ctx);
+        let st = ctx.style();
+        let size = |style: egui::TextStyle| st.text_styles[&style].size;
+        assert!(size(egui::TextStyle::Body) >= 15.0);
+        assert!(size(egui::TextStyle::Button) >= 15.0);
+        assert!(size(egui::TextStyle::Small) >= 14.0);
+        assert!(
+            size(egui::TextStyle::Heading) >= size(egui::TextStyle::Body) + 3.0,
+            "заголовки должны быть заметно крупнее основного текста"
+        );
+        assert!(st.spacing.interact_size.y >= 24.0);
+        assert!(st.spacing.icon_width >= 16.0);
+        assert!(st.spacing.item_spacing.y >= 8.0);
+        assert!(st.spacing.indent >= 18.0);
+    }
+
     /// G6.4 (визуальная приёмка): иконка чекбокса и подпись — разные
     /// виджеты, их прямоугольники не пересекаются даже внутри колонки.
     #[test]
     fn checkbox_row_icon_and_label_do_not_overlap() {
         let ctx = egui::Context::default();
+        configure_style(&ctx);
         let mut rects = None;
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {

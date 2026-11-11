@@ -7,12 +7,12 @@
   G6.2.1 — жизненный цикл гибрида, G6.2 — гибридный пакетный CUDA 2×2;
   G6.1.2 — запрет повторных CLI-опций).
 - **HEAD**: только из Git (`git log -1 --oneline`), не из этого файла.
-- **Бэкап на NAS (верифицирован, сделан ПЕРЕД изменениями G6.4,
-  2026-11-11 14:44)**: полный архив HEAD `b868c1c` (G6.3) —
-  `\\DISKSTATION\Ableton 2\Temp2\ShtormTTS-Windows-full-b868c1c-20261111-144417.zip`,
-  SHA256 `9446895783E9F749A7AEE009B84DA319568851B5954C888625B36F3533E1FF8A`,
-  169/169 blob совпадают. Ранее (G6.3): архив `af005f7` — 167/167,
-  SHA256 `6940D90A…C5747C1`; прежние архивы не тронуты.
+- **Бэкап на NAS (верифицирован, сделан ПЕРЕД fix-изменениями G6.4,
+  2026-11-11 18:13)**: полный архив HEAD `bb2ea85` (G6.4 baseline) —
+  `\\DISKSTATION\Ableton 2\Temp2\ShtormTTS-Windows-full-bb2ea85-20261111-181322.zip`,
+  SHA256 `711B1D5B0D14BAC497336A536492DC74FD93C222895F5AA3164BF301D9C27AD3`,
+  171/171 blob совпадают. Ранее: `b868c1c` (169/169), `af005f7`
+  (167/167); прежние архивы не тронуты.
 - **NAS РАБОТАЕТ.** «SMB error 1702» из G2.1/P2B.1 — ошибка диагностического
   скрипта (`out/nas_check.ps1` строил UNC с одним ведущим слэшем); скрипт
   исправлен, блокер не воспроизводится.
@@ -54,9 +54,10 @@ WAV/MP3/Opus без накопления аудио в памяти, одино�
   конфиги, unknown-key round-trip), FP32/INT8, CPU/CUDA, пакетные режимы
   1×2/2×2, EOS/паузы, отмена, автосохранение G6.2.3, GUI без консоли.
   Движок/IPC/ONNX/CUDA/Job Object не затрагивались.
-- **Проверки**: `cargo fmt --all`; clippy 0; `cargo test --release` —
-  271 passed / 0 failed / 31 ignored (весь workspace); GUI-приёмка на
-  реальном release EXE в песочнице: ресайз
+- **Проверки**: `cargo fmt --all -- --check`; clippy 0; `cargo test
+  --release` — 273 passed / 0 failed / 31 ignored (весь workspace, из них
+  `shtorm-gui` 148); однократный `cargo build --release`. GUI-приёмка на
+  реальном release EXE (до fix, базовая сборка `bb2ea85`): ресайз
   620…1350, maximize/restore, прокрутка формы и журнала, пакет 4 файла,
   отмена, длинные кириллические пути/ошибки валидации, ComboBox у нижнего
   края, hybrid 2×2 selftest. Скриншоты — `out/g64/shots/`, журнал —
