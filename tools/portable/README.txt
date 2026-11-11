@@ -7,7 +7,12 @@ Layout:
   msvcp140.dll, msvcp140_1.dll,
   vcruntime140.dll, vcruntime140_1.dll  MSVC++ redistributable runtime
   shtorm-gui.exe                       GUI executable
-  models/ru-v2-fast, models/ru-v2-slow  ONNX models (FP32 only)
+  models/ru-v2-fast, models/ru-v2-slow  ONNX models (FP32 default; also
+                                       *_int8.onnx graphs: flow_lm_main_int8,
+                                       flow_lm_flow_int8, mimi_decoder_int8 —
+                                       the INT8 model variants; mimi_encoder
+                                       and text_conditioner stay FP32 in both
+                                       modes, quantized versions do not exist)
   onnxruntime/cpu/onnxruntime.dll       CPU ONNX Runtime 1.23.2
   onnxruntime/cuda/                     CUDA ONNX Runtime + providers + CUDA/cuDNN DLLs
   ffmpeg/ffmpeg.exe                     MP3/Opus encoder (GPLv3 build)
@@ -30,6 +35,14 @@ Important:
   * CPU and CUDA use different ONNX Runtime DLLs. A process can initialize only
     one runtime; after switching CPU <-> CUDA inside one GUI session, restart
     the application.
+  * Model variants (G6.3): the "Модель" list combines the model and precision —
+    "Shtorm-v2 Fast/Slow (FP32)" is the original mode (default); "(INT8)"
+    selects the quantized main/flow/decoder graphs plus FP32 encoder/conditioner.
+    INT8 is noticeably faster on CPU; on CUDA it WORKS but is measured ~2.7x
+    SLOWER than FP32 (quantized nodes run on the CPU EP with per-frame PCIe
+    copies) — the GUI warns about this combination and never switches the
+    selection automatically. Missing INT8 files is an explicit error; there is
+    no silent fallback to FP32.
   * Existing audio files are NOT overwritten by default: an existing result
     is skipped. If you explicitly enable "Перезаписывать существующие
     файлы" (overwrite existing files), a finished file is replaced
