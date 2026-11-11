@@ -1388,7 +1388,13 @@ const LOG_HANDLE_HEIGHT: f32 = 6.0;
 
 // Компактная типографика Python GUI в ЛОГИЧЕСКИХ пунктах (egui × DPI).
 const BODY_SIZE: f32 = 13.0;
-const SMALL_SIZE: f32 = 12.0;
+/// Вспомогательный текст (пути, пояснения, статусы, предупреждения):
+/// ТОТ ЖЕ размер, что и основной (13 пт) — второстепенность обозначается
+/// цветом (secondary_text_color), а не уменьшением шрифта. Умышленное
+/// уменьшение ниже BODY_SIZE запрещено (регресс в «мелкий серый» текст).
+const SMALL_SIZE: f32 = BODY_SIZE;
+/// Журнал выполнения (моноширинный, плотный): допускается 12–13 пт.
+const MONO_SIZE: f32 = BODY_SIZE;
 const HEADING_SIZE: f32 = 15.0;
 
 /// Минимальная ширина одной колонки параметров: подпись + ползунок
@@ -1401,6 +1407,14 @@ const COLUMN_GAP: f32 = 12.0;
 fn two_columns_threshold() -> f32 {
     COLUMN_MIN_WIDTH * 2.0 + COLUMN_GAP
 }
+
+// Детерминированный запрет регресса типографики (проверяется при сборке):
+// вспомогательный текст не мельче основного, журнал не мельче 12 пт,
+// заголовки заметно крупнее. Иначе пути/подсказки/статусы снова
+// превратятся в «мелкий серый» текст.
+const _: () = assert!(SMALL_SIZE >= BODY_SIZE - 0.25);
+const _: () = assert!(MONO_SIZE >= 12.0);
+const _: () = assert!(HEADING_SIZE >= BODY_SIZE + 1.5);
 
 /// Типографика и отступы — один раз при старте. Размеры логические:
 /// при 125/150/200 % Windows масштабирование делает egui, а не мы.
@@ -1422,7 +1436,7 @@ fn configure_style(ctx: &egui::Context) {
         ),
         (
             egui::TextStyle::Monospace,
-            egui::FontId::monospace(SMALL_SIZE),
+            egui::FontId::monospace(MONO_SIZE),
         ),
     ]
     .into();
@@ -1436,7 +1450,7 @@ fn configure_style(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
-/// Второстепенный текст: 12 пт и достаточный контраст в обеих темах
+/// Второстепенный текст: 13 пт (как основной) и контраст в обеих темах
 /// (вместо `.small().weak()`, который на тёмной теме был слишком тусклым).
 fn secondary_text_color(ui: &egui::Ui) -> egui::Color32 {
     if ui.visuals().dark_mode {
@@ -3265,10 +3279,23 @@ mod tests {
         configure_style(&ctx);
         let st = ctx.style();
         let size = |style: egui::TextStyle| st.text_styles[&style].size;
-        // Компактный масштаб Python GUI: 13/12/15, не 15–16.
+        // Компактный масштаб Python GUI: 13/13/13/15, не 15–16.
         assert!((13.0..=14.0).contains(&size(egui::TextStyle::Body)));
         assert!((13.0..=14.0).contains(&size(egui::TextStyle::Button)));
-        assert!((12.0..=13.0).contains(&size(egui::TextStyle::Small)));
+        // Вспомогательный текст не мельче основного: второстепенность
+        // передаётся цветом, а не размером.
+        assert!(
+            size(egui::TextStyle::Small) >= size(egui::TextStyle::Body) - 0.25,
+            "Small {:?} мельче Body {:?}",
+            size(egui::TextStyle::Small),
+            size(egui::TextStyle::Body)
+        );
+        // Журнал: 12–13 пт — не «мелкий серый».
+        assert!(
+            (12.0..=13.5).contains(&size(egui::TextStyle::Monospace)),
+            "Monospace {:?}",
+            size(egui::TextStyle::Monospace)
+        );
         assert!((14.0..=16.0).contains(&size(egui::TextStyle::Heading)));
         assert!(
             size(egui::TextStyle::Heading) >= size(egui::TextStyle::Body) + 2.0,
