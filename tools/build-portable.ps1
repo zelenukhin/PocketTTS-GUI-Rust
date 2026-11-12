@@ -14,7 +14,7 @@
 # Example:
 #   powershell -ExecutionPolicy Bypass -File tools\build-portable.ps1 `
 #     -Destination C:\PocketTTS-GUI-Rust\dist\PocketTTS-GUI-Rust-Portable-2026-11-12 `
-#     -ModelsDir C:\Users\alexa\Downloads\pocket_tts_android\build\onnx `
+#     -ModelsDir C:\Users\<user>\Downloads\pocket_tts_android\build\onnx `
 #     -Ffmpeg C:\PocketTTS-GUI\ffmpeg\ffmpeg.exe `
 #     -VoiceFile "C:\PocketTTS-GUI\examples\Microsoft Brian Speed 1.wav"
 

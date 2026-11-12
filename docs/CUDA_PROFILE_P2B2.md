@@ -2,7 +2,7 @@
 
 Дата: 2026-11-10. HEAD на момент эксперимента: `5cdf088` (CUDA-P2B.1).
 Верифицированный бэкап HEAD **создан перед изменениями**:
-`\\DISKSTATION\Ableton 2\Temp2\ShtormTTS-Windows-full-5cdf088-20261110-061711.zip`,
+`<NAS>\Temp2\ShtormTTS-Windows-full-5cdf088-20261110-061711.zip`,
 SHA256 `A99A78723EC59A3C8A16D04266ECCCD02599F6FC235EB5DB475811F23F5CAC7C`,
 148/148 blob совпадают с HEAD.
 
@@ -43,13 +43,13 @@ GPU-времени на ту же работу.**
 ошибка экранирования в диагностическом скрипте `out/nas_check.ps1`:
 
 ```powershell
-$nas = '\DISKSTATION\Ableton 2\Temp2'   # ОДИН ведущий слэш
+$nas = '\<NAS>\backup\Temp2'   # ОДИН ведущий слэш
 ```
 
 С одним ведущим `\` PowerShell трактует путь как относительный от текущего
-диска (`C:\DISKSTATION\...`), а не как UNC — `Test-Path` всегда `false`.
+диска (`C:\<NAS>\...`), а не как UNC — `Test-Path` всегда `false`.
 Дополнительно сам вызов из bash терял один слэш при двойном экранировании.
-С корректным `\\DISKSTATION\Ableton 2\Temp2` шара **доступна**: в каталоге
+С корректным `<NAS>\Temp2` шара **доступна**: в каталоге
 лежат архивы предыдущих этапов вплоть до `full-1e4603d-20261110-040125.zip`.
 
 **Следствие:** блокер снят, бэкап HEAD создан штатной процедурой
@@ -82,7 +82,7 @@ Char-rules: `C:/PocketTTS-GUI/PocketTTS-GUI/custom_models/Shtorm_PocketTTS_RU_v2
 ## 3. Исходный текст и разбиение
 
 Файл (только чтение, не изменялся):
-`C:\Users\alexa\Documents\Гарри Поттер отрывок 2_accented_processed_normalized.txt`
+`C:\Users\<user>\Documents\Гарри Поттер отрывок 2_accented_processed_normalized.txt`
 
 | Свойство | Значение |
 |---|---|
@@ -487,8 +487,8 @@ B3 41.47 с (−0.8%). При этом B тратит существенно б�
 Разбиение текста:
 
 ```powershell
-target\release\diag_p2b2.exe analyze --text-file "C:\Users\alexa\Documents\Гарри Поттер отрывок 2_accented_processed_normalized.txt" --max-tokens 50 --json-out out\cuda_p2b2\text_analysis.json
-target\release\diag_p2b2.exe split   --text-file "C:\Users\alexa\Documents\Гарри Поттер отрывок 2_accented_processed_normalized.txt" --max-tokens 50 --parts 3 --out-dir out\cuda_p2b2\text_parts_20261110-062021 --prefix part
+target\release\diag_p2b2.exe analyze --text-file "C:\Users\<user>\Documents\Гарри Поттер отрывок 2_accented_processed_normalized.txt" --max-tokens 50 --json-out out\cuda_p2b2\text_analysis.json
+target\release\diag_p2b2.exe split   --text-file "C:\Users\<user>\Documents\Гарри Поттер отрывок 2_accented_processed_normalized.txt" --max-tokens 50 --parts 3 --out-dir out\cuda_p2b2\text_parts_20261110-062021 --prefix part
 ```
 
 Эталон и матрица:

@@ -146,12 +146,12 @@ elease\PocketTTS-GUI-Rust.exe`.
 
 - **Бэкап на NAS (верифицирован, сделан ПЕРЕД переименованием G6.5,
   2026-11-12 01:46)**: полный архив HEAD `3d30692` (G6.4-type-e03342f) —
-  `\\DISKSTATION\Ableton 2\Temp2\ShtormTTS-Windows-full-3d30692-20261112-014608.zip`,
+  `<NAS>\Temp2\ShtormTTS-Windows-full-3d30692-20261112-014608.zip`,
   SHA256 `3A8FB5F513AFB63DAE9DDFAE18B8F66F8D591F43320CFDC47D166E85EA44551D`,
   171/171 blob совпадают. Ранее: `045f957`, `e03342f`, `bb2ea85`, `b868c1c`,
   `af005f7`; прежние архивы не тронуты.
 - **Прежний бэкап (G6.4-fix)**: полный архив HEAD `e03342f` —
-  `\\DISKSTATION\Ableton 2\Temp2\ShtormTTS-Windows-full-e03342f-20261111-190125.zip`,
+  `<NAS>\Temp2\ShtormTTS-Windows-full-e03342f-20261111-190125.zip`,
   SHA256 `27D5DF104B8192E0E86A3A0CBA5AE06B3F5CFCBFA8D19AC16BCF6CE21D0FBC0F`,
   171/171 blob совпадают. Ранее: `bb2ea85` (G6.4 baseline), `b868c1c`
   (G6.3), `af005f7` (G6.2.3-fix); прежние архивы не тронуты.

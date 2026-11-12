@@ -74,7 +74,7 @@ PocketTTS-GUI-Rust-Portable-<date>/
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\build-portable.ps1 `
   -Destination C:\PocketTTS-GUI-Rust\dist\PocketTTS-GUI-Rust-Portable-2026-11-12 `
-  -ModelsDir C:\Users\alexa\Downloads\pocket_tts_android\build\onnx `
+  -ModelsDir C:\Users\<user>\Downloads\pocket_tts_android\build\onnx `
   -Ffmpeg C:\PocketTTS-GUI\ffmpeg\ffmpeg.exe `
   -VoiceFile "C:\PocketTTS-GUI\examples\Microsoft Brian Speed 1.wav"
 ```
@@ -129,7 +129,7 @@ powershell -ExecutionPolicy Bypass -File tools\build-portable.ps1 `
    `onnxruntime/cuda/`, `ffmpeg/`.
 3. **Каталоги проекта** (`Cargo.toml` + `deps/`) — только режим разработки.
 4. **Документированный fallback** — существующий dev-каталог моделей
-   `C:\Users\alexa\Downloads\pocket_tts_android\build\onnx`. На чистой машине
+   `C:\Users\<user>\Downloads\pocket_tts_android\build\onnx`. На чистой машине
    его нет; он не влияет на портативность. В настройках портативной сборки
    абсолютных путей профиля разработчика нет.
 

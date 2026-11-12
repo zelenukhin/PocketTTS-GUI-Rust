@@ -23,7 +23,7 @@ OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tests", "g
                    "chunking_golden.json")
 
 # ---------- корпус ----------
-BOOK = r"C:\Users\alexa\Documents\Гарри Поттер отрывок 2_accented_processed_normalized.txt"
+BOOK = r"C:\Users\<user>\Documents\Гарри Поттер отрывок 2_accented_processed_normalized.txt"
 
 def corpus():
     cases = []

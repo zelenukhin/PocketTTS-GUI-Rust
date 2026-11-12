@@ -16,7 +16,7 @@ New-Item -ItemType Directory -Path $sandbox | Out-Null
 $exe = Join-Path $sandbox 'PocketTTS-GUI-Rust.exe'
 Copy-Item -LiteralPath $exeSrc -Destination $exe
 $voice = 'C:/PocketTTS-GUI/examples/Microsoft Brian Speed 1.wav'
-$onnxBase = 'C:/Users/alexa/Downloads/pocket_tts_android/build/onnx'
+$onnxBase = 'C:/Users/<user>/Downloads/pocket_tts_android/build/onnx'
 $outDir = ($sandbox -replace '\\', '/') + '/out'
 $settingsJson = @"
 {

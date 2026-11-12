@@ -3700,7 +3700,7 @@ mod tests {
     //   cargo test -p pockettts-gui-rust --release --lib real_matrix -- --ignored --nocapture
     //   SHTORM_GUI_TEST_DEVICE=cuda cargo test -p pockettts-gui-rust --release --lib real_matrix -- --ignored --nocapture
 
-    const REAL_ONNX_BASE: &str = r"C:\Users\alexa\Downloads\pocket_tts_android\build\onnx";
+    const REAL_ONNX_BASE: &str = r"C:\Users\<user>\Downloads\pocket_tts_android\build\onnx";
     const REAL_VOICE: &str = r"C:\PocketTTS-GUI\examples\Microsoft Brian Speed 1.wav";
     const REAL_TEXT: &str = "Стр+елки час+ов показ+ывали п+олночь, а стрелк+и заст+ыли. Вт+орое предложение для над+ёжности прогона. Тр+етий хв+остик текста.";
     const REAL_FFMPEG: &str = r"C:\PocketTTS-GUI\ffmpeg\ffmpeg.exe";
@@ -4875,7 +4875,7 @@ mod tests {
     /// голос — эталон P2B.1/P2B.2/P2B.3 «Василий Леванов F5-TTS3.wav».
     const P2B_VOICE: &str = r"C:\PocketTTS-GUI\examples\Василий Леванов F5-TTS3.wav";
     const P2B_SOURCE: &str =
-        r"C:\Users\alexa\Documents\Гарри Поттер отрывок 2_accented_processed_normalized.txt";
+        r"C:\Users\<user>\Documents\Гарри Поттер отрывок 2_accented_processed_normalized.txt";
     /// Набор из P2B.3 (12 файлов, 77 чанков на весь текст).
     const P2B_PARTS_DIR: &str = r"out\cuda_p2b3\main12_bal_20261110-122635";
 

@@ -2,7 +2,7 @@
 
 Дата: 2026-11-10. HEAD на момент эксперимента: `8f07d70` (CUDA-P2B.2, docs).
 Верифицированный бэкап HEAD **создан перед изменениями**:
-`\\DISKSTATION\Ableton 2\Temp2\ShtormTTS-Windows-full-8f07d70-20261110-121744.zip`,
+`<NAS>\Temp2\ShtormTTS-Windows-full-8f07d70-20261110-121744.zip`,
 SHA256 `A0C57455A8C8B0F93C4FDBA2CCBFECBF81DEEB3AF7468BFAF96D968581EC7861`,
 151/151 blob совпадают с HEAD.
 
@@ -59,7 +59,7 @@ PCM16 24 кГц, intra-op threads 4 (основная серия) и 2 (доп.)
 ## 2. Исходный текст и разбиение
 
 Источник (только чтение, не менялся):
-`C:\Users\alexa\Documents\Гарри Поттер отрывок 2_accented_processed_normalized.txt`
+`C:\Users\<user>\Documents\Гарри Поттер отрывок 2_accented_processed_normalized.txt`
 — 10 081 байт, 39 абзацев, 77 чанков (max_tokens 50), 410.2 с речи.
 SHA256 до и после эксперимента:
 `8a6eb548f070335a1ee6313e565e4e64944667cc5e86b311c6881ffa20399bdd`.

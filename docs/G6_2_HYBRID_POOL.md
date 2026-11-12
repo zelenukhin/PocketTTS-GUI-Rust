@@ -2,7 +2,7 @@
 
 Дата: 2026-11-10. База: HEAD `807ffad` (G6.1.2), верифицированный бэкап на NAS
 создан ДО изменений:
-`\\DISKSTATION\Ableton 2\Temp2\ShtormTTS-Windows-full-fdcc485-20261110-172531.zip`,
+`<NAS>\Temp2\ShtormTTS-Windows-full-fdcc485-20261110-172531.zip`,
 SHA256 `F2F7E942744A80AE850FFC8891C92DB28A32ECDFB1AD4BFC7B9058997C81A7AA`,
 160/160 blob совпадают с HEAD. Математика Pocket, ONNX-модели, EOS, seed,
 чанкер, DSP и I/O Binding не менялись.

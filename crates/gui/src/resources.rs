@@ -60,7 +60,7 @@ pub fn find_project_root() -> Option<PathBuf> {
 /// Документированный dev-fallback: модели проекта на машине разработчика.
 /// Используется ТОЛЬКО если рядом с exe и в проекте моделей нет; на чистой
 /// машине путь отсутствует и на портативность не влияет.
-const DEV_ONNX_FALLBACK: &str = r"C:\Users\alexa\Downloads\pocket_tts_android\build\onnx";
+const DEV_ONNX_FALLBACK: &str = r"C:\Users\<user>\Downloads\pocket_tts_android\build\onnx";
 
 /// Каталоги, где может лежать база ONNX-моделей (`ru-v2-fast|slow` внутри).
 fn model_base_candidates_for(exe: &Path) -> Vec<PathBuf> {

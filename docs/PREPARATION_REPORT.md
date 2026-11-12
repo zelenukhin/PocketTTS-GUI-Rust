@@ -9,7 +9,7 @@
 | Python-приложение (`C:\PocketTTS-GUI\PocketTTS-GUI\`) | Актуальные версии подтверждены: `pocket-tts_gui.py` (117 783 Б, 04.11), `synthesis_worker.py` (40 454 Б, 05.11), `runtime.json` (eos_threshold −1.0 + char_rules), `settings_pocket_tts.json` (модель по умолчанию — Shtorm_PocketTTS_RU_v2_slow, 3 инстанса, seed 42). Git HEAD `82d4543`; неполитая ветка `comma-semantics` (`terminate_bare_chunks`) учтена в FEATURE_PARITY как отдельная фаза. Приложение не изменялось. |
 | teratts-android (движок-источник) | Ветка `teratts`, **commit `edb614e81186ea82a27294b34d567f1b4937bb20`** (2026-11-08) — зафиксирован; все вендоренные файлы побайтово сверены с этим SHA. Лицензия репозитория: **GPL-3.0** (см. §5). |
 | Компоненты teratts-android | `rust/src/pocket.rs` — полный движок Shtorm ONNX (BPE-токенизатор на чистом Rust, stateful-графы, EOS, анти-повторы); `denoise.rs` — DPDFNet; `tera.rs` — паузы/trim/fade/`plus_to_acute`; `stretch.rs` — WSOLA-темп; `helper.rs`/`lib.rs` — JNI/Supertonic-обвязка (не вендорится). Cargo: `ort 2.0.0-rc.11` (load-dynamic), ndarray 0.17, rustfft, hound. |
-| Модели Shtorm-v2 ONNX | `C:\Users\alexa\Downloads\pocket_tts_android\build\onnx\ru-v2-fast`, `ru-v2-slow` (+ ru, ru-v1, ru-xvibe). Инспекция — §3. |
+| Модели Shtorm-v2 ONNX | `C:\Users\<user>\Downloads\pocket_tts_android\build\onnx\ru-v2-fast`, `ru-v2-slow` (+ ru, ru-v1, ru-xvibe). Инспекция — §3. |
 | Windows-среда — §4. | |
 | CUDA-путь — см. CUDA_FEASIBILITY.md. | |
 

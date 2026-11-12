@@ -11,7 +11,7 @@ GUI для Pocket-TTS на Rust; репозиторий —
 
 - Нативный Windows x64 GUI для Pocket-TTS (порт Python `pocket-tts_gui.py`).
 - Модели: **Shtorm-PocketTTS-RU v2 fast/slow** (ONNX, каталог
-  `C:\Users\alexa\Downloads\pocket_tts_android\build\onnx\ru-v2-fast|slow`).
+  `C:\Users\<user>\Downloads\pocket_tts_android\build\onnx\ru-v2-fast|slow`).
 - ONNX Runtime (`ort` 2.0.0-rc.11, load-dynamic, `ORT_DYLIB_PATH`),
   CPU и NVIDIA CUDA (RTX 3060).
 - **Точность графов (G6.3).** FP32 — исходный режим и значение по умолчанию
@@ -192,7 +192,7 @@ GUI для Pocket-TTS на Rust; репозиторий —
 - Не изменять: Python-проект `C:\PocketTTS-GUI`, системные настройки/PATH/
   CUDA/профиль Windows/SSH/GPG/глобальные инструменты, модели Shtorm.
 - Перед значительными изменениями: `git status` чист + верифицированный
-  резервный zip на NAS (`\\DISKSTATION\Ableton 2\Temp2\ShtormTTS-Windows-
+  резервный zip на NAS (`<NAS>\Temp2\ShtormTTS-Windows-
   backup-<hash>.zip`, CRC-проверка). Нет бэкапа — сначала создать.
 - Тесты не удаляют файлы (артефакты остаются в %TEMP%); юнит-тесты «на
   реальных путях» запрещены; зависающие сценарии — только в дочернем

@@ -82,7 +82,7 @@ Grep-контроль по всему проекту (`crates/`, `tools/`; `*.rs
 
 1. Резервная копия ДО начала изменений: полные исходники проекта
    (59 файлов, без `target/`, `deps/`, WAV) —
-   `\\DISKSTATION\Ableton 2\Temp2\ShtormTTS-Windows-backup-bf4e9da.zip`
+   `<NAS>\Temp2\ShtormTTS-Windows-backup-bf4e9da.zip`
    (+локальная копия), CRC всех записей проверен.
 2. `cargo fmt` — применён.
 3. `cargo clippy --all-targets` — **0 предупреждений**.

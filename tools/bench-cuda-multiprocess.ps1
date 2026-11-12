@@ -29,7 +29,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $repo = 'C:\PocketTTS-GUI-Rust\ShtormTTS-Windows'
 $exe = Join-Path $repo 'target\release\synthesize.exe'
-$modelDir = 'C:/Users/alexa/Downloads/pocket_tts_android/build/onnx/ru-v2-slow'
+$modelDir = 'C:/Users/<user>/Downloads/pocket_tts_android/build/onnx/ru-v2-slow'
 $voice = 'C:/PocketTTS-GUI/examples/Василий Леванов F5-TTS3.wav'
 $textFile = Join-Path $repo 'out\cuda_p1\test_text.txt'
 $charRules = 'C:/PocketTTS-GUI/PocketTTS-GUI/custom_models/Shtorm_PocketTTS_RU_v2_slow/runtime.json'

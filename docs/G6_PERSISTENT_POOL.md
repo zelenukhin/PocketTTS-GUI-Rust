@@ -2,7 +2,7 @@
 
 Дата: 2026-11-10. База: HEAD `69a96f5` (CUDA-P2B.3), верифицированный бэкап
 на NAS создан ДО изменений:
-`\\DISKSTATION\Ableton 2\Temp2\ShtormTTS-Windows-full-69a96f5-20261110-142544.zip`,
+`<NAS>\Temp2\ShtormTTS-Windows-full-69a96f5-20261110-142544.zip`,
 SHA256 `76C2AD153DDF78EAE12CD3A6CFCB6A3F2F700EDF6D18BA4EC017CC6A3D3E946C`,
 154/154 blob совпадают с HEAD.
 

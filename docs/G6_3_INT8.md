@@ -3,10 +3,10 @@
 - **Дата**: 2026-11-11
 - **HEAD этапа**: `284f695` (G6.3a+b; база `af005f7` G6.2.3-fix)
 - **Бэкап перед изменениями**: полный архив HEAD `af005f7` —
-  `\\DISKSTATION\Ableton 2\Temp2\ShtormTTS-Windows-full-af005f7-20261111-124806.zip`,
+  `<NAS>\Temp2\ShtormTTS-Windows-full-af005f7-20261111-124806.zip`,
   SHA256 `6940D90A346DD353B66116023F22D3FE1F59DAA6F90D40EB98828F3A2C5747C1`,
   167/167 blob совпадают.
-- **Исходные модели**: `C:\Users\alexa\Downloads\pocket_tts_android\build\onnx\
+- **Исходные модели**: `C:\Users\<user>\Downloads\pocket_tts_android\build\onnx\
   {ru-v2-fast,ru-v2-slow}` — только чтение; ничего не конвертировалось,
   не переименовывалось и не изменялось.
 

@@ -1,5 +1,5 @@
 [2026-11-08T14:39:01Z INFO  smoke] ORT_DYLIB_PATH = C:\PocketTTS-GUI-Rust\ShtormTTS-Windows\deps\ort-cpu\onnxruntime-win-x64-1.23.2\lib\onnxruntime.dll
-[2026-11-08T14:39:01Z INFO  smoke] model_dir = C:\Users\alexa\Downloads\pocket_tts_android\build\onnx\ru-v2-slow
+[2026-11-08T14:39:01Z INFO  smoke] model_dir = C:\Users\<user>\Downloads\pocket_tts_android\build\onnx\ru-v2-slow
 [2026-11-08T14:39:01Z INFO  smoke] onnxruntime dylib loaded OK
 [2026-11-08T14:39:01Z INFO  shtorm_engine::pocket] load mimi_encoder: 292 ms
 [2026-11-08T14:39:01Z INFO  shtorm_engine::pocket] load text_conditioner: 48 ms

@@ -4,7 +4,7 @@
 дерево: только новые диагностические артефакты `out/cpu_research/` и флаг
 `--precision` в `diag_p2b3` (диагностический инструмент; production-код не
 менялся). Перед изменением создан верифицированный NAS-бэкап
-`\\DISKSTATION\Ableton 2\Temp2\ShtormTTS-Windows-full-350a39b-20261112-114219.zip`
+`<NAS>\Temp2\ShtormTTS-Windows-full-350a39b-20261112-114219.zip`
 (SHA256 `9CD6FC22…F8181B`, 171/171 blob совпадают).
 
 ## 1. Реальная архитектура текущего CPU-синтеза

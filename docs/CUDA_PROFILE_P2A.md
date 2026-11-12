@@ -5,7 +5,7 @@ ONNX Runtime 1.23.2 (`deps/portable`, DLL идентичен `deps/ort-gpu-wheel
 SHA256 `062C3FDA…`, FileVersion 1.23.20251021.3.a83fc4d), CUDA EP
 `use_tf32=0`, FP32, модель ru-v2-slow. Rust `ort = 2.0.0-rc.11`
 (dynamic load). Базовый HEAD до этапа: `374097b` (CUDA-P1).
-Бэкап перед изменениями: `\\DISKSTATION\Ableton 2\Temp2\ShtormTTS-Windows-
+Бэкап перед изменениями: `<NAS>\Temp2\ShtormTTS-Windows-
 full-374097b-20261109-223351.zip`, SHA256
 `593A0594B77B4033F2C03B5153D866D46D4559BF8ED84ED8F549508279A2F1D6`,
 135/135 blob совпали с HEAD.
@@ -315,7 +315,7 @@ PATH="deps/portable:$PATH" SHTORM_P2A_DEVICE=cuda \
 ## 13. CUDA-P2A.1 — стабилизация и включение по умолчанию (2026-11-09)
 
 Базовый HEAD перед этапом — `9133450` (docs-коммит P2A). Бэкап:
-`\DISKSTATION\Ableton 2\Temp2\ShtormTTS-Windows-full-9133450-20261109-232858.zip`,
+`\<NAS>\backup\Temp2\ShtormTTS-Windows-full-9133450-20261109-232858.zip`,
 SHA256 `8709B433800205DFF49E06E4C19A0533C0F2A1BEC667A8E837C2A40DB5A1F09A`,
 144/144 blob совпали с HEAD. Python-проект и системные настройки не менялись.
 

@@ -47,7 +47,7 @@ CUDA-P2B.2 должен оптимизировать покадровый пут
 
 Перед экспериментами по установленной процедуре требовался
 верифицированный бэкап HEAD на NAS
-(`\\DISKSTATION\Ableton 2\Temp2`). NAS отвечает на ping, но SMB-шара
+(`<NAS>\Temp2`). NAS отвечает на ping, но SMB-шара
 недоступна: `sys error 1702` («Недопустимый дескриптор привязки»), та же
 картина, что в задокументированном блокере G2.1
 (`out/g21_nas_blocker_2026-11-09.md`). Без прав администратора
@@ -64,7 +64,7 @@ ready/start barrier в CLI не реализовывался (он требов�
 
 > **Уточнение (CUDA-P2B.2, 2026-11-10).** Утверждение о недоступности NAS
 > ошибочно: причиной был баг проверочного скрипта `out/nas_check.ps1`
-> (`'\DISKSTATION\...'` с одним ведущим слэшем — PowerShell трактует такой
+> (`'\<NAS>\...'` с одним ведущим слэшем — PowerShell трактует такой
 > путь как относительный от `C:`, а `Test-Path` всегда даёт `false`; при
 > вызове из bash терялся ещё один слэш). С корректным UNC-путём шара
 > доступна, бэкапы штатно создавались и до, и после. Замеры §2–§10 этого
@@ -77,7 +77,7 @@ ready/start barrier в CLI не реализовывался (он требов�
 
 - Текст: `out/cuda_p1/test_text.txt` (эталон CUDA-P1/P2A), 13 чанков,
   речь 64.01 с, паузы 6.00 с, итог 70.01 с.
-- Модель: `C:/Users/alexa/Downloads/pocket_tts_android/build/onnx/ru-v2-slow`.
+- Модель: `C:/Users/<user>/Downloads/pocket_tts_android/build/onnx/ru-v2-slow`.
 - Голос: `C:/PocketTTS-GUI/examples/Василий Леванов F5-TTS3.wav`.
 - Параметры: temperature 0.3, decode_steps 1, seed 42, EOS −4.0 /
   хвосты 5 и 3, anti_repeat, denoise false, brightness 8 дБ,
@@ -118,7 +118,7 @@ powershell ... -Label a3_t1 -Processes 3 -Workers 1 -Threads 1 -SkipWarmup -Reps
 
 ```
 target\release\synthesize.exe
-  --model-dir C:/Users/alexa/Downloads/pocket_tts_android/build/onnx/ru-v2-slow
+  --model-dir C:/Users/<user>/Downloads/pocket_tts_android/build/onnx/ru-v2-slow
   --voice "C:/PocketTTS-GUI/examples/Василий Леванов F5-TTS3.wav"
   --text-file <repo>/out/cuda_p1/test_text.txt
   --out <run>/pN/out.wav --format wav --device cuda --workers 1

@@ -1,7 +1,7 @@
 # G6.2.1 — Hardening жизненного цикла гибридного пула 2×2
 
 Дата: 2026-11-10. База: HEAD `40c363c` (G6.2). Верифицированный бэкап ДО
-изменений: `\\DISKSTATION\Ableton 2\Temp2\ShtormTTS-Windows-full-40c363c-
+изменений: `<NAS>\Temp2\ShtormTTS-Windows-full-40c363c-
 20261110-212916.zip`, SHA256
 `7B591D5CAFEA0F38863A7180A7742FC0B10C571D0436593C5947EAB8C8C679C0`,
 165/165 blob совпадают с HEAD.
