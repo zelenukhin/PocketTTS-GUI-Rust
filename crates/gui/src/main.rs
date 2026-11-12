@@ -129,7 +129,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(plan.inner_size)
             .with_min_inner_size(plan.min_inner_size)
-            .with_title("PocketTTS-GUI-Rust"),
+            .with_title("PocketTTS-GUI-Rust v1.0"),
         ..Default::default()
     };
     eframe::run_native(

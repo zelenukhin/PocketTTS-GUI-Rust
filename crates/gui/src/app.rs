@@ -1789,7 +1789,11 @@ impl eframe::App for ShtormApp {
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("PocketTTS-GUI-Rust").heading().strong());
+                ui.label(
+                    egui::RichText::new("PocketTTS-GUI-Rust v1.0")
+                        .heading()
+                        .strong(),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let (badge, color) = match self.settings_load {
                         SettingsLoadState::Loaded => ("настройки загружены", None),
