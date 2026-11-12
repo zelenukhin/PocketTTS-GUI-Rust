@@ -854,6 +854,19 @@ bash out/p2a1/bench_clean.sh auto 1 <tag>
 `C:\PocketTTS-GUI\examples\Microsoft Brian Speed 1.wav`, ffmpeg
 `C:\PocketTTS-GUI\ffmpeg\ffmpeg.exe`, seed 42, threads 4 (CPU 2w / CUDA 1w).
 
+## CPU-RESEARCH-2 (2026-11-12, контрольная серия завершена)
+
+Дополнение к исследованию CPU-пула — раздел 11
+`docs/CPU_BATCH_WORKERS_RESEARCH.md`: корректный эталон — реальный GUI
+CPU-batch W2T4 (не W1T4). Итог: постоянный CPU-пул W2T4 даёт против GUI
+**1.26× (Slow FP32) … 1.44× (Fast INT8)** wall (−21…−30%), короткий пакет
+4 файлов — 1.23×; W4T1 — 1.35× (Slow FP32) при 3.3 ГБ и латентности
+первого файла ×2.9; **T=4 оставить** (W2T2 не быстрее, T=4 побитово
+совместим). Паритет: seq W2T4 ≡ pool W2T4 SHA256 на всех 4 моделях.
+Budget ~33 мин; production-код не менялся (только скрипты out/, без
+коммита — артефакты). Внедрение пула — отдельным заданием; схема настроек
+и адаптивное Auto — в §11 раздела «Итоговые рекомендации».
+
 ## CPU-RESEARCH (2026-11-12, этап завершён)
 
 Исследование CPU batching/воркеров — `docs/CPU_BATCH_WORKERS_RESEARCH.md`
