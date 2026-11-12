@@ -966,7 +966,6 @@ impl ShtormApp {
         .show(ui, |ui| {
             let is_cuda = s.device == DeviceChoice::Cuda;
             let int8 = s.model.precision() == shtorm_engine::ModelPrecision::Int8;
-            let effective_workers = s.effective_workers();
             let model_note = crate::job::resolve_model_dir(s)
                 .map(|d| d.display().to_string())
                 .unwrap_or_else(|e| e.to_string());
@@ -1038,10 +1037,6 @@ impl ShtormApp {
                     .pick_file()
             });
             hint(ui, "(пусто = авто из deps проекта)");
-            hint(
-                ui,
-                format!("Воркеров: {effective_workers} (авто: CPU 2 / CUDA 1)"),
-            );
             if int8 {
                 hint(
                     ui,
@@ -1204,7 +1199,6 @@ impl ShtormApp {
             egui::CollapsingHeader::new(egui::RichText::new("Паузы и воркеры").heading().strong())
                 .open(Some(s.pauses_open))
                 .show(ui, |ui| {
-                    let auto_workers = s.effective_workers();
                     two_columns(
                         ui,
                         |ui| {
@@ -1215,6 +1209,8 @@ impl ShtormApp {
                                         .fixed_decimals(2),
                                 );
                             });
+                        },
+                        |ui| {
                             slider_row(ui, "Пауза абзаца (с):", |ui| {
                                 ui.add(
                                     egui::Slider::new(&mut s.paragraph_pause_s, 0.0..=3.0)
@@ -1222,34 +1218,14 @@ impl ShtormApp {
                                         .fixed_decimals(2),
                                 );
                             });
-                            let mut manual = s.workers.is_some();
-                            if ui.checkbox(&mut manual, "Воркеров вручную").changed()
-                            {
-                                s.workers = if manual {
-                                    Some(auto_workers.max(1))
-                                } else {
-                                    None
-                                };
-                            }
-                            if let Some(w) = &mut s.workers {
-                                ui.add(egui::Slider::new(w, 1..=12));
-                            }
-                        },
-                        |ui| {
-                            ui.horizontal(|ui| {
-                                label_cell(ui, "Потоков ORT:");
-                                ui.add(egui::DragValue::new(&mut s.threads).range(1..=16));
-                            });
-                            hint(ui, "intra-op, паритет с CLI --threads (по умолчанию 4)");
                         },
                     );
-                    // G6.6: универсальный блок параллельной обработки каталога
-                    // (одинаковые поля/порядок/пресеты для CPU и CUDA;
-                    // устройства отличаются только диапазонами и оценкой
-                    // ресурсов).
-                    if s.batch {
-                        parallel_processing_block(ui, s);
-                    }
+                    // G6.7: ОДИН универсальный блок параллельной обработки для
+                    // обоих режимов (одиночный TXT и каталог) и обоих устройств
+                    // (CPU/CUDA): P/W/C/T, пресеты «Оптимальный»/«Производительный»,
+                    // ручное состояние «Свой». Старые «Воркеров вручную» и
+                    // дубль «Потоков ORT» одиночного режима удалены (ТЗ G6.7 §7).
+                    parallel_processing_block(ui, s);
                 });
         header_clicked(&resp, &mut s.pauses_open);
         ui.add_space(8.0);
@@ -1652,11 +1628,14 @@ fn parallel_processing_block(ui: &mut egui::Ui, s: &mut GuiSettings) {
     ui.add_space(4.0);
     ui.group(|ui| {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Параллельная обработка (каталог)").strong())
+            ui.label(egui::RichText::new("Параллельная обработка").strong())
                 .on_hover_text(
-                    "Процесс — дочерний рабочий процесс с карманами Pocket (воркерами). \
-                 Воркер файлового пула = один Pocket (набор ONNX-сессий). \
-                 ORT-потоки — intra-op потоки одной ONNX-сессии; это разные вещи.",
+                    "Процесс (P) — рабочий процесс с Pocket; при P=1 пул живёт в \
+                 процессе приложения, при P>1 — в дочерних процессах. Воркер (W) = \
+                 постоянный Pocket (набор ONNX-сессий), создаётся один раз на задание. \
+                 Одновременные чанки (C) ограничивают параллелизм чанков текущего \
+                 файла (файлов в обработке всегда максимум 1). ORT-потоки (T) — \
+                 intra-op потоки одной ONNX-сессии.",
                 );
         });
         ui.horizontal(|ui| {
@@ -1679,7 +1658,7 @@ fn parallel_processing_block(ui: &mut egui::Ui, s: &mut GuiSettings) {
         // правки полей выполняются в копиях (две колонки — два замыкания);
         // слияние и перевод профиля в «Свой» — после two_columns
         let (mut processes, mut wpp) = (cfg.processes, cfg.workers_per_process);
-        let (mut files, mut threads_t) = (cfg.max_concurrent_files, cfg.ort_threads);
+        let (mut files, mut threads_t) = (cfg.max_concurrent_chunks, cfg.ort_threads);
         let mut left_changed = false;
         let mut right_changed = false;
         let pockets_for_files = cfg.total_pockets();
@@ -1715,8 +1694,8 @@ fn parallel_processing_block(ui: &mut egui::Ui, s: &mut GuiSettings) {
             |ui| {
                 combo_row(
                     ui,
-                    "Одновременных файлов:",
-                    "par_files",
+                    "Одновременных чанков:",
+                    "par_chunks",
                     &files.to_string(),
                     |ui| {
                         for f in 1..=pockets_for_files {
@@ -1726,9 +1705,10 @@ fn parallel_processing_block(ui: &mut egui::Ui, s: &mut GuiSettings) {
                     },
                 )
                 .on_hover_text(
-                    "Верхний предел файлов, обрабатываемых одновременно. Pocket сверх \
-                     предела не создаются (однопроцессный пул) либо не получают \
-                     назначений (мультипроцессный диспетчер).",
+                    "Верхний предел чанков текущего файла, синтезируемых одновременно \
+                     (min(C, P×W, оставшихся чанков)). C не создаёт дополнительные \
+                     Pocket — только ограничивает параллелизм. Файлов в обработке \
+                     всегда не более одного.",
                 );
                 combo_row(
                     ui,
@@ -1752,7 +1732,7 @@ fn parallel_processing_block(ui: &mut egui::Ui, s: &mut GuiSettings) {
         if left_changed || right_changed {
             cfg.processes = processes;
             cfg.workers_per_process = wpp;
-            cfg.max_concurrent_files = files;
+            cfg.max_concurrent_chunks = files;
             cfg.ort_threads = threads_t;
             edited(&mut cfg);
         }
@@ -1780,9 +1760,9 @@ fn parallel_processing_block(ui: &mut egui::Ui, s: &mut GuiSettings) {
         })
         .response
         .on_hover_text(
-            "Процессы = дочерние рабочие процессы с Pocket; воркер файлового пула = \
-             один Pocket; ORT — потоки одной ONNX-сессии. Одновременные файлы \
-             ограничивают параллельные задания, но не создают дополнительные Pocket.",
+            "P — процессы, W — Pocket на процесс, C — одновременно синтезируемых \
+             чанков текущего файла, T — потоки ORT на сессию. Каталог: файлы строго \
+             последовательны, чанки файла параллельны. Одиночный TXT — тот же пул.",
         );
         if cfg.ort_threads != 4 {
             hint(
@@ -3079,7 +3059,7 @@ mod tests {
             profile: crate::settings::ParallelProfile::Productive,
             processes: 2,
             workers_per_process: 2,
-            max_concurrent_files: 4,
+            max_concurrent_chunks: 4,
             ort_threads: 4,
         };
         app.settings.theme_dark = false;

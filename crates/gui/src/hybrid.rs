@@ -143,6 +143,18 @@ pub enum Cmd {
         out: PathBuf,
         seed: u64,
     },
+    /// G6.7: назначение ЧАНКА файла `pos` воркеру `worker` (чанк-конвейер:
+    /// файлами владеет диспетчер, воркеры синтезируют отдельные чанки).
+    AssignChunk {
+        worker: usize,
+        pos: usize,
+        index: u64,
+        model_text: String,
+        pause_s: Option<f32>,
+        /// Per-file seed: воркер ставит его на постоянный Pocket перед
+        /// чанком (seed чанка = seed + index, назначение воркера не влияет).
+        seed: u64,
+    },
     /// Отмена пакета: генерация прерывается между чанками; файлы в фазах
     /// Finalizing/Publishing дорабатывают публикацию до конца.
     Cancel,
@@ -220,6 +232,29 @@ pub enum Ev {
         worker: usize,
         error: String,
     },
+    /// G6.7: чанк синтезирован. `pcm` НЕ сериализуется в JSON: writer-поток
+    /// дочернего процесса пишет JSON-заголовок, ЗАТЕМ (из ЭТОГО ЖЕ сообщения
+    /// очереди — перемешивание с событиями других воркеров невозможно) один
+    /// бинарный кадр PCM (f32 little-endian, `samples` сэмплов). Большие
+    /// PCM-массивы через JSON не передаются (ТЗ G6.7 §5).
+    ChunkDone {
+        worker: usize,
+        pos: usize,
+        index: u64,
+        pause_s: Option<f32>,
+        /// Тег статуса денойза: "applied"/"off"/"missing"/"failed: …".
+        denoise: String,
+        samples: u32,
+        #[serde(skip)]
+        pcm: Option<Vec<u8>>,
+    },
+    /// G6.7: чанк не синтезирован (ошибка движка/отмена).
+    ChunkFailed {
+        worker: usize,
+        pos: usize,
+        index: u64,
+        error: String,
+    },
     /// Воркер корректно завершился (после Shutdown / закрытия канала).
     Stopped {
         worker: usize,
@@ -236,7 +271,31 @@ fn ev_to_value(ev: &Ev) -> Result<serde_json::Value> {
     serde_json::to_value(ev).map_err(|e| anyhow!("сериализация события: {e}"))
 }
 
-fn send_cmd(end: &PipeEnd, cmd: &Cmd) -> Result<()> {
+/// PCM → бинарный кадр (f32 little-endian) — транспорт аудио без JSON.
+pub fn pcm_to_frame(pcm: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(pcm.len() * 4);
+    for v in pcm {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
+}
+
+/// Бинарный кадр → PCM (f32 little-endian); некратный размер — ошибка.
+pub fn pcm_from_frame(bytes: &[u8]) -> Result<Vec<f32>> {
+    anyhow::ensure!(
+        bytes.len().is_multiple_of(4),
+        "размер PCM-кадра {} не кратен 4 байтам",
+        bytes.len()
+    );
+    Ok(bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
+}
+
+pub(crate) fn send_cmd(end: &PipeEnd, cmd: &Cmd) -> Result<()> {
     wire::send_json(end, &cmd_to_value(cmd)?).map_err(|e| anyhow!("отправка команды IPC: {e}"))
 }
 
@@ -280,8 +339,19 @@ pub struct AssignJob {
 /// Управляющие сообщения потока воркера (Assign адресуется конкретному
 /// воркеру; Cancel — общий AtomicBool процесса; Shutdown/закрытие канала
 /// завершает цикл).
+/// G6.7: чанк-задание воркеру (файлом владеет диспетчер).
+#[derive(Debug, Clone)]
+pub struct ChunkTask {
+    pub pos: usize,
+    pub index: u64,
+    pub model_text: String,
+    pub pause_s: Option<f32>,
+    pub seed: u64,
+}
+
 enum WorkerCmd {
     Assign(AssignJob),
+    AssignChunk(ChunkTask),
     Shutdown,
 }
 
@@ -360,7 +430,16 @@ fn worker_main_impl(pipe_name: &str) -> Result<i32> {
     let write_end = Arc::clone(&end);
     let writer = std::thread::spawn(move || {
         while let Ok(ev) = ev_rx.recv() {
-            if send_ev(&write_end, &ev).is_err() {
+            // G6.7: ChunkDone с PCM — JSON-заголовок, затем бинарный кадр;
+            // оба кадра порождены ОДНИМ сообщением очереди — порядок пары
+            // не может быть перемешан событиями других воркеров
+            let ok = match &ev {
+                Ev::ChunkDone {
+                    pcm: Some(bytes), ..
+                } => send_ev(&write_end, &ev).is_ok() && write_end.send(bytes).is_ok(),
+                _ => send_ev(&write_end, &ev).is_ok(),
+            };
+            if !ok {
                 break; // диспетчер ушёл
             }
         }
@@ -467,6 +546,33 @@ fn worker_main_impl(pipe_name: &str) -> Result<i32> {
                             Some(out),
                             "воркер дочернего процесса недоступен — файл не запускался",
                         ),
+                    });
+                }
+            }
+            Cmd::AssignChunk {
+                worker,
+                pos,
+                index,
+                model_text,
+                pause_s,
+                seed,
+            } => {
+                let task = ChunkTask {
+                    pos,
+                    index,
+                    model_text,
+                    pause_s,
+                    seed,
+                };
+                let delivered = worker < workers
+                    && assign_tx[worker].send(WorkerCmd::AssignChunk(task)).is_ok();
+                if !delivered {
+                    // чанк не теряется: диспетчер получает явный отказ
+                    let _ = ev_tx.send(Ev::ChunkFailed {
+                        worker,
+                        pos,
+                        index,
+                        error: "воркер дочернего процесса недоступен".into(),
                     });
                 }
             }
@@ -600,9 +706,73 @@ fn worker_loop(
     };
 
     let _ = ev_tx.send(Ev::Ready { worker: wid });
-    loop {
-        let job = match cmds.recv() {
-            Ok(WorkerCmd::Assign(job)) => {
+    while let Ok(cmd) = cmds.recv() {
+        // G6.7: чанк-конвейер — чанк на постоянном Pocket, PCM бинарным
+        // кадром; сбой движка отравляет Pocket (не переиспользуется)
+        if let WorkerCmd::AssignChunk(task) = cmd {
+            if cancel.load(Ordering::SeqCst) {
+                let _ = ev_tx.send(Ev::ChunkFailed {
+                    worker: wid,
+                    pos: task.pos,
+                    index: task.index,
+                    error: "отменено".into(),
+                });
+                continue;
+            }
+            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                process_chunk(shared, &slot, &task, shared.is_none())
+            }));
+            match run {
+                Ok(Ok(audio)) => {
+                    let samples = audio.speech.len() as u32;
+                    let _ = ev_tx.send(Ev::ChunkDone {
+                        worker: wid,
+                        pos: task.pos,
+                        index: task.index,
+                        pause_s: audio.pause_s,
+                        denoise: denoise_tag(&audio.denoise),
+                        samples,
+                        pcm: Some(pcm_to_frame(&audio.speech)),
+                    });
+                }
+                Ok(Err(e)) => {
+                    let _ = ev_tx.send(Ev::ChunkFailed {
+                        worker: wid,
+                        pos: task.pos,
+                        index: task.index,
+                        error: format!("{e:#}"),
+                    });
+                    // Pocket в неопределённом состоянии — отравить слот
+                    if let Ok(mut guard) = slot.lock() {
+                        *guard = None;
+                    }
+                    let _ = ev_tx.send(Ev::WorkerError {
+                        worker: wid,
+                        error: "ошибка движка на чанке — Pocket не переиспользуется".into(),
+                    });
+                    break;
+                }
+                Err(p) => {
+                    let _ = ev_tx.send(Ev::ChunkFailed {
+                        worker: wid,
+                        pos: task.pos,
+                        index: task.index,
+                        error: format!("паника воркера: {}", panic_text(p.as_ref())),
+                    });
+                    if let Ok(mut guard) = slot.lock() {
+                        *guard = None;
+                    }
+                    let _ = ev_tx.send(Ev::WorkerError {
+                        worker: wid,
+                        error: "паника на чанке — Pocket не переиспользуется".into(),
+                    });
+                    break;
+                }
+            }
+            continue;
+        }
+        let job = match cmd {
+            WorkerCmd::Assign(job) => {
                 if cancel.load(Ordering::SeqCst) {
                     // после отмены новые файлы не начинаются: честный отказ,
                     // файл не «повисает» у диспетчера
@@ -623,8 +793,8 @@ fn worker_loop(
                 }
                 job
             }
-            Ok(WorkerCmd::Shutdown) => break,
-            Err(_) => break, // диспетчер закрыл канал
+            WorkerCmd::AssignChunk(_) => unreachable!("обработан выше"),
+            WorkerCmd::Shutdown => break,
         };
         let _ = ev_tx.send(Ev::FileStarted {
             worker: wid,
@@ -828,6 +998,72 @@ fn process_file(
                 !publish_failed,
             )
         }
+    }
+}
+
+/// G6.7: синтез ОДНОГО чанка на постоянном Pocket воркера (per-file seed
+/// ставится перед чанком; say_chunk пересеивает RNG как seed+index, поэтому
+/// результат не зависит от того, каким воркером/процессом выполнен чанк).
+/// Сбой не возвращает Pocket в слот — вызывающий код отравляет его.
+fn process_chunk(
+    shared: Option<&WorkerEnv>,
+    slot: &WorkerSlot<RealWorker>,
+    task: &ChunkTask,
+    fake: bool,
+) -> Result<app_core::pool::ChunkAudio> {
+    let _ = shared; // используется ниже только в боевом режиме
+    use app_core::pool::{ChunkAudio, ChunkWorker, DenoiseChunkStatus, Task};
+    if fake {
+        // тестовая заглушка: короткая тишина (маркер — индекс чанка)
+        let marker = (task.index % 7) as f32;
+        return Ok(ChunkAudio {
+            speech: vec![marker; 240],
+            pause_s: task.pause_s,
+            denoise: DenoiseChunkStatus::Off,
+        });
+    }
+    let mut worker = slot
+        .lock()
+        .map_err(|_| anyhow!("мьютекс воркера отравлен"))?
+        .take()
+        .ok_or_else(|| anyhow!("Pocket воркера занят или отравлен"))?;
+    worker.set_seed(task.seed);
+    let result = worker.process(&Task {
+        index: task.index,
+        model_text: task.model_text.clone(),
+        pause_s: task.pause_s,
+    });
+    match result {
+        Ok(audio) => {
+            // Pocket исправен — вернуть в слот
+            if let Ok(mut guard) = slot.lock() {
+                *guard = Some(worker);
+            }
+            Ok(audio)
+        }
+        Err(e) => Err(e), // слот остаётся пустым (отравлен)
+    }
+}
+
+/// Тег статуса денойза для IPC-заголовка ChunkDone.
+fn denoise_tag(d: &app_core::pool::DenoiseChunkStatus) -> String {
+    use app_core::pool::DenoiseChunkStatus;
+    match d {
+        DenoiseChunkStatus::Applied => "applied".into(),
+        DenoiseChunkStatus::Off => "off".into(),
+        DenoiseChunkStatus::Missing => "missing".into(),
+        DenoiseChunkStatus::Failed(e) => format!("failed: {e}"),
+    }
+}
+
+/// Обратное преобразование тега денойза (для отчётов диспетчера).
+pub fn denoise_from_tag(tag: &str) -> app_core::pool::DenoiseChunkStatus {
+    use app_core::pool::DenoiseChunkStatus;
+    match tag {
+        "applied" => DenoiseChunkStatus::Applied,
+        "off" => DenoiseChunkStatus::Off,
+        "missing" => DenoiseChunkStatus::Missing,
+        other => DenoiseChunkStatus::Failed(other.to_string()),
     }
 }
 
@@ -1083,6 +1319,16 @@ fn assign_to_job(_job: isize, _pid: u32) -> Result<()> {
 #[allow(clippy::large_enum_variant)]
 pub enum ChildEvent {
     Msg(Ev),
+    /// G6.7: чанк готов — JSON-заголовок ChunkDone + бинарный кадр PCM,
+    /// прочитанный в порядке следования кадров того же канала.
+    ChunkAudio {
+        worker: usize,
+        pos: usize,
+        index: u64,
+        pause_s: Option<f32>,
+        denoise: String,
+        pcm: Vec<f32>,
+    },
     /// Канал закрыт (процесс умер/завершился) с диагностикой причины.
     Closed(String),
 }
@@ -1131,6 +1377,60 @@ pub fn connect_child(server: PipeServer, child: std::process::Child) -> Result<S
         loop {
             match recv_ev(&read_end).transpose() {
                 Some(Ok(ev)) => {
+                    // G6.7: за ChunkDone ОБЯЗАН следовать один бинарный кадр
+                    // PCM — читаем его в этом же потоке, сохраняя порядок
+                    if let Ev::ChunkDone {
+                        worker,
+                        pos,
+                        index,
+                        pause_s,
+                        denoise,
+                        samples,
+                        ..
+                    } = ev
+                    {
+                        let pcm = match read_end.recv() {
+                            Ok(Some(bytes)) => match pcm_from_frame(&bytes) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    let _ =
+                                        tx.send(ChildEvent::Closed(format!("разрыв IPC: {e:#}")));
+                                    break;
+                                }
+                            },
+                            Ok(None) => {
+                                let _ = tx.send(ChildEvent::Closed(
+                                    "разрыв IPC: EOF при чтении PCM чанка".into(),
+                                ));
+                                break;
+                            }
+                            Err(e) => {
+                                let _ = tx.send(ChildEvent::Closed(format!("разрыв IPC: {e}")));
+                                break;
+                            }
+                        };
+                        if pcm.len() != samples as usize {
+                            let _ = tx.send(ChildEvent::Closed(format!(
+                                "разрыв IPC: PCM чанка {index}: {} сэмплов вместо {samples}",
+                                pcm.len()
+                            )));
+                            break;
+                        }
+                        if tx
+                            .send(ChildEvent::ChunkAudio {
+                                worker,
+                                pos,
+                                index,
+                                pause_s,
+                                denoise,
+                                pcm,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
                     if tx.send(ChildEvent::Msg(ev)).is_err() {
                         break;
                     }
@@ -1584,6 +1884,9 @@ impl Dispatch {
                 Vec::new()
             }
             Ev::FileProgress { .. } => Vec::new(),
+            // G6.7: чанк-события обрабатывает чанк-диспетчер (chunkpipe.rs);
+            // файловый диспетчер их не использует
+            Ev::ChunkDone { .. } | Ev::ChunkFailed { .. } => Vec::new(),
             Ev::FilePhase { pos, phase, .. } => {
                 if let Some(slot) = self.slots.get_mut(*pos) {
                     slot.phase = match phase {
@@ -1949,6 +2252,8 @@ pub fn run_hybrid(d: &HybridDriver) -> Result<HybridOutcome> {
             break;
         }
         match rx.recv_timeout(Duration::from_millis(100)) {
+            // G6.7: чанк-аудио приходит только чанк-диспетчеру
+            Ok((_, ChildEvent::ChunkAudio { .. })) => {}
             Ok((ci, ChildEvent::Msg(ev))) => {
                 last_seen[ci] = Instant::now();
                 (d.event)(&ev);
@@ -3623,6 +3928,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             match sp.events.recv_timeout(Duration::from_millis(100)) {
+                Ok(ChildEvent::ChunkAudio { .. }) => {}
                 Ok(ChildEvent::Msg(ev)) => evs.push(ev),
                 Ok(ChildEvent::Closed(_)) => {
                     closed = true;

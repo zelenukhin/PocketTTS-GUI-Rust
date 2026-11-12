@@ -360,7 +360,7 @@ fn portable_selftest_hybrid(args: &[String]) -> i32 {
         profile: pockettts_gui_rust::settings::ParallelProfile::Productive,
         processes: 2,
         workers_per_process: 2,
-        max_concurrent_files: 4,
+        max_concurrent_chunks: 4,
         ort_threads: 4,
     };
     s.clamped();

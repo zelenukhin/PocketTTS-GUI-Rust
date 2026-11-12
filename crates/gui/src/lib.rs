@@ -3,6 +3,7 @@
 
 pub mod app;
 pub mod batch;
+pub mod chunkpipe;
 pub mod cli;
 #[cfg(windows)]
 pub mod hybrid;

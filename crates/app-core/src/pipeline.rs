@@ -662,39 +662,52 @@ where
     )
 }
 
-/// Реализация с инъекцией фабрики воркеров: публичная обёртка всегда берёт
-/// `real_worker_factory`; тесты подставляют мок и проверяют аварийный путь
-/// целиком (run_job → StreamError с реальным прогрессом/seed/черновиком).
+/// G6.7: потоковый конвейер ОДНОГО файла на ПОСТОЯННОМ чанк-пуле. Чанки
+/// текущего файла распределяются между `workers` (= min(C, живые слоты))
+/// одалживаемыми воркерами; Pocket переживают файлы пакета (фабрика
+/// `persistent::pooled_*_worker_factory`). Seed = `opts.seed` этого файла,
+/// аудио побитово равно одиночному пути с тем же T/seed (seed чанка =
+/// seed файла + индекс, назначение воркера не влияет).
 #[allow(clippy::too_many_arguments)]
-fn synthesize_stream_impl<W, Fac, FacW, F>(
+pub fn synthesize_stream_pooled<W, FacW, F>(
     raw_text: &str,
     opts: &PipelineOptions,
     workers: usize,
     sink: Box<dyn AudioSink>,
-    mut progress: F,
+    progress: F,
     cancel: &AtomicBool,
     phase: &dyn Fn(RunPhase),
-    factory_of: Fac,
+    factory: FacW,
 ) -> Result<StreamOutcome>
 where
     W: crate::pool::ChunkWorker + 'static,
-    Fac: FnOnce(u64) -> FacW,
     FacW: Fn(usize, u64) -> anyhow::Result<W> + Send + Sync + 'static,
     F: FnMut(usize, usize),
 {
-    use text_processing::{chunk_pause_s, chunk_pipeline, to_model_stress_notation};
+    synthesize_stream_impl(
+        raw_text,
+        opts,
+        workers.max(1),
+        sink,
+        progress,
+        cancel,
+        phase,
+        move |_seed| factory,
+    )
+}
 
+/// G6.7: план чанков файла WITHOUT движка — текст → (исходные чанки для
+/// журнала, задачи пула с model_text/паузами). Используется и конвейером
+/// (`synthesize_stream_impl`), и многопроцессным диспетчером (чанки
+/// отправляются дочерним процессам командами AssignChunk).
+pub fn build_file_tasks(
+    raw_text: &str,
+    opts: &PipelineOptions,
+) -> Result<(Vec<String>, Vec<Task>)> {
+    use text_processing::{chunk_pause_s, chunk_pipeline, to_model_stress_notation};
     let chunks = chunk_pipeline(raw_text, opts.max_tokens);
     anyhow::ensure!(!chunks.is_empty(), "текст пуст — нечего синтезировать");
     let total = chunks.len();
-    let fs = POCKET_RATE;
-    let partial_path = sink.partial_path();
-
-    let base_seed = match opts.seed {
-        Some(s) => s,
-        None => SeedPolicy::Random.resolve(),
-    };
-
     let tasks: Vec<Task> = chunks
         .iter()
         .enumerate()
@@ -716,6 +729,41 @@ where
             }
         })
         .collect();
+    let texts = chunks.iter().map(|c| c.text.clone()).collect();
+    Ok((texts, tasks))
+}
+
+/// Реализация с инъекцией фабрики воркеров: публичная обёртка всегда берёт
+/// `real_worker_factory`; тесты подставляют мок и проверяют аварийный путь
+/// целиком (run_job → StreamError с реальным прогрессом/seed/черновиком).
+#[allow(clippy::too_many_arguments)]
+fn synthesize_stream_impl<W, Fac, FacW, F>(
+    raw_text: &str,
+    opts: &PipelineOptions,
+    workers: usize,
+    sink: Box<dyn AudioSink>,
+    mut progress: F,
+    cancel: &AtomicBool,
+    phase: &dyn Fn(RunPhase),
+    factory_of: Fac,
+) -> Result<StreamOutcome>
+where
+    W: crate::pool::ChunkWorker + 'static,
+    Fac: FnOnce(u64) -> FacW,
+    FacW: Fn(usize, u64) -> anyhow::Result<W> + Send + Sync + 'static,
+    F: FnMut(usize, usize),
+{
+    // G6.7: план чанков выделен в build_file_tasks (общий с многопроцессным
+    // диспетчером); порядок/паузы/char_rules — без изменений.
+    let (chunk_texts, tasks) = build_file_tasks(raw_text, opts)?;
+    let total = tasks.len();
+    let fs = POCKET_RATE;
+    let partial_path = sink.partial_path();
+
+    let base_seed = match opts.seed {
+        Some(s) => s,
+        None => SeedPolicy::Random.resolve(),
+    };
 
     let cfg = PoolConfig {
         workers,
@@ -758,14 +806,14 @@ where
         .cloned()
         .map(|t| (t.index, t))
         .collect();
-    let rows: Vec<ChunkLogRow> = chunks
+    let rows: Vec<ChunkLogRow> = chunk_texts
         .iter()
         .enumerate()
-        .map(|(i, c)| {
+        .map(|(i, text)| {
             let t = by_index.remove(&i);
             ChunkLogRow {
                 index: i,
-                text: c.text.clone(),
+                text: text.clone(),
                 worker_id: t.as_ref().map(|t| t.worker_id),
                 ms: t.as_ref().map(|t| t.ms),
                 denoise: t

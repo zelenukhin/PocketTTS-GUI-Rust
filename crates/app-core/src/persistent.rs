@@ -100,6 +100,96 @@ pub fn loaned_real_worker_factory(
     loaned_worker_factory(slot, |w, seed| w.set_seed(seed))
 }
 
+/// G6.7: одалженный воркер чанк-пула с ОТРАВЛЕНИЕМ слота при сбое движка.
+/// `process()` возвращает Err ИЛИ паникует (unwind проходит через Drop) —
+/// Pocket не возвращается в пул (слот опустошается), успешные вызовы
+/// возвращают Pocket в слот как `Loaned`. Отмена НЕ считается сбоем:
+/// say_chunk пересеивает RNG на каждый чанк, Pocket остаётся детерминированным.
+pub struct PoisonLoan<W> {
+    slot: WorkerSlot<W>,
+    inner: Option<W>,
+    /// false — внутри process() (или сбой); true — вне вызова после успеха.
+    healthy: bool,
+}
+
+impl<W: ChunkWorker> ChunkWorker for PoisonLoan<W> {
+    fn process(&mut self, task: &crate::pool::Task) -> Result<crate::pool::ChunkAudio> {
+        self.healthy = false; // паника ниже уйдёт через Drop с healthy=false
+        let r = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("одолженный воркер пуст"))?
+            .process(task);
+        if r.is_ok() {
+            self.healthy = true;
+        }
+        r
+    }
+}
+
+impl<W> Drop for PoisonLoan<W> {
+    fn drop(&mut self) {
+        if let Some(w) = self.inner.take() {
+            // сбой движка/паника (healthy=false): слот опустошается —
+            // Pocket не переиспользуется (классификация G6.1 внутри займа)
+            let poisoned = !self.healthy;
+            if let Ok(mut slot) = self.slot.lock() {
+                *slot = if poisoned { None } else { Some(w) };
+            }
+        }
+    }
+}
+
+/// G6.7: фабрика чанк-пула. Воркер `run_job` (workers = min(C, живые слоты))
+/// одалживает ЛЮБОЙ свободный слот постоянного пула (слоты, отравленные
+/// ранее сбоями, пропускаются); per-file seed ставится перед первым чанком
+/// файла.Pocket переживает файлы пакета.
+pub fn pooled_worker_factory<W, P>(
+    slots: Arc<Vec<WorkerSlot<W>>>,
+    prepare: P,
+) -> impl Fn(usize, u64) -> Result<PoisonLoan<W>> + Send + Sync + use<W, P>
+where
+    W: ChunkWorker,
+    P: Fn(&mut W, u64) + Send + Sync,
+{
+    move |_worker_id: usize, seed: u64| {
+        for slot in slots.iter() {
+            let Ok(mut guard) = slot.lock() else {
+                continue; // отравленный мьютекс — пробуем следующие слоты
+            };
+            if let Some(mut worker) = guard.take() {
+                prepare(&mut worker, seed);
+                return Ok(PoisonLoan {
+                    slot: Arc::clone(slot),
+                    inner: Some(worker),
+                    healthy: true,
+                });
+            }
+        }
+        Err(anyhow::anyhow!(
+            "в постоянном пуле нет свободного воркера (слоты заняты или отравлены)"
+        ))
+    }
+}
+
+/// G6.7: фабрика чанк-пула для `RealWorker` (per-file seed на постоянном
+/// Pocket, отравление слота при сбое движка).
+pub fn pooled_real_worker_factory(
+    slots: Arc<Vec<WorkerSlot<RealWorker>>>,
+) -> impl Fn(usize, u64) -> Result<PoisonLoan<RealWorker>> + Send + Sync + use<> {
+    pooled_worker_factory(slots, |w, seed| w.set_seed(seed))
+}
+
+/// G6.7: число живых (не отравленных) слотов пула — ограничение сверху для
+/// workers файла: run_job не должен стартовать воркеры, которым не хватит
+/// слотов (ошибка старта воркера = ошибка файла).
+pub fn live_slots<W>(slots: &[WorkerSlot<W>]) -> usize {
+    slots
+        .iter()
+        .filter(|s| s.lock().map(|g| g.is_some()).unwrap_or(false))
+        .count()
+}
+
 /// Итог параллельной загрузки пула.
 pub struct SpawnedWorkers<W> {
     pub slots: Vec<WorkerSlot<W>>,
@@ -462,6 +552,138 @@ mod tests {
         let outcome = run_dynamic_queue(slots, 1, &cancel, |pos, _w, _s| pos + 1);
         assert_eq!(outcome.results, vec![Some(1)]);
         assert!(outcome.worker_fatal.is_empty());
+    }
+
+    // ===== G6.7: чанк-пул (PoisonLoan/pooled_factory/live_slots) =====
+
+    /// Воркер, падающий на указанном чанке.
+    struct FailingMock {
+        fail_on: Option<u64>,
+        calls: Arc<Mutex<Vec<u64>>>,
+    }
+    impl ChunkWorker for FailingMock {
+        fn process(&mut self, task: &Task) -> Result<ChunkAudio> {
+            self.calls.lock().unwrap().push(task.index);
+            if self.fail_on == Some(task.index) {
+                anyhow::bail!("сбой движка на чанке {}", task.index);
+            }
+            Ok(ChunkAudio {
+                speech: vec![task.index as f32],
+                pause_s: task.pause_s,
+                denoise: crate::pool::DenoiseChunkStatus::Off,
+            })
+        }
+    }
+
+    /// PoisonLoan: успех возвращает Pocket в слот; ошибка process() —
+    /// отравляет (слот пуст, Pocket не переиспользуется).
+    #[test]
+    fn poison_loan_error_poisons_slot() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let slot: WorkerSlot<FailingMock> = Arc::new(Mutex::new(Some(FailingMock {
+            fail_on: Some(1),
+            calls: Arc::clone(&calls),
+        })));
+        let slots: Arc<Vec<WorkerSlot<FailingMock>>> = Arc::new(vec![Arc::clone(&slot)]);
+        let factory = pooled_worker_factory(Arc::clone(&slots), |_w, _s| {});
+        let cancel = AtomicBool::new(false);
+        let tasks: Vec<Task> = (0..4)
+            .map(|i| Task {
+                index: i,
+                model_text: format!("т{i}"),
+                pause_s: None,
+            })
+            .collect();
+        let err = run_job(
+            &crate::pool::PoolConfig {
+                workers: 1,
+                queue_cap: 2,
+            },
+            tasks,
+            factory,
+            |_, _, _| Ok(()),
+            &cancel,
+            crate::pool::SeedPolicy::Fixed(1),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("сбой движка"), "{err:#}");
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "слот отравлен: Pocket не возвращается в пул"
+        );
+        assert_eq!(live_slots(&slots), 0);
+    }
+
+    /// Успешный прогон двух файлов на pooled-фабрике: Pocket возвращается в
+    /// слот после каждого файла и переиспользуется (один «Pocket» обслуживает
+    /// оба файла); per-file seed ставится перед первым чанком файла.
+    #[test]
+    fn pooled_factory_reuses_pocket_across_files() {
+        #[derive(Clone)]
+        struct CountingMock {
+            id: u32,
+            #[allow(dead_code)]
+            created: Arc<Mutex<Vec<u32>>>,
+            seeds: Arc<Mutex<Vec<u64>>>,
+        }
+        impl ChunkWorker for CountingMock {
+            fn process(&mut self, _t: &Task) -> Result<ChunkAudio> {
+                Ok(ChunkAudio {
+                    speech: vec![self.id as f32],
+                    pause_s: None,
+                    denoise: crate::pool::DenoiseChunkStatus::Off,
+                })
+            }
+        }
+        let created = Arc::new(Mutex::new(Vec::new()));
+        let seeds = Arc::new(Mutex::new(Vec::new()));
+        let slots: Arc<Vec<WorkerSlot<CountingMock>>> =
+            Arc::new(vec![Arc::new(Mutex::new(Some(CountingMock {
+                id: 7,
+                created: Arc::clone(&created),
+                seeds: Arc::clone(&seeds),
+            })))]);
+        let cancel = AtomicBool::new(false);
+        for file_seed in [10u64, 20] {
+            let fac_slots = Arc::clone(&slots);
+            let fac_seeds = Arc::clone(&seeds);
+            let factory = pooled_worker_factory(fac_slots, move |w: &mut CountingMock, seed| {
+                w.seeds.lock().unwrap().push(seed);
+                let _ = &fac_seeds;
+            });
+            let mut out = Vec::new();
+            let summary = run_job(
+                &crate::pool::PoolConfig {
+                    workers: 1,
+                    queue_cap: 2,
+                },
+                tasks(3),
+                factory,
+                |_i, pcm, _p| {
+                    out.push(pcm[0] as u32);
+                    Ok(())
+                },
+                &cancel,
+                crate::pool::SeedPolicy::Fixed(file_seed),
+            )
+            .unwrap();
+            assert_eq!(summary.chunks_done, 3);
+            assert_eq!(out, vec![7, 7, 7], "тот же Pocket обслужил все чанки файла");
+            assert_eq!(live_slots(&slots), 1, "Pocket вернулся в слот");
+        }
+        assert_eq!(*seeds.lock().unwrap(), vec![10, 20], "per-file seed");
+        assert!(created.lock().unwrap().is_empty());
+    }
+
+    /// live_slots: отравленные/занятые слоты не считаются живыми.
+    #[test]
+    fn live_slots_counts_only_loaded_free() {
+        let slots: Vec<WorkerSlot<u8>> = vec![
+            Arc::new(Mutex::new(Some(1))),
+            Arc::new(Mutex::new(None)), // отравлен
+            Arc::new(Mutex::new(Some(3))),
+        ];
+        assert_eq!(live_slots(&slots), 2);
     }
 
     /// Сквозной прогон: постоянный слот + run_job(workers=1) на каждый файл —

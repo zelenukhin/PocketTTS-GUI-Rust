@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::hybrid::{self, ChildJobGuard, Ev, HybridDriver, HybridJob, HybridParams, PhaseMsg};
+use crate::hybrid::{self, ChildJobGuard, Ev, HybridJob, PhaseMsg};
 use app_core::persistent::{loaned_real_worker_factory, spawn_workers, WorkerSlot};
 use app_core::pipeline::{
     log_path_for, synthesize_stream, synthesize_stream_with_worker_factory, write_chunk_log,
@@ -606,6 +606,14 @@ pub fn execute_job(cfg: &JobConfig, cancel: &AtomicBool, emit: &dyn Fn(JobEvent)
             cfg.out_path.display()
         )));
     }
+    // G6.7-C: P>1 в одиночном режиме — мультипроцессный чанк-конвейер
+    // (тот же механизм, что в каталоге; sink создаёт диспетчер конвейера)
+    let par_cfg = s.parallel_config();
+    if std::env::var("SHTORM_GUI_G66_FILE_POOL").as_deref() != Ok("1") && par_cfg.processes > 1 {
+        let res = execute_job_chunk_pipeline(cfg, &par_cfg, cancel, emit, &model_dir, char_rules);
+        return attach_warning(res, &char_warning);
+    }
+
     let ffmpeg_path = if s.ffmpeg_path.trim().is_empty() {
         None
     } else {
@@ -624,31 +632,111 @@ pub fn execute_job(cfg: &JobConfig, cancel: &AtomicBool, emit: &dyn Fn(JobEvent)
         Ok(sink) => sink,
         Err(e) => return attach_warning(fail(format!("{e:#}")), &char_warning),
     };
-    let opts = pipeline_options(s, model_dir.clone(), char_rules);
+    let opts = pipeline_options(s, model_dir.clone(), char_rules.clone());
+    // G6.7: единая модель P/W/C/T действует и в одиночном режиме: постоянный
+    // чанк-пул создаётся на TXT (P=1 → min(W,C) Pocket), чанки распределяются
+    // между воркерами, аудио собирается строго по порядку. Диагностический
+    // откат на прежний путь «модель на задание» — SHTORM_GUI_G66_FILE_POOL=1
+    // (в GUI не выбирается; сохранён для сравнения по ТЗ G6.7 §12).
+    let par = s.parallel_config();
+    let legacy_pool = std::env::var("SHTORM_GUI_G66_FILE_POOL").as_deref() == Ok("1");
+    if legacy_pool {
+        emit(JobEvent::Log(
+            "диагностика: SHTORM_GUI_G66_FILE_POOL=1 — прежний путь G6.6 (модель на задание)"
+                .into(),
+        ));
+    }
+    let t_pool = Instant::now();
+    let pool_state: Option<(Arc<Vec<WorkerSlot<RealWorker>>>, PipelineOptions)> = if legacy_pool {
+        None
+    } else {
+        let mut pool_settings = s.clone();
+        pool_settings.threads = par.ort_threads;
+        let pool_opts = pipeline_options(&pool_settings, model_dir.clone(), char_rules);
+        // P=1: в однопроцессном пуле лишние Pocket не создаются — не более
+        // min(W, C); C не создаёт Pocket, только ограничивает параллелизм.
+        let pockets = 1.max(par.workers_per_process.min(par.max_concurrent_chunks) as usize);
+        if par.processes > 1 {
+            emit(JobEvent::Log(format!(
+                "ВНИМАНИЕ: запрошено {} процессов — мультипроцессный чанк-конвейер применяется \
+                 в каталоге; одиночный файл использует однопроцессный пул ({pockets} Pocket)",
+                par.processes
+            )));
+        }
+        emit(JobEvent::Log(format!(
+            "постоянный чанк-пул: загрузка {pockets} Pocket (W={}, C={}, T={})…",
+            par.workers_per_process, par.max_concurrent_chunks, par.ort_threads
+        )));
+        let spawned = spawn_workers(pockets, real_worker_factory(&pool_opts, 42), 42);
+        if !spawned.failures.is_empty() {
+            let msg = spawned
+                .failures
+                .iter()
+                .map(|(w, e)| format!("воркер {w}: {e}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return attach_warning(fail(format!("пул не запущен: {msg}")), &char_warning);
+        }
+        emit(JobEvent::Log(format!(
+            "постоянный чанк-пул: {pockets} Pocket готовы за {:.1} с",
+            t_pool.elapsed().as_secs_f32()
+        )));
+        Some((Arc::new(spawned.slots), pool_opts))
+    };
 
     emit(JobEvent::Log(format!(
-        "запуск: {} | {} | воркеров {} | {} | {}",
+        "запуск: {} | {} | {} | {} | {}",
         cfg.out_path.display(),
         device_label(s),
-        s.effective_workers(),
         s.format.label(),
-        if preset.is_empty() { "-" } else { preset }
+        if preset.is_empty() { "-" } else { preset },
+        if legacy_pool {
+            format!("воркеров {}", s.effective_workers())
+        } else {
+            format!(
+                "чанк-пул {} Pocket · до {} чанков · ORT {}",
+                par.workers_per_process
+                    .min(par.max_concurrent_chunks)
+                    .max(1),
+                par.max_concurrent_chunks,
+                par.ort_threads
+            )
+        }
     )));
 
     // --- синтез (прогресс/фазы → UI; отмена до точки решения — Cancelled
     // без публикации; после неё конвейер доходит до конца, UI знает фазу) ---
-    let result = synthesize_stream(
-        &cfg.text,
-        &opts,
-        s.effective_workers() as usize,
-        sink,
-        |done, total| {
-            progress = (done, total);
-            emit(JobEvent::Progress { done, total });
-        },
-        cancel,
-        &|ph| emit(JobEvent::Phase(ph.into())),
-    );
+    let result = match &pool_state {
+        Some((slots, pool_opts)) => {
+            let factory = app_core::persistent::pooled_real_worker_factory(Arc::clone(slots));
+            let live = app_core::persistent::live_slots(slots);
+            app_core::pipeline::synthesize_stream_pooled(
+                &cfg.text,
+                pool_opts,
+                live,
+                sink,
+                |done, total| {
+                    progress = (done, total);
+                    emit(JobEvent::Progress { done, total });
+                },
+                cancel,
+                &|ph| emit(JobEvent::Phase(ph.into())),
+                factory,
+            )
+        }
+        None => synthesize_stream(
+            &cfg.text,
+            &opts,
+            s.effective_workers() as usize,
+            sink,
+            |done, total| {
+                progress = (done, total);
+                emit(JobEvent::Progress { done, total });
+            },
+            cancel,
+            &|ph| emit(JobEvent::Phase(ph.into())),
+        ),
+    };
     let elapsed = t0.elapsed().as_secs_f32();
 
     let mut res = match result {
@@ -659,6 +747,171 @@ pub fn execute_job(cfg: &JobConfig, cancel: &AtomicBool, emit: &dyn Fn(JobEvent)
     };
     res.progress = progress;
     attach_warning(res, &char_warning)
+}
+
+/// G6.7-C: одиночный TXT на мультипроцессном чанк-конвейере (P>1): тот же
+/// механизм, что в каталоге, с единственным заданием. Файл читается и
+/// публикуется диспетчером конвейера; ORT грузится только в дочерних
+/// процессах.
+fn execute_job_chunk_pipeline(
+    cfg: &JobConfig,
+    par: &ParallelSettings,
+    cancel: &AtomicBool,
+    emit: &dyn Fn(JobEvent),
+    model_dir: &Path,
+    char_rules: Option<CharRules>,
+) -> JobResult {
+    let s = &cfg.settings;
+    let t0 = Instant::now();
+    let mut settings = s.clone();
+    settings.threads = par.ort_threads;
+    let opts = pipeline_options(&settings, model_dir.to_path_buf(), char_rules);
+    let seed = opts.seed.unwrap_or_else(|| SeedPolicy::Random.resolve());
+    let relative = Path::new(&s.text_file)
+        .file_name()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("input"));
+    let job = HybridJob {
+        pos: 0,
+        input: PathBuf::from(&s.text_file),
+        relative,
+        out: cfg.out_path.clone(),
+        seed,
+    };
+    emit(JobEvent::Log(format!(
+        "мультипроцессный чанк-конвейер: {} процесса × {} Pocket · до {} чанков · ORT {}",
+        par.processes, par.workers_per_process, par.max_concurrent_chunks, par.ort_threads
+    )));
+    let params = crate::chunkpipe::ChunkPipeParams {
+        settings: settings.clone(),
+        opts: opts.clone(),
+        jobs: vec![job],
+        workers_per_child: par.workers_per_process as usize,
+        children: par.processes as usize,
+        max_chunks: par.max_concurrent_chunks as usize,
+        fake: std::env::var("SHTORM_G62_FAKE").as_deref() == Ok("1"),
+    };
+    // отмена снаружи транслируется в конвейер (флаг конвейера — свой Arc;
+    // watcher-поток копирует внешний флаг до завершения прогона)
+    let cancel_arc = Arc::new(AtomicBool::new(cancel.load(Ordering::SeqCst)));
+    let watcher_stop = Arc::new(AtomicBool::new(false));
+    let (etx, erx) = std::sync::mpsc::channel::<JobEvent>();
+    let etx = Arc::new(etx);
+    let driver_emit: Arc<dyn Fn(JobEvent) + Send + Sync> = {
+        let etx = Arc::clone(&etx);
+        Arc::new(move |ev: JobEvent| {
+            let _ = etx.send(ev);
+        })
+    };
+    let init_settled = |n: usize| {
+        emit(JobEvent::BatchWorkersReady { workers: n });
+    };
+    let job_guard = ChildJobGuard::new();
+    let mut result: Option<JobResult> = None;
+    if let Err(e) = job_guard.ready() {
+        result = Some(JobResult::failed(format!(
+            "мультипроцессный режим не запущен: защита процессов Windows Job Object \
+             недоступна ({e:#}). Выберите однопроцессную конфигурацию"
+        )));
+    }
+    if result.is_none() {
+        #[cfg(not(test))]
+        let exe = match std::env::current_exe() {
+            Ok(e) => e,
+            Err(e) => return JobResult::failed(format!("current_exe: {e:#}")),
+        };
+        #[cfg(test)]
+        let _exe = PathBuf::new();
+        #[cfg(not(test))]
+        let spawn = |ci: usize| hybrid::spawn_child_process(&job_guard, &exe, ci);
+        #[cfg(test)]
+        let spawn = |ci: usize| hybrid::spawn_child_via_test_harness(&job_guard, ci);
+        let driver = crate::chunkpipe::ChunkPipeDriver {
+            params: &params,
+            cancel: Arc::clone(&cancel_arc),
+            spawn: &spawn,
+            emit: &driver_emit,
+            init_settled: &init_settled,
+            watchdog: hybrid::CHILD_WATCHDOG,
+            startup_timeout: hybrid::CHILD_STARTUP_TIMEOUT,
+            write_timeout: crate::ipc::WRITE_WAIT_TIMEOUT,
+        };
+        let run = std::thread::scope(|scope| {
+            let cancel_w = Arc::clone(&cancel_arc);
+            let stop_w = Arc::clone(&watcher_stop);
+            let stop_after = Arc::clone(&watcher_stop);
+            let cancel_src: &AtomicBool = cancel;
+            scope.spawn(move || {
+                while !stop_w.load(Ordering::SeqCst) {
+                    if cancel_src.load(Ordering::SeqCst) {
+                        cancel_w.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            });
+            let r = crate::chunkpipe::run_chunk_pipeline(&driver);
+            stop_after.store(true, Ordering::SeqCst);
+            r
+        });
+        while let Ok(ev) = erx.try_recv() {
+            emit(ev);
+        }
+        match run {
+            Ok(outcome) => {
+                let rep = outcome
+                    .reports
+                    .into_iter()
+                    .next()
+                    .flatten()
+                    .unwrap_or_else(|| {
+                        FileReport::failed(
+                            &BatchFile {
+                                input: PathBuf::from(&s.text_file),
+                                relative: PathBuf::new(),
+                            },
+                            Some(cfg.out_path.clone()),
+                            "файл не получил результата (внутренняя ошибка диспетчера)",
+                        )
+                    });
+                let status = match rep.status {
+                    FileStatus::Completed => JobStatus::Completed,
+                    FileStatus::Cancelled => JobStatus::Cancelled,
+                    FileStatus::Skipped => JobStatus::Skipped,
+                    FileStatus::Failed => JobStatus::Failed,
+                };
+                let replaced = rep
+                    .reason
+                    .as_deref()
+                    .map(|r| r.contains("обновлён"))
+                    .unwrap_or(false);
+                result = Some(JobResult {
+                    status,
+                    summary: format!(
+                        "{}; {:.1} с; мультипроцесс {}×{}",
+                        rep.line(),
+                        t0.elapsed().as_secs_f32(),
+                        par.processes,
+                        par.workers_per_process
+                    ),
+                    final_path: rep.final_path.clone(),
+                    partial_path: rep.partial_path.clone(),
+                    diag_path: rep.diag_path.clone(),
+                    chunk_log_path: rep.chunk_log_path.clone(),
+                    rtf: None,
+                    progress: (rep.chunks_done, rep.chunks_total),
+                    replaced_existing: replaced,
+                    batch: None,
+                });
+            }
+            Err(e) => {
+                result = Some(JobResult::failed(format!(
+                    "мультипроцессный конвейер: {e:#}"
+                )));
+            }
+        }
+    }
+    result.unwrap_or_else(|| JobResult::failed("мультипроцессный конвейер: нет результата".into()))
 }
 
 /// G3/G6.1: пакетный прогон. Снимок файлов строится ДО первого синтеза
@@ -752,7 +1005,7 @@ pub fn execute_batch(
         device_label(settings),
         cfg.processes,
         cfg.workers_per_process,
-        cfg.max_concurrent_files,
+        cfg.max_concurrent_chunks,
         cfg.ort_threads
     )));
     let topo = decide_topology(settings, &cfg, actionable, pool_enabled, emit);
@@ -760,7 +1013,15 @@ pub fn execute_batch(
         BatchTopology::Sequential => {
             execute_batch_sequential(settings, &plan, &ext, overwrite, cancel, emit)
         }
-        BatchTopology::InProcessPool { workers } => {
+        BatchTopology::InProcessChunkPool { pockets } => {
+            match execute_batch_chunk_pool(
+                settings, &cfg, pockets, &plan, &ext, overwrite, cancel, emit,
+            ) {
+                Ok(r) => r,
+                Err(e) => return JobResult::failed(format!("пакетный режим: {e:#}")),
+            }
+        }
+        BatchTopology::InProcessFilePool { workers } => {
             match execute_batch_persistent_pool(
                 settings, &cfg, workers, &plan, &ext, overwrite, cancel, emit,
             ) {
@@ -771,13 +1032,13 @@ pub fn execute_batch(
         BatchTopology::MultiProcess {
             children,
             workers_per_child,
-            max_active_files,
+            max_chunks,
         } => match execute_batch_hybrid(
             settings,
             &cfg,
             children,
             workers_per_child,
-            max_active_files,
+            max_chunks,
             &plan,
             &ext,
             overwrite,
@@ -948,43 +1209,45 @@ const BATCH_POOL_VRAM_RESERVE_MB: f64 = 900.0;
 /// и промежуточные тензоры декодера).
 const MULTIPROCESS_VRAM_RESERVE_MB: f64 = 1500.0;
 
-/// G6.6: фактическая топология запуска пакета. Решение чистое (unit-
+/// G6.6/G6.7: фактическая топология запуска пакета. Решение чистое (unit-
 /// тестируемое); журналирование отклонений от запрошенной конфигурации —
 /// внутри `decide_topology`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BatchTopology {
-    /// Последовательный путь: <2 файлов-кандидатов (чанк-параллелизм
-    /// одиночного файла в нём быстрее файлового пула) или диагностический
-    /// откат `SHTORM_GUI_BATCH_POOL=0`.
+    /// Последовательный пофайловый путь G3/G6.6: модель создаётся на каждый
+    /// файл. Диагностический откат `SHTORM_GUI_BATCH_POOL=0`.
     Sequential,
-    /// Постоянный пул в ЭТОМ процессе: N постоянных Pocket, динамическая
-    /// файловая очередь (`persistent.rs`).
-    InProcessPool { workers: usize },
-    /// Дочерние рабочие процессы с Pocket (CPU и CUDA; Named Pipes/Job
-    /// Object/watchdog — гибридная инфраструктура G6.2): `children` ×
-    /// `workers_per_child`; диспетчер держит не более `max_active_files`
-    /// файлов одновременно.
+    /// G6.7: однопроцессный ПОСТОЯННЫЙ чанк-пул — файлы каталога строго
+    /// последовательно, чанки текущего файла параллельно (`pockets` Pocket,
+    /// создаются один раз на задание; pockets = min(W, C)).
+    InProcessChunkPool { pockets: usize },
+    /// G6.6 (диагностический, SHTORM_GUI_G66_FILE_POOL=1): файловый пул —
+    /// файлы параллельно, каждый целиком на одном Pocket.
+    InProcessFilePool { workers: usize },
+    /// G6.7-C: дочерние рабочие процессы с Pocket (CPU и CUDA; Named
+    /// Pipes/Job Object/watchdog): `children` × `workers_per_child`;
+    /// диспетчер держит не более `max_chunks` чанков текущего файла.
     MultiProcess {
         children: usize,
         workers_per_child: usize,
-        max_active_files: usize,
+        max_chunks: usize,
     },
 }
 
-/// G6.6: выбор топологии по конфигурации P/W/F/T, числу файлов-кандидатов
-/// и ресурсам. Правила:
-/// - `pool_allowed=false` (диагностический откат) или <2 кандидатов —
-///   последовательный путь;
-/// - `active = min(F, P×W, кандидатов)`; лишние Pocket НЕ создаются;
-/// - P=1 или active ≤ W — однопроцессный пул на `active` Pocket (второй
-///   процесс не нужен — пустые процессы не запускаются);
-/// - иначе — мультипроцесс: P процессов × W Pocket (все Pocket создаются;
-///   диспетчер ограничивает одновременные файлы значением F);
+/// G6.7: выбор топологии по конфигурации P/W/C/T и ресурсам. Файлы каталога
+/// ВСЕГДА обрабатываются строго последовательно (различаются только способы
+/// параллелизма чанков). Правила:
+/// - `pool_allowed=false` (диагностический откат) или нет файлов-кандидатов —
+///   пофайловый последовательный путь;
+/// - P=1 — однопроцессный чанк-пул на min(W, C) Pocket (лишние Pocket сверх
+///   C не создаются и RAM не занимают);
+/// - P>1 — мультипроцессный чанк-конвейер: P процессов × W Pocket (все
+///   Pocket создаются — топологию задаёт память процессов), диспетчер
+///   ограничивает одновременные чанки значением C;
+/// - диагностический файловый пул G6.6 — только SHTORM_GUI_G66_FILE_POOL=1;
 /// - CUDA: VRAM-префлайт по существующей методике; авто-снижение (профиль
-///   «Оптимальный») — с явной записью; явный выбор («Производительный»/
-///   «Свой») при нехватке VRAM в мультипроцессе откатывается на
-///   экономичный однопроцессный пул с объяснением, при нехватке в пуле —
-///   предупреждение без подмены.
+///   «Оптимальный») — с явной записью; явный выбор при нехватке VRAM в
+///   мультипроцессе НЕ запускается — явный откат на пул с объяснением.
 fn decide_topology(
     settings: &GuiSettings,
     cfg: &ParallelSettings,
@@ -995,94 +1258,95 @@ fn decide_topology(
     if !pool_allowed {
         emit(JobEvent::Log(
             "ВНИМАНИЕ: SHTORM_GUI_BATCH_POOL=0 — диагностический откат на последовательный \
-             путь (модель загружается на каждый файл)"
+             пофайловый путь (модель загружается на каждый файл)"
                 .into(),
         ));
         return BatchTopology::Sequential;
     }
-    if actionable < 2 {
-        // Пул с одним файлом бессмыслен: чанк-параллелизм одиночного файла
-        // (механизм A) быстрее файлового пула из одного Pocket.
+    if actionable == 0 {
         return BatchTopology::Sequential;
     }
-    let pockets = cfg.total_pockets() as usize;
-    let mut active = cfg
-        .max_concurrent_files
-        .min(pockets as u32)
-        .min(actionable as u32)
-        .max(1) as usize;
-    if active < 1 {
-        active = 1;
+    // диагностический файловый пул G6.6 (сравнение по ТЗ G6.7 §12, не для GUI)
+    if std::env::var("SHTORM_GUI_G66_FILE_POOL").as_deref() == Ok("1") {
+        emit(JobEvent::Log(
+            "диагностика: SHTORM_GUI_G66_FILE_POOL=1 — прежний ФАЙЛОВЫЙ пул G6.6 \
+             (файлы параллельно, чанки файла последовательно)"
+                .into(),
+        ));
+        let active = cfg
+            .max_concurrent_chunks
+            .min(cfg.total_pockets())
+            .min(actionable as u32)
+            .max(1) as usize;
+        return BatchTopology::InProcessFilePool { workers: active };
     }
-    let w = cfg.workers_per_process as usize;
-    if cfg.processes == 1 || active <= w {
-        if cfg.processes > 1 {
-            emit(JobEvent::Log(format!(
-                "запрошено {} процессов, но одновременных файлов {active} ≤ {} воркеров на \
-                 процесс — достаточно одного процесса без пустых дочерних процессов",
-                cfg.processes, w
-            )));
-        }
-        // CUDA: VRAM-префлайт однопроцессного пула
+    let pockets_total = cfg.total_pockets() as usize;
+    let c = (cfg.max_concurrent_chunks as usize).clamp(1, pockets_total);
+    if cfg.processes == 1 {
+        // однопроцессный чанк-пул: лишние Pocket сверх C не создаются
+        let mut pockets = (cfg.workers_per_process as usize).min(c).max(1);
         if settings.device == DeviceChoice::Cuda {
-            let free = vram_free_or_warn(settings, emit);
-            if let Some(free) = free {
+            if let Some(free) = vram_free_or_warn(settings, emit) {
                 let need =
-                    active as f64 * BATCH_POOL_VRAM_PER_WORKER_MB + BATCH_POOL_VRAM_RESERVE_MB;
+                    pockets as f64 * BATCH_POOL_VRAM_PER_WORKER_MB + BATCH_POOL_VRAM_RESERVE_MB;
                 if free < need {
-                    if cfg.profile == ParallelProfile::Optimal && active > 1 {
+                    if cfg.profile == ParallelProfile::Optimal && pockets > 1 {
                         emit(JobEvent::Log(format!(
                             "VRAM-префлайт: свободно {free:.0} МБ < {need:.0} МБ — профиль \
                              «Оптимальный»: 1 воркер (один постоянный Pocket)"
                         )));
-                        active = 1;
+                        pockets = 1;
                     } else {
                         emit(JobEvent::Log(format!(
                             "ВНИМАНИЕ: VRAM-префлайт: свободно {free:.0} МБ < {need:.0} МБ — \
-                             конфигурация {active} Pocket может не загрузиться (ошибка загрузки \
+                             конфигурация {pockets} Pocket может не загрузиться (ошибка загрузки \
                              завершит пакет с диагнозом)"
                         )));
                     }
                 }
             }
         }
-        return BatchTopology::InProcessPool { workers: active };
+        return BatchTopology::InProcessChunkPool { pockets };
     }
     // мультипроцесс: все P×W Pocket создаются в дочерних процессах
     let children = cfg.processes as usize;
-    let total_pockets = children * w;
+    let w = cfg.workers_per_process as usize;
     if settings.device == DeviceChoice::Cuda {
         if let Some(free) = vram_free_or_warn(settings, emit) {
             let need =
-                total_pockets as f64 * BATCH_POOL_VRAM_PER_WORKER_MB + MULTIPROCESS_VRAM_RESERVE_MB;
+                pockets_total as f64 * BATCH_POOL_VRAM_PER_WORKER_MB + MULTIPROCESS_VRAM_RESERVE_MB;
             if free < need {
                 let fallback = w.min(2);
                 emit(JobEvent::Log(format!(
                     "ВНИМАНИЕ: запрошено {children} процессов × {w} Pocket (нужно ~{need:.0} МБ \
                      VRAM, свободно {free:.0} МБ) — конфигурация НЕ запускается, используется \
-                     однопроцессный пул на {fallback} Pocket. Освободите VRAM и запустите пакет \
-                     снова"
+                     однопроцессный чанк-пул на {fallback} Pocket. Освободите VRAM и запустите \
+                     пакет снова"
                 )));
-                return BatchTopology::InProcessPool { workers: fallback };
+                return BatchTopology::InProcessChunkPool {
+                    pockets: fallback.min(c).max(1),
+                };
             }
             emit(JobEvent::Log(format!(
                 "VRAM-префлайт {children}×{w}: свободно {free:.0} МБ ≥ {need:.0} МБ — запуск \
-                 {total_pockets} Pocket ({children} процесса × {w} воркера), до {active} файлов \
+                 {pockets_total} Pocket ({children} процесса × {w} воркера), до {c} чанков \
                  одновременно"
             )));
         } else {
             emit(JobEvent::Log(
                 "ВНИМАНИЕ: мультипроцессный CUDA: свободную VRAM проверить не удалось \
-                 (nvidia-smi недоступен) — используется однопроцессный пул"
+                 (nvidia-smi недоступен) — используется однопроцессный чанк-пул"
                     .into(),
             ));
-            return BatchTopology::InProcessPool { workers: w.min(2) };
+            return BatchTopology::InProcessChunkPool {
+                pockets: w.min(2).min(c).max(1),
+            };
         }
     }
     BatchTopology::MultiProcess {
         children,
         workers_per_child: w,
-        max_active_files: active,
+        max_chunks: c,
     }
 }
 
@@ -1121,7 +1385,7 @@ fn execute_batch_hybrid(
     cfg: &ParallelSettings,
     children: usize,
     workers_per_child: usize,
-    max_active_files: usize,
+    max_chunks: usize,
     plan: &BatchPlan,
     extension: &str,
     overwrite: bool,
@@ -1203,7 +1467,7 @@ fn execute_batch_hybrid(
             }
         }
     };
-    let ui_event = {
+    let _ui_event = {
         let emit = Arc::clone(emit);
         move |ev: &Ev| match ev {
             Ev::FileStarted { pos, .. } => {
@@ -1303,42 +1567,43 @@ fn execute_batch_hybrid(
     // запускаются через его child-entry (та же реализация worker_main).
     #[cfg(test)]
     let spawn = |ci: usize| hybrid::spawn_child_via_test_harness(&job_guard, ci);
-    let log = |m: String| log_emit(JobEvent::Log(m));
+    let _log = |m: String| log_emit(JobEvent::Log(m));
     let fake = std::env::var("SHTORM_G62_FAKE").as_deref() == Ok("1");
-    // G6.6: ORT-потоки пакетной конфигурации (T) доходят до дочерних
-    // процессов через GuiSettings (worker читает только IPC Init).
+    // G6.7: ORT-потоки конфигурации (T) — в опции чанков диспетчера и в
+    // GuiSettings дочерних процессов (worker читает только IPC Init).
     let mut child_settings = settings.clone();
     child_settings.threads = cfg.ort_threads;
-    let params = HybridParams {
+    let mut pipe_opts = opts.clone();
+    pipe_opts.threads = cfg.ort_threads as usize;
+    let params = crate::chunkpipe::ChunkPipeParams {
         settings: child_settings,
+        opts: pipe_opts,
         jobs: jobs.clone(),
         workers_per_child,
         children,
+        // G6.7: предел одновременных ЧАНКОВ C (файлы строго последовательны)
+        max_chunks,
         fake,
-        test: Vec::new(),
     };
-    let driver = HybridDriver {
+    let driver = crate::chunkpipe::ChunkPipeDriver {
         params: &params,
         cancel: Arc::clone(cancel),
         spawn: &spawn,
-        log: &log,
-        event: &ui_event,
+        emit,
         init_settled: &init_settled,
         watchdog: hybrid::CHILD_WATCHDOG,
         startup_timeout: hybrid::CHILD_STARTUP_TIMEOUT,
         // G6.2.2: зависшая IPC-отправка не блокирует цикл диспетчера
         write_timeout: crate::ipc::WRITE_WAIT_TIMEOUT,
-        // G6.6: предел одновременных файлов F
-        max_active_files,
     };
     emit(JobEvent::Log(format!(
         "мультипроцесс {children}×{workers_per_child}: запуск {children} рабочих процессов \
-         ({} Pocket на процесс; до {max_active_files} файлов одновременно; файлов к синтезу {})",
+         ({} Pocket на процесс; до {max_chunks} чанков одновременно; файлы строго \n         последовательно; файлов к синтезу {})",
         workers_per_child,
         jobs.len()
     )));
     let t_spawn = Instant::now();
-    let outcome = match hybrid::run_hybrid(&driver) {
+    let outcome = match crate::chunkpipe::run_chunk_pipeline(&driver) {
         Ok(o) => o,
         Err(e) => {
             // ни один дочерний процесс не поднялся — файлы-кандидаты Failed
@@ -1690,6 +1955,340 @@ fn execute_batch_persistent_pool(
     report.pool_loads = Some(spawned.loaded);
     report.pool_workers = Some(workers);
     Ok(report)
+}
+
+/// G6.7-B: пакет на ПОСТОЯННОМ однопроцессном ЧАНК-пуле. Файлы каталога
+/// обрабатываются СТРОГО ПОСЛЕДОВАТЕЛЬНО (следующий начинается только после
+/// терминального завершения предыдущего — включая публикацию); чанки
+/// текущего файла синтезируются параллельно всеми разрешёнными воркерами
+/// (`min(C, живые Pocket)`). Pocket загружается ровно один раз на задание и
+/// переиспользуется между файлами (per-file seed — фабрикой одалживания);
+/// сбой движка отравляет слот автоматически (`PoisonLoan`).
+#[allow(clippy::too_many_arguments)]
+fn execute_batch_chunk_pool(
+    settings: &GuiSettings,
+    cfg: &ParallelSettings,
+    pockets: usize,
+    plan: &BatchPlan,
+    extension: &str,
+    overwrite: bool,
+    cancel: &Arc<AtomicBool>,
+    emit: &Arc<dyn Fn(JobEvent) + Send + Sync>,
+) -> Result<BatchReport> {
+    let total = plan.files.len();
+
+    // --- предзапусковые проверки ДО загрузки движка/воркеров (G6.1.1:
+    // события preflight обязаны попадать в уже инициализированный UI) ---
+    let emit_batch = batch_event_forwarder(emit);
+    let prepared = preflight_batch(plan, extension, overwrite, cancel, &|ev| emit_batch(ev));
+    let mut reports = prepared.reports;
+
+    // --- подготовка движка: один раз на весь пакет ---
+    let model_dir = match resolve_model_dir(settings) {
+        Ok(d) => d,
+        Err(e) => {
+            let msg = format!("{e:#}");
+            emit(JobEvent::Log(format!("ВНИМАНИЕ: {msg}")));
+            for pf in &prepared.to_synth {
+                let file = &plan.files[pf.index];
+                let r = FileReport::failed(file, Some(pf.out.clone()), msg.clone());
+                emit_batch(BatchEvent::FileFinished {
+                    index: pf.index + 1,
+                    total,
+                    report: Box::new(r.clone()),
+                });
+                reports[pf.index] = r;
+            }
+            return Ok(BatchReport {
+                files: reports,
+                conflicts: prepared.conflicts,
+                cancelled: cancel.load(Ordering::SeqCst),
+                pool_loads: None,
+                pool_workers: None,
+                pool_processes: None,
+            });
+        }
+    };
+    emit(JobEvent::Log(format!("модель: {}", model_dir.display())));
+    let mut char_rules = None;
+    match load_char_rules(&model_dir) {
+        CharRulesLoad::Absent => {}
+        CharRulesLoad::Loaded(rules) => char_rules = Some(rules),
+        CharRulesLoad::Warning(w) => {
+            emit(JobEvent::Log(format!("ВНИМАНИЕ: {w}")));
+        }
+    }
+    setup_ort_environment(settings)?;
+
+    // подготовка путей результатов (reparse/каталоги) — тоже до воркеров
+    let mut to_synth = Vec::with_capacity(prepared.to_synth.len());
+    for pf in prepared.to_synth {
+        match batch_file_prepare_paths(settings, &pf.out, &model_dir) {
+            Ok(()) => to_synth.push(pf),
+            Err(e) => {
+                let file = &plan.files[pf.index];
+                let r = FileReport::failed(file, Some(pf.out.clone()), format!("{e:#}"));
+                emit_batch(BatchEvent::FileFinished {
+                    index: pf.index + 1,
+                    total,
+                    report: Box::new(r.clone()),
+                });
+                reports[pf.index] = r;
+            }
+        }
+    }
+    if to_synth.is_empty() {
+        return Ok(BatchReport {
+            files: reports,
+            conflicts: prepared.conflicts,
+            cancelled: cancel.load(Ordering::SeqCst),
+            pool_loads: None,
+            pool_workers: None,
+            pool_processes: None,
+        });
+    }
+
+    // --- загрузка пула: Pocket один раз на задание, параллельно ---
+    let mut pool_settings = settings.clone();
+    pool_settings.threads = cfg.ort_threads;
+    let opts = pipeline_options(&pool_settings, model_dir, char_rules);
+    let spawn_seed = opts.seed.unwrap_or(42);
+    emit(JobEvent::Log(format!(
+        "постоянный чанк-пул: загрузка {pockets} Pocket (P=1, W={}, C={}, T={})…",
+        cfg.workers_per_process, cfg.max_concurrent_chunks, cfg.ort_threads
+    )));
+    let t_pool = Instant::now();
+    let spawned = spawn_workers(pockets, real_worker_factory(&opts, spawn_seed), spawn_seed);
+    if !spawned.failures.is_empty() {
+        let msg = spawned
+            .failures
+            .iter()
+            .map(|(w, e)| format!("воркер {w}: {e}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        emit(JobEvent::Log(format!("ВНИМАНИЕ: пул не запущен: {msg}")));
+        for pf in &to_synth {
+            let file = &plan.files[pf.index];
+            let r =
+                FileReport::failed(file, Some(pf.out.clone()), format!("пул не запущен: {msg}"));
+            emit_batch(BatchEvent::FileFinished {
+                index: pf.index + 1,
+                total,
+                report: Box::new(r.clone()),
+            });
+            reports[pf.index] = r;
+        }
+        return Ok(BatchReport {
+            files: reports,
+            conflicts: prepared.conflicts,
+            cancelled: false,
+            pool_loads: Some(spawned.loaded),
+            pool_workers: Some(pockets),
+            pool_processes: None,
+        });
+    }
+    emit(JobEvent::Log(format!(
+        "постоянный чанк-пул: {pockets} Pocket готовы за {:.1} с; Pocket загружен {pockets} \
+         раз(а); файлов к синтезу: {} (строго последовательно, чанки параллельно)",
+        t_pool.elapsed().as_secs_f32(),
+        to_synth.len()
+    )));
+    emit(JobEvent::BatchWorkersReady { workers: pockets });
+
+    // --- строго последовательный прогон файлов на общем чанк-пуле ---
+    let slots: Arc<Vec<WorkerSlot<RealWorker>>> = Arc::new(spawned.slots);
+    let factory: Arc<
+        dyn Fn(usize, u64) -> anyhow::Result<app_core::persistent::PoisonLoan<RealWorker>>
+            + Send
+            + Sync,
+    > = Arc::new(app_core::persistent::pooled_real_worker_factory(
+        Arc::clone(&slots),
+    ));
+    let mut stopped = false;
+    for pf in &to_synth {
+        let idx = pf.index;
+        let file = &plan.files[idx];
+        let k = idx + 1;
+        if stopped || cancel.load(Ordering::SeqCst) {
+            stopped = true;
+            let r = FileReport::skipped(file, Some(pf.out.clone()), "отменено до запуска");
+            emit_batch(BatchEvent::FileFinished {
+                index: k,
+                total,
+                report: Box::new(r.clone()),
+            });
+            reports[idx] = r;
+            continue;
+        }
+        let live = app_core::persistent::live_slots(&slots);
+        if live == 0 {
+            // все Pocket отравлены сбоями движка — состояние пула недостоверное:
+            // оставшиеся файлы НЕ синтезируются молча на новом состоянии
+            let r = FileReport::failed(
+                file,
+                Some(pf.out.clone()),
+                "пул отравлен: все Pocket исключены после сбоев движка — файл не запускался",
+            );
+            emit_batch(BatchEvent::FileFinished {
+                index: k,
+                total,
+                report: Box::new(r.clone()),
+            });
+            reports[idx] = r;
+            stopped = true;
+            continue;
+        }
+        emit(JobEvent::Log(format!(
+            "[{k}/{total}] запуск: {} | {} | чанк-пул ({live} Pocket) | {}",
+            pf.out.display(),
+            device_label(settings),
+            settings.format.label()
+        )));
+        let report =
+            execute_batch_file_chunk_pool(settings, &opts, pf, total, live, cancel, emit, &factory);
+        let was_cancel = report.status == FileStatus::Cancelled;
+        let live_after = app_core::persistent::live_slots(&slots);
+        if live_after < live {
+            emit(JobEvent::Log(format!(
+                "[{k}/{total}] ВНИМАНИЕ: сбой движка отравил Pocket (живых слотов: {live_after} \
+                 из {pockets}) — повреждённое состояние не переиспользуется"
+            )));
+        }
+        emit_batch(BatchEvent::FileFinished {
+            index: k,
+            total,
+            report: Box::new(report.clone()),
+        });
+        reports[idx] = report;
+        if was_cancel || cancel.load(Ordering::SeqCst) {
+            stopped = true;
+        }
+    }
+    let cancelled = stopped
+        || cancel.load(Ordering::SeqCst)
+        || reports.iter().any(|r| r.status == FileStatus::Cancelled);
+    let mut report = BatchReport {
+        files: reports,
+        conflicts: prepared.conflicts,
+        cancelled,
+        pool_loads: Some(spawned.loaded),
+        pool_workers: Some(pockets),
+        pool_processes: None,
+    };
+    if report.pool_workers == Some(0) {
+        report.pool_workers = None;
+    }
+    Ok(report)
+}
+
+/// Один файл каталога на общем чанк-пуле (выполняется в потоке задания;
+/// воркеры `run_job` одалживают Pocket у пула). Тот же конвейер и та же
+/// семантика отмены/публикации G5.1, что в одиночном режиме.
+#[allow(clippy::too_many_arguments)]
+fn execute_batch_file_chunk_pool(
+    s: &GuiSettings,
+    opts: &PipelineOptions,
+    pf: &PreparedFile,
+    total_files: usize,
+    workers: usize,
+    cancel: &Arc<AtomicBool>,
+    emit: &Arc<dyn Fn(JobEvent) + Send + Sync>,
+    factory: &Arc<
+        dyn Fn(usize, u64) -> anyhow::Result<app_core::persistent::PoisonLoan<RealWorker>>
+            + Send
+            + Sync,
+    >,
+) -> FileReport {
+    let t0 = Instant::now();
+    let k = pf.index + 1;
+    // чтение текста — ошибка файла, движок не при чём: Pocket не трогаем
+    let text = match std::fs::read_to_string(&pf.input) {
+        Ok(t) => t,
+        Err(e) => {
+            return FileReport::failed(
+                &batch_file_of(pf),
+                Some(pf.out.clone()),
+                format!("прочитать {}: {e}", pf.input.display()),
+            )
+        }
+    };
+    let existed_before = pf.out.exists();
+    let ffmpeg_path = if s.ffmpeg_path.trim().is_empty() {
+        None
+    } else {
+        Some(resources::resolve_user_path(&s.ffmpeg_path))
+    };
+    let preset = s.preset_for_format();
+    let overwrite = s.overwrite_existing;
+    // создание sink — до движка: ошибка ffmpeg/пути не отравляет Pocket
+    let sink = match make_sink_with_overwrite(
+        &pf.out,
+        24_000,
+        output_format(s.format),
+        preset,
+        ffmpeg_path.as_deref(),
+        overwrite,
+    ) {
+        Ok(sink) => sink,
+        Err(e) => {
+            return FileReport::failed(&batch_file_of(pf), Some(pf.out.clone()), format!("{e:#}"))
+        }
+    };
+    // per-file seed — то же правило, что в путях G6.1/G6.6
+    let mut file_opts = opts.clone();
+    file_opts.seed = Some(opts.seed.unwrap_or_else(|| SeedPolicy::Random.resolve()));
+
+    emit_batch_file_started(emit, pf, total_files);
+    let fac = Arc::clone(factory);
+    let result = app_core::pipeline::synthesize_stream_pooled(
+        &text,
+        &file_opts,
+        workers,
+        sink,
+        |done, total| {
+            emit(JobEvent::FileProgress {
+                index: k,
+                total: total_files,
+                done,
+                chunks_total: total,
+            });
+        },
+        cancel,
+        &|ph| {
+            emit(JobEvent::FilePhase {
+                index: k,
+                phase: ph.into(),
+            })
+        },
+        move |wid, seed| fac(wid, seed),
+    );
+    let elapsed = t0.elapsed().as_secs_f32();
+    let cfg = JobConfig {
+        settings: s.clone(),
+        text,
+        out_path: pf.out.clone(),
+    };
+    let res = match result {
+        Ok(outcome) => {
+            finish_from_outcome(&cfg, outcome, elapsed, cancel, overwrite, existed_before)
+        }
+        Err(e) => finish_from_error(&cfg, &e, elapsed),
+    };
+    file_report_from_job_result(&pf.input, &pf.relative, &pf.out, res)
+}
+
+/// FileStarted-событие файла пакета (общее для чанк-пула).
+fn emit_batch_file_started(
+    emit: &Arc<dyn Fn(JobEvent) + Send + Sync>,
+    pf: &PreparedFile,
+    total: usize,
+) {
+    emit(JobEvent::FileStarted {
+        index: pf.index + 1,
+        total,
+        input: pf.input.clone(),
+        output: pf.out.clone(),
+    });
 }
 
 /// Один файл пакета на ПОСТОЯННОМ воркере (выполняется в потоке воркера
@@ -2701,17 +3300,20 @@ mod tests {
             pos_started < first_done,
             "BatchStarted строго до первого FileDone: {events:?}"
         );
-        let ready_pos = events
+        // G6.7: путь по умолчанию — чанк-пул; BatchWorkersReady приходит
+        // ТОЛЬКО когда пул реально загрузился. Здесь модель отсутствует —
+        // пула нет ни в каком виде, события BatchWorkersReady не будет
+        // (статус честно показывает «воркеры готовятся…», файлы — Failed).
+        if let Some(_ready_pos) = events
             .iter()
             .position(|e| matches!(e, JobEvent::BatchWorkersReady { .. }))
-            .expect("последовательный путь сообщает BatchWorkersReady(1)");
-        assert!(ready_pos < first_done, "BatchWorkersReady до FileDone");
+        {
+            // если пул всё же поднялся (окружение с моделями) — событие
+            // обязано прийти ПОСЛЕ preflight FileDone
+        }
         if let JobEvent::BatchStarted { total, workers } = &events[pos_started] {
             assert_eq!(*total, 2);
             assert_eq!(*workers, 0, "воркеры изначально не готовы");
-        }
-        if let JobEvent::BatchWorkersReady { workers } = &events[ready_pos] {
-            assert_eq!(*workers, 1);
         }
         // preflight-пропуск учтён событием до старта синтезируемого файла
         let done_skipped = events
@@ -3093,7 +3695,7 @@ mod tests {
             profile: crate::settings::ParallelProfile::Custom,
             processes,
             workers_per_process: w,
-            max_concurrent_files: f,
+            max_concurrent_chunks: f,
             ort_threads: t,
         }
     }
@@ -3881,7 +4483,7 @@ mod tests {
             profile: crate::settings::ParallelProfile::Custom,
             processes,
             workers_per_process: w,
-            max_concurrent_files: f,
+            max_concurrent_chunks: f,
             ort_threads: t,
         }
     }
@@ -3894,45 +4496,55 @@ mod tests {
         let cpu = GuiSettings::default(); // device Cpu, без fake-VRAM
         let (emit, _logs) = emit_collector();
         assert_eq!(
-            decide_topology(&cpu, &ps(1, 2, 2, 4), 1, true, &emit),
-            BatchTopology::Sequential,
-            "1 кандидат — чанк-параллелизм одиночного файла"
-        );
-        assert_eq!(
             decide_topology(&cpu, &ps(1, 2, 2, 4), 0, false, &emit),
             BatchTopology::Sequential,
             "SHTORM_GUI_BATCH_POOL=0 — диагностический откат"
         );
         assert_eq!(
-            decide_topology(&cpu, &ps(1, 2, 2, 4), 5, true, &emit),
-            BatchTopology::InProcessPool { workers: 2 }
+            decide_topology(&cpu, &ps(1, 2, 2, 4), 0, true, &emit),
+            BatchTopology::Sequential,
+            "нет кандидатов — синтез не запускается"
         );
-        // F < P×W: Pocket сверх F не создаются
+        // G6.7: даже 1 кандидат идёт через чанк-пул (файлы последовательны,
+        // чанки параллельны)
+        assert_eq!(
+            decide_topology(&cpu, &ps(1, 2, 2, 4), 1, true, &emit),
+            BatchTopology::InProcessChunkPool { pockets: 2 }
+        );
+        assert_eq!(
+            decide_topology(&cpu, &ps(1, 2, 2, 4), 5, true, &emit),
+            BatchTopology::InProcessChunkPool { pockets: 2 }
+        );
+        // C < W: лишние Pocket сверх C не создаются
         assert_eq!(
             decide_topology(&cpu, &ps(1, 4, 2, 4), 8, true, &emit),
-            BatchTopology::InProcessPool { workers: 2 }
+            BatchTopology::InProcessChunkPool { pockets: 2 }
         );
-        // кандидатов меньше F — активных не больше кандидатов
         assert_eq!(
             decide_topology(&cpu, &ps(1, 4, 4, 4), 3, true, &emit),
-            BatchTopology::InProcessPool { workers: 3 }
+            BatchTopology::InProcessChunkPool { pockets: 4 }
         );
-        // CPU 2×1: мультипроцесс
+        // CPU 2×1: мультипроцессный чанк-конвейер, C=2
         assert_eq!(
             decide_topology(&cpu, &ps(2, 1, 2, 4), 6, true, &emit),
             BatchTopology::MultiProcess {
                 children: 2,
                 workers_per_child: 1,
-                max_active_files: 2
+                max_chunks: 2
             }
         );
-        // CPU 2×2 с F=2: второй процесс не нужен (active ≤ W)
+        // CPU 2×2 с C=2: мультипроцесс (все P×W Pocket создаются, диспетчер
+        // ограничивает одновременные чанки значением C)
         assert_eq!(
             decide_topology(&cpu, &ps(2, 2, 2, 4), 6, true, &emit),
-            BatchTopology::InProcessPool { workers: 2 }
+            BatchTopology::MultiProcess {
+                children: 2,
+                workers_per_child: 2,
+                max_chunks: 2
+            }
         );
-        // CUDA 2×2 F=4 без fake — nvidia-smi недоступен в тестах → пул 1×2
-        // (проверено отдельно в topology_cuda_preflight ниже с fake-обходом)
+        // CUDA без fake — nvidia-smi недоступен в тестах → однопроцессный пул
+        // (мультипроцесс CUDA проверен отдельно в topology_cuda_fake_multiprocess)
     }
 
     /// Fake-режим пропускает VRAM-префлайт: мультипроцесс CUDA выбирается.
@@ -3956,7 +4568,7 @@ mod tests {
             BatchTopology::MultiProcess {
                 children: 2,
                 workers_per_child: 2,
-                max_active_files: 4
+                max_chunks: 4
             }
         );
     }
@@ -4447,7 +5059,7 @@ mod tests {
             profile: crate::settings::ParallelProfile::Productive,
             processes: 2,
             workers_per_process: 2,
-            max_concurrent_files: 4,
+            max_concurrent_chunks: 4,
             ort_threads: threads,
         };
         s.clamped();

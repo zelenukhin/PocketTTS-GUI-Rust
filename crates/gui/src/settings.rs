@@ -270,28 +270,31 @@ impl ParallelProfile {
     }
 }
 
-/// G6.6: единая модель параллельной обработки пакетов для CPU и CUDA.
+/// G6.6/G6.7: единая модель параллельной обработки для CPU и CUDA.
 ///
-/// Определения (ТЗ G6.6):
+/// Определения (ТЗ G6.7):
 /// - `processes` — число ДОЧЕРНИХ рабочих процессов с Pocket (не считая
-///   GUI-диспетчер);
+///   GUI-диспетчер); при P=1 пул живёт в основном процессе приложения;
 /// - `workers_per_process` — постоянных Pocket (ONNX-сессий) в каждом
-///   рабочем процессе; воркер файлового пула = один Pocket;
-/// - `max_concurrent_files` — верхний предел ОДНОВРЕМЕННО обрабатываемых
-///   файлов; Pocket сверх этого предела не создаются (однопроцессный пул)
-///   либо не получают назначений (мультипроцессный диспетчер);
+///   рабочем процессе; Pocket переживает файлы задания;
+/// - `max_concurrent_chunks` — верхний предел ОДНОВРЕМЕННО синтезируемых
+///   чанков ТЕКУЩЕГО файла (файлов в обработке всегда максимум 1);
 /// - `ort_threads` — intra-op потоки ONNX Runtime на ОДНУ ONNX-сессию.
 ///
 /// `total_pockets = processes × workers_per_process`;
-/// `active_files = min(max_concurrent_files, total_pockets, eligible_files)`.
-/// Процесс, Pocket и ORT-поток — разные понятия и не взаимозаменяемы.
+/// `active_chunks = min(max_concurrent_chunks, total_pockets, remaining_chunks)`.
+/// Процесс, Pocket и ORT-поток — разные понятия и не взаимозаменяемы; C не
+/// создаёт дополнительные Pocket.Исторический ключ G6.6
+/// `max_concurrent_files` читается как стартовое значение C (семантика
+/// параметра изменилась: предел файлов → предел чанков; см. docs/G6_7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ParallelSettings {
     pub profile: ParallelProfile,
     pub processes: u32,
     pub workers_per_process: u32,
-    pub max_concurrent_files: u32,
+    #[serde(alias = "max_concurrent_files")]
+    pub max_concurrent_chunks: u32,
     pub ort_threads: u32,
 }
 
@@ -303,7 +306,7 @@ impl Default for ParallelSettings {
             profile: ParallelProfile::Optimal,
             processes: 1,
             workers_per_process: 2,
-            max_concurrent_files: 2,
+            max_concurrent_chunks: 2,
             ort_threads: 4,
         }
     }
@@ -350,24 +353,22 @@ impl ParallelSettings {
         self.processes.saturating_mul(self.workers_per_process)
     }
 
-    /// Зажим в жёсткие диапазоны устройства (валидация ТЗ G6.6 §10:
-    /// F ≤ P×W; CUDA — всего ≤4 Pocket; без переполнений).
+    /// Зажим в жёсткие диапазоны устройства (валидация ТЗ G6.7 §7:
+    /// C ≤ P×W; общий предел P×W ≤ 4 Pocket; T ≤ 16; без переполнений).
     pub fn clamp_for_device(&mut self, device: DeviceChoice) {
         let (pmax, wmax) = parallel_limits(device);
         self.processes = self.processes.clamp(1, pmax);
         self.workers_per_process = self.workers_per_process.clamp(1, wmax);
-        if device == DeviceChoice::Cuda {
-            // CUDA: всего Pocket не более 4 (уменьшаем воркеров процесса)
-            while self.total_pockets() > 4 && self.workers_per_process > 1 {
-                self.workers_per_process -= 1;
-            }
-            if self.total_pockets() > 4 && self.processes > 1 {
-                self.processes = 1;
-            }
+        // общий предел Pocket: не более 4 на задание (первая реализация G6.7)
+        while self.total_pockets() > 4 && self.workers_per_process > 1 {
+            self.workers_per_process -= 1;
+        }
+        if self.total_pockets() > 4 && self.processes > 1 {
+            self.processes = 1;
         }
         self.ort_threads = self.ort_threads.clamp(1, 16);
         let pockets = self.total_pockets();
-        self.max_concurrent_files = self.max_concurrent_files.clamp(1, pockets);
+        self.max_concurrent_chunks = self.max_concurrent_chunks.clamp(1, pockets);
     }
 
     pub fn clamped_for_device(mut self, device: DeviceChoice) -> Self {
@@ -383,19 +384,19 @@ impl ParallelSettings {
             "процесса"
         };
         format!(
-            "{} {} · {} Pocket · до {} файлов · ORT {}",
+            "{} {} · {} Pocket · до {} чанков · ORT {}",
             self.processes,
             p,
             self.total_pockets(),
-            self.max_concurrent_files,
+            self.max_concurrent_chunks,
             self.ort_threads
         )
     }
 
     /// Пресет «Оптимальный» (баланс скорости, RAM/VRAM и времени первого
     /// результата). CPU: 1 процесс, W = clamp(floor(logical/4), 1, 4) с
-    /// ограничением по свободной RAM (исследованное правило), T=4.
-    /// CUDA: 1×2, F=2, T=4 (проверенный экономичный режим G6.1).
+    /// ограничением по свободной RAM (исследованное правило), C=W, T=4.
+    /// CUDA: 1×2, C=2, T=4 (кандидат ТЗ G6.7 для чанк-пула).
     pub fn preset_optimal(
         device: DeviceChoice,
         logical_cpus: usize,
@@ -409,7 +410,7 @@ impl ParallelSettings {
                     profile: ParallelProfile::Optimal,
                     processes: 1,
                     workers_per_process: w,
-                    max_concurrent_files: w,
+                    max_concurrent_chunks: w,
                     ort_threads: 4,
                 }
             }
@@ -417,15 +418,15 @@ impl ParallelSettings {
                 profile: ParallelProfile::Optimal,
                 processes: 1,
                 workers_per_process: 2,
-                max_concurrent_files: 2,
+                max_concurrent_chunks: 2,
                 ort_threads: 4,
             },
         }
     }
 
-    /// Пресет «Производительный» (приоритет общей скорости пакета).
+    /// Пресет «Производительный» (приоритет скорости генерации).
     /// CPU: 1 процесс × до 4 Pocket × T=1 (W = clamp(floor(logical/2), 2, 4),
-    /// ограничен RAM); CUDA: 2×2, F=4, T=4 (гибрид H22 P2B.3).
+    /// ограничен RAM); CUDA: 2×2, C=4, T=4 (кандидат ТЗ G6.7).
     pub fn preset_productive(
         device: DeviceChoice,
         logical_cpus: usize,
@@ -439,7 +440,7 @@ impl ParallelSettings {
                     profile: ParallelProfile::Productive,
                     processes: 1,
                     workers_per_process: w,
-                    max_concurrent_files: w,
+                    max_concurrent_chunks: w,
                     ort_threads: 1,
                 }
             }
@@ -447,7 +448,7 @@ impl ParallelSettings {
                 profile: ParallelProfile::Productive,
                 processes: 2,
                 workers_per_process: 2,
-                max_concurrent_files: 4,
+                max_concurrent_chunks: 4,
                 ort_threads: 4,
             },
         }
@@ -461,7 +462,7 @@ impl ParallelSettings {
         let canonical = |p: u32, w: u32, t: u32| {
             self.processes == p
                 && self.workers_per_process == w
-                && self.max_concurrent_files == p * w
+                && self.max_concurrent_chunks == p * w
                 && self.ort_threads == t
         };
         match device {
@@ -713,7 +714,7 @@ fn migrate_parallel_settings(s: &mut GuiSettings, raw: &str) {
             profile: ParallelProfile::Productive,
             processes: 2,
             workers_per_process: 2,
-            max_concurrent_files: 4,
+            max_concurrent_chunks: 4,
             ort_threads: legacy_threads.clamp(1, 16),
         }
     } else if let Some(w) = legacy_workers {
@@ -724,7 +725,7 @@ fn migrate_parallel_settings(s: &mut GuiSettings, raw: &str) {
             profile: ParallelProfile::Custom,
             processes: 1,
             workers_per_process: w,
-            max_concurrent_files: w,
+            max_concurrent_chunks: w,
             ort_threads: legacy_threads.clamp(1, 16),
         }
     } else {
@@ -1166,14 +1167,14 @@ mod tests {
                 profile: ParallelProfile::Productive,
                 processes: 2,
                 workers_per_process: 2,
-                max_concurrent_files: 4,
+                max_concurrent_chunks: 4,
                 ort_threads: 4,
             },
             parallel_cpu: ParallelSettings {
                 profile: ParallelProfile::Custom,
                 processes: 2,
                 workers_per_process: 1,
-                max_concurrent_files: 2,
+                max_concurrent_chunks: 2,
                 ort_threads: 4,
             },
             ..Default::default()
@@ -1182,14 +1183,14 @@ mod tests {
             profile: ParallelProfile::Custom,
             processes: 2,
             workers_per_process: 1,
-            max_concurrent_files: 2,
+            max_concurrent_chunks: 2,
             ort_threads: 4,
         };
         s.parallel_cuda = ParallelSettings {
             profile: ParallelProfile::Custom,
             processes: 1,
             workers_per_process: 2,
-            max_concurrent_files: 2,
+            max_concurrent_chunks: 2,
             ort_threads: 3,
         };
         save_settings(&s, &p).unwrap();
@@ -1218,33 +1219,34 @@ mod tests {
             profile: ParallelProfile::Custom,
             processes: 9,
             workers_per_process: 8,
-            max_concurrent_files: 99,
+            max_concurrent_chunks: 99,
             ort_threads: 32,
         };
         ps.clamp_for_device(DeviceChoice::Cpu);
-        assert_eq!((ps.processes, ps.workers_per_process), (4, 4));
-        assert_eq!(ps.max_concurrent_files, 16);
+        // G6.7: общий предел P×W ≤ 4 Pocket (для обоих устройств)
+        assert_eq!((ps.processes, ps.workers_per_process), (4, 1));
+        assert_eq!(ps.max_concurrent_chunks, 4);
         assert_eq!(ps.ort_threads, 16);
         let mut ps = ParallelSettings {
             profile: ParallelProfile::Custom,
             processes: 4,
             workers_per_process: 4,
-            max_concurrent_files: 16,
+            max_concurrent_chunks: 16,
             ort_threads: 1,
         };
         ps.clamp_for_device(DeviceChoice::Cuda);
         assert!(ps.total_pockets() <= 4, "CUDA: всего ≤4 Pocket");
-        assert_eq!(ps.max_concurrent_files, ps.total_pockets());
+        assert_eq!(ps.max_concurrent_chunks, ps.total_pockets());
         // F меньше P×W — легальная конфигурация, хранится как есть
         let mut ps = ParallelSettings {
             profile: ParallelProfile::Custom,
             processes: 2,
             workers_per_process: 2,
-            max_concurrent_files: 2,
+            max_concurrent_chunks: 2,
             ort_threads: 4,
         };
         ps.clamp_for_device(DeviceChoice::Cuda);
-        assert_eq!(ps.max_concurrent_files, 2);
+        assert_eq!(ps.max_concurrent_chunks, 2);
         assert_eq!(ps.total_pockets(), 4);
         // clamped() затрагивает обе конфигурации
         let mut s = GuiSettings::default();
@@ -1271,7 +1273,7 @@ mod tests {
             ),
             (1, 2, 4)
         );
-        assert_eq!(cpu_opt.max_concurrent_files, cpu_opt.total_pockets());
+        assert_eq!(cpu_opt.max_concurrent_chunks, cpu_opt.total_pockets());
         assert_eq!(cpu_opt.profile, ParallelProfile::Optimal);
         let cpu_prod = ParallelSettings::preset_productive(DeviceChoice::Cpu, logical, fp32);
         assert_eq!(
@@ -1287,7 +1289,7 @@ mod tests {
             (
                 cuda_opt.processes,
                 cuda_opt.workers_per_process,
-                cuda_opt.max_concurrent_files,
+                cuda_opt.max_concurrent_chunks,
                 cuda_opt.ort_threads
             ),
             (1, 2, 2, 4)
@@ -1297,7 +1299,7 @@ mod tests {
             (
                 cuda_prod.processes,
                 cuda_prod.workers_per_process,
-                cuda_prod.max_concurrent_files,
+                cuda_prod.max_concurrent_chunks,
                 cuda_prod.ort_threads
             ),
             (2, 2, 4, 4)
@@ -1314,7 +1316,7 @@ mod tests {
             profile: ParallelProfile::Productive,
             processes: 2,
             workers_per_process: 2,
-            max_concurrent_files: 4,
+            max_concurrent_chunks: 4,
             ort_threads: 4,
         };
         assert_eq!(
@@ -1346,7 +1348,7 @@ mod tests {
             ),
             (2, 2)
         );
-        assert_eq!(s.parallel_cuda.max_concurrent_files, 4);
+        assert_eq!(s.parallel_cuda.max_concurrent_chunks, 4);
         // Economy + ручные workers=1 → Custom 1×1 (выбор сохранён)
         std::fs::write(&p, r#"{"batch_cuda_mode": "Economy", "workers": 1}"#).unwrap();
         let s = load_settings(&p).unwrap();
@@ -1361,7 +1363,7 @@ mod tests {
         std::fs::write(
             &p,
             r#"{"parallel_cuda": {"profile": "Custom", "processes": 1,
-                "workers_per_process": 1, "max_concurrent_files": 1,
+                "workers_per_process": 1, "max_concurrent_chunks": 1,
                 "ort_threads": 2}, "batch_cuda_mode": "MaxSpeed"}"#,
         )
         .unwrap();
