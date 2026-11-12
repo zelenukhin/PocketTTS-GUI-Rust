@@ -1,0 +1,5 @@
+[2026-11-08T14:21:42Z INFO  smoke] ORT_DYLIB_PATH = C:\PocketTTS-GUI-Rust\ShtormTTS-Windows\deps\portable\onnxruntime.dll
+[2026-11-08T14:21:42Z INFO  smoke] model_dir = C:\Users\<user>\Downloads\pocket_tts_android\build\onnx\ru-v2-slow
+[2026-11-08T14:21:42Z INFO  smoke] onnxruntime dylib loaded OK
+Could not locate cudnn_graph64_9.dll. Please make sure it is in your library path!
+Invalid handle. Cannot load symbol cudnnCreate

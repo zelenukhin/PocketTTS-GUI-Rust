@@ -1,0 +1,18 @@
+=== stress cuda/slow 1000 ===
+stress | stress-cuda-slow | ru-v2-slow | cuda | phrases 107 | load 1.4s | warmup 25.2s (10 chunks)
+stress | chunks 1000 | mean 1.988s p95 4.429s | audio 3834.3s in 1992.4s | RTF 0.520 (1.9x)
+stress | mem: after-warmup WS 926/priv 3581/gpu 2753 MB -> end WS 831/priv 3584/gpu 2785 MB
+stress | trend (МНК, МБ/1000 чанков): WS -26.7 | private +1.1 | gpu +15.4
+stress | after drop: WS 531 MB, private 1106 MB, gpu 737 MB (возврат: WS -301, priv -2478, gpu -2048)
+=== stress cuda/fast 1000 ===
+stress | stress-cuda-fast | ru-v2-fast | cuda | phrases 107 | load 1.6s | warmup 17.0s (10 chunks)
+stress | chunks 1000 | mean 1.190s p95 2.627s | audio 3827.6s in 1194.3s | RTF 0.312 (3.2x)
+stress | mem: after-warmup WS 893/priv 3530/gpu 2773 MB -> end WS 800/priv 3534/gpu 2766 MB
+stress | trend (МНК, МБ/1000 чанков): WS -64.5 | private +0.9 | gpu -6.4
+stress | after drop: WS 531 MB, private 1103 MB, gpu 730 MB (возврат: WS -269, priv -2430, gpu -2036)
+=== stress cpu/slow 1000 ===
+stress | stress-cpu-slow | ru-v2-slow | cpu | phrases 107 | load 1.1s | warmup 37.9s (10 chunks)
+stress | chunks 1000 | mean 2.486s p95 6.077s | audio 3833.2s in 2490.8s | RTF 0.650 (1.5x)
+stress | mem: after-warmup WS 511/priv 500/gpu 607 MB -> end WS 514/priv 505/gpu 592 MB
+stress | trend (МНК, МБ/1000 чанков): WS +0.9 | private +1.4 | gpu -15.4
+stress | after drop: WS 29 MB, private 18 MB, gpu 592 MB (возврат: WS -485, priv -487, gpu +0)

@@ -1,0 +1,8 @@
+поток: out/a4_book.txt | формат Mp3 (-V2 (Высокое)) | чанков-лимит 50 | паузы ×1.00 | абзац 0.90 с | cpu | воркеров 1
+[2026-11-09T10:44:02Z INFO  shtorm_engine::pocket] load mimi_encoder: 189 ms
+[2026-11-09T10:44:02Z INFO  shtorm_engine::pocket] load text_conditioner: 13 ms
+[2026-11-09T10:44:03Z INFO  shtorm_engine::pocket] load flow_lm_main: 610 ms
+[2026-11-09T10:44:03Z INFO  shtorm_engine::pocket] load flow_lm_flow: 97 ms
+[2026-11-09T10:44:03Z INFO  shtorm_engine::pocket] load mimi_decoder: 153 ms
+ОТМЕНЕНО: обработано 0/47 чанков; итоговый файл out/a52_cancel_mp3/book.mp3 НЕ создан; черновик: out/a52_cancel_mp3\book.1794221042614277800.11760.0.partial.mp3
+диагностический журнал: out/a52_cancel_mp3\book.1794221049890398600.11760.diagnostic_log.txt

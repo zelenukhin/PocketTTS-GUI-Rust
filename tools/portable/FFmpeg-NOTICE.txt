@@ -1,0 +1,14 @@
+FFmpeg notice
+=============
+
+Bundled binary: ffmpeg/ffmpeg.exe
+Version: 8.0.1-full_build-www.gyan.dev
+Build configuration includes --enable-gpl --enable-version3, so the binary is
+distributed under the GNU General Public License version 3.
+
+The complete corresponding source code is available from:
+  https://ffmpeg.org/download.html
+  https://www.gyan.dev/ffmpeg/builds/
+
+License text: LICENSES/FFmpeg-GPLv3.txt.
+This package is assembled for local use and is not published to the Internet.

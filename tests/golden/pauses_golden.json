@@ -1,0 +1,686 @@
+[
+ {
+  "name": "многоабзацный|mt50|s1.0|p0.9",
+  "text": "Стр+елки час+ов показ+ывали п+олночь. В д+оме сп+али, и т+олько стар+ые часы продолжали свой мерный разговор.\nОна открыла окно, посмотрела на улицу и тихо вздохнула: за стеклом шумел дождь.\nУтро пришло быстро.",
+  "max_tokens": 50,
+  "pause_scale": 1.0,
+  "paragraph_pause_s": 0.9,
+  "chunks": [
+   {
+    "text": "Стр+елки час+ов показ+ывали п+олночь. В д+оме сп+али, и т+олько стар+ые часы продолжали свой мерный разговор.",
+    "is_last": true,
+    "soft_break": false
+   },
+   {
+    "text": "Она открыла окно, посмотрела на улицу и тихо вздохнула: за стеклом шумел дождь.",
+    "is_last": true,
+    "soft_break": false
+   },
+   {
+    "text": "Утро пришло быстро.",
+    "is_last": true,
+    "soft_break": false
+   }
+  ],
+  "python_pauses": [
+   0.9,
+   0.9,
+   null
+  ],
+  "rust_pauses": [
+   0.9,
+   0.9,
+   null
+  ],
+  "divergent": [],
+  "fs": 24000,
+  "rust_pause_samples": [
+   21600,
+   21600,
+   null
+  ],
+  "rust_total_pause_s": 1.8
+ },
+ {
+  "name": "многоабзацный|mt50|s1.5|p0.5",
+  "text": "Стр+елки час+ов показ+ывали п+олночь. В д+оме сп+али, и т+олько стар+ые часы продолжали свой мерный разговор.\nОна открыла окно, посмотрела на улицу и тихо вздохнула: за стеклом шумел дождь.\nУтро пришло быстро.",
+  "max_tokens": 50,
+  "pause_scale": 1.5,
+  "paragraph_pause_s": 0.5,
+  "chunks": [
+   {
+    "text": "Стр+елки час+ов показ+ывали п+олночь. В д+оме сп+али, и т+олько стар+ые часы продолжали свой мерный разговор.",
+    "is_last": true,
+    "soft_break": false
+   },
+   {
+    "text": "Она открыла окно, посмотрела на улицу и тихо вздохнула: за стеклом шумел дождь.",
+    "is_last": true,
+    "soft_break": false
+   },
+   {
+    "text": "Утро пришло быстро.",
+    "is_last": true,
+    "soft_break": false
+   }
+  ],
+  "python_pauses": [
+   0.75,
+   0.75,
+   null
+  ],
+  "rust_pauses": [
+   0.75,
+   0.75,
+   null
+  ],
+  "divergent": [],
+  "fs": 24000,
+  "rust_pause_samples": [
+   18000,
+   18000,
+   null
+  ],
+  "rust_total_pause_s": 1.5
+ },
+ {
+  "name": "многоабзацный|mt120|s1.0|p0.9",
+  "text": "Стр+елки час+ов показ+ывали п+олночь. В д+оме сп+али, и т+олько стар+ые часы продолжали свой мерный разговор.\nОна открыла окно, посмотрела на улицу и тихо вздохнула: за стеклом шумел дождь.\nУтро пришло быстро.",
+  "max_tokens": 120,
+  "pause_scale": 1.0,
+  "paragraph_pause_s": 0.9,
+  "chunks": [
+   {
+    "text": "Стр+елки час+ов показ+ывали п+олночь. В д+оме сп+али, и т+олько стар+ые часы продолжали свой мерный разговор.",
+    "is_last": true,
+    "soft_break": false
+   },
+   {
+    "text": "Она открыла окно, посмотрела на улицу и тихо вздохнула: за стеклом шумел дождь.",
+    "is_last": true,
+    "soft_break": false
+   },
+   {
+    "text": "Утро пришло быстро.",
+    "is_last": true,
+    "soft_break": false
+   }
+  ],
+  "python_pauses": [
+   0.9,
+   0.9,
+   null
+  ],
+  "rust_pauses": [
+   0.9,
+   0.9,
+   null
+  ],
+  "divergent": [],
+  "fs": 24000,
+  "rust_pause_samples": [
+   21600,
+   21600,
+   null
+  ],
+  "rust_total_pause_s": 1.8
+ },
+ {
+  "name": "многоабзацный|mt120|s1.5|p0.5",
+  "text": "Стр+елки час+ов показ+ывали п+олночь. В д+оме сп+али, и т+олько стар+ые часы продолжали свой мерный разговор.\nОна открыла окно, посмотрела на улицу и тихо вздохнула: за стеклом шумел дождь.\nУтро пришло быстро.",
+  "max_tokens": 120,
+  "pause_scale": 1.5,
+  "paragraph_pause_s": 0.5,
+  "chunks": [
+   {
+    "text": "Стр+елки час+ов показ+ывали п+олночь. В д+оме сп+али, и т+олько стар+ые часы продолжали свой мерный разговор.",
+    "is_last": true,
+    "soft_break": false
+   },
+   {
+    "text": "Она открыла окно, посмотрела на улицу и тихо вздохнула: за стеклом шумел дождь.",
+    "is_last": true,
+    "soft_break": false
+   },
+   {
+    "text": "Утро пришло быстро.",
+    "is_last": true,
+    "soft_break": false
+   }
+  ],
+  "python_pauses": [
+   0.75,
+   0.75,
+   null
+  ],
+  "rust_pauses": [
+   0.75,
+   0.75,
+   null
+  ],
+  "divergent": [],
+  "fs": 24000,
+  "rust_pause_samples": [
+   18000,
+   18000,
+   null
+  ],
+  "rust_total_pause_s": 1.5
+ },
+ {
+  "name": "голый_конец_абзаца|mt50|s1.0|p0.9",
+  "text": "Первый абзац кончается знаком.\nВторой абзац кончается словом без знака\nТретий короткий.",
+  "max_tokens": 50,
+  "pause_scale": 1.0,
+  "paragraph_pause_s": 0.9,
+  "chunks": [
+   {
+    "text": "Первый абзац кончается знаком.",
+    "is_last": true,
+    "soft_break": false
+   },
+   {
+    "text": "Второй абзац кончается словом без знака,",
+    "is_last": true,
+    "soft_break": true
+   },
+   {
+    "text": "Третий короткий.",
+    "is_last": true,
+    "soft_break": false
+   }
+  ],
+  "python_pauses": [
+   0.9,
+   0.02,
+   null
+  ],
+  "rust_pauses": [
+   0.9,
+   0.9,
+   null
+  ],
+  "divergent": [
+   {
+    "i": 1,
+    "why": "конец абзаца + soft_break от terminate: python даёт стык 0.02, rust — max(знак, пауза абзаца)"
+   }
+  ],
+  "fs": 24000,
+  "rust_pause_samples": [
+   21600,
+   21600,
+   null
+  ],
+  "rust_total_pause_s": 1.8
+ },
+ {
+  "name": "голый_конец_абзаца|mt50|s1.5|p0.5",
+  "text": "Первый абзац кончается знаком.\nВторой абзац кончается словом без знака\nТретий короткий.",
+  "max_tokens": 50,
+  "pause_scale": 1.5,
+  "paragraph_pause_s": 0.5,
+  "chunks": [
+   {
+    "text": "Первый абзац кончается знаком.",
+    "is_last": true,
+    "soft_break": false
+   },
+   {
+    "text": "Второй абзац кончается словом без знака,",
+    "is_last": true,
+    "soft_break": true
+   },
+   {
+    "text": "Третий короткий.",
+    "is_last": true,
+    "soft_break": false
+   }
+  ],
+  "python_pauses": [
+   0.75,
+   0.02,
+   null
+  ],
+  "rust_pauses": [
+   0.75,
+   0.75,
+   null
+  ],
+  "divergent": [
+   {
+    "i": 1,
+    "why": "конец абзаца + soft_break от terminate: python даёт стык 0.02, rust — max(знак, пауза абзаца)"
+   }
+  ],
+  "fs": 24000,
+  "rust_pause_samples": [
+   18000,
+   18000,
+   null
+  ],
+  "rust_total_pause_s": 1.5
+ },
+ {
+  "name": "голый_конец_абзаца|mt120|s1.0|p0.9",
+  "text": "Первый абзац кончается знаком.\nВторой абзац кончается словом без знака\nТретий короткий.",
+  "max_tokens": 120,
+  "pause_scale": 1.0,
+  "paragraph_pause_s": 0.9,
+  "chunks": [
+   {
+    "text": "Первый абзац кончается знаком.",
+    "is_last": true,
+    "soft_break": false
+   },
+   {
+    "text": "Второй абзац кончается словом без знака,",
+    "is_last": true,
+    "soft_break": true
+   },
+   {
+    "text": "Третий короткий.",
+    "is_last": true,
+    "soft_break": false
+   }
+  ],
+  "python_pauses": [
+   0.9,
+   0.02,
+   null
+  ],
+  "rust_pauses": [
+   0.9,
+   0.9,
+   null
+  ],
+  "divergent": [
+   {
+    "i": 1,
+    "why": "конец абзаца + soft_break от terminate: python даёт стык 0.02, rust — max(знак, пауза абзаца)"
+   }
+  ],
+  "fs": 24000,
+  "rust_pause_samples": [
+   21600,
+   21600,
+   null
+  ],
+  "rust_total_pause_s": 1.8
+ },
+ {
+  "name": "голый_конец_абзаца|mt120|s1.5|p0.5",
+  "text": "Первый абзац кончается знаком.\nВторой абзац кончается словом без знака\nТретий короткий.",
+  "max_tokens": 120,
+  "pause_scale": 1.5,
+  "paragraph_pause_s": 0.5,
+  "chunks": [
+   {
+    "text": "Первый абзац кончается знаком.",
+    "is_last": true,
+    "soft_break": false
+   },
+   {
+    "text": "Второй абзац кончается словом без знака,",
+    "is_last": true,
+    "soft_break": true
+   },
+   {
+    "text": "Третий короткий.",
+    "is_last": true,
+    "soft_break": false
+   }
+  ],
+  "python_pauses": [
+   0.75,
+   0.02,
+   null
+  ],
+  "rust_pauses": [
+   0.75,
+   0.75,
+   null
+  ],
+  "divergent": [
+   {
+    "i": 1,
+    "why": "конец абзаца + soft_break от terminate: python даёт стык 0.02, rust — max(знак, пауза абзаца)"
+   }
+  ],
+  "fs": 24000,
+  "rust_pause_samples": [
+   18000,
+   18000,
+   null
+  ],
+  "rust_total_pause_s": 1.5
+ },
+ {
+  "name": "и_границы|mt50|s1.0|p0.9",
+  "text": "Старый город встретил нас тишиной и узкими переулками и спящими кошками и запахом хлеба и далёким звоном",
+  "max_tokens": 50,
+  "pause_scale": 1.0,
+  "paragraph_pause_s": 0.9,
+  "chunks": [
+   {
+    "text": "Старый город встретил нас тишиной и узкими переулками и спящими кошками и запахом хлеба и далёким звоном.",
+    "is_last": true,
+    "soft_break": false
+   }
+  ],
+  "python_pauses": [
+   null
+  ],
+  "rust_pauses": [
+   null
+  ],
+  "divergent": [],
+  "fs": 24000,
+  "rust_pause_samples": [
+   null
+  ],
+  "rust_total_pause_s": 0
+ },
+ {
+  "name": "и_границы|mt50|s1.5|p0.5",
+  "text": "Старый город встретил нас тишиной и узкими переулками и спящими кошками и запахом хлеба и далёким звоном",
+  "max_tokens": 50,
+  "pause_scale": 1.5,
+  "paragraph_pause_s": 0.5,
+  "chunks": [
+   {
+    "text": "Старый город встретил нас тишиной и узкими переулками и спящими кошками и запахом хлеба и далёким звоном.",
+    "is_last": true,
+    "soft_break": false
+   }
+  ],
+  "python_pauses": [
+   null
+  ],
+  "rust_pauses": [
+   null
+  ],
+  "divergent": [],
+  "fs": 24000,
+  "rust_pause_samples": [
+   null
+  ],
+  "rust_total_pause_s": 0
+ },
+ {
+  "name": "и_границы|mt120|s1.0|p0.9",
+  "text": "Старый город встретил нас тишиной и узкими переулками и спящими кошками и запахом хлеба и далёким звоном",
+  "max_tokens": 120,
+  "pause_scale": 1.0,
+  "paragraph_pause_s": 0.9,
+  "chunks": [
+   {
+    "text": "Старый город встретил нас тишиной и узкими переулками и спящими кошками и запахом хлеба и далёким звоном.",
+    "is_last": true,
+    "soft_break": false
+   }
+  ],
+  "python_pauses": [
+   null
+  ],
+  "rust_pauses": [
+   null
+  ],
+  "divergent": [],
+  "fs": 24000,
+  "rust_pause_samples": [
+   null
+  ],
+  "rust_total_pause_s": 0
+ },
+ {
+  "name": "и_границы|mt120|s1.5|p0.5",
+  "text": "Старый город встретил нас тишиной и узкими переулками и спящими кошками и запахом хлеба и далёким звоном",
+  "max_tokens": 120,
+  "pause_scale": 1.5,
+  "paragraph_pause_s": 0.5,
+  "chunks": [
+   {
+    "text": "Старый город встретил нас тишиной и узкими переулками и спящими кошками и запахом хлеба и далёким звоном.",
+    "is_last": true,
+    "soft_break": false
+   }
+  ],
+  "python_pauses": [
+   null
+  ],
+  "rust_pauses": [
+   null
+  ],
+  "divergent": [],
+  "fs": 24000,
+  "rust_pause_samples": [
+   null
+  ],
+  "rust_total_pause_s": 0
+ },
+ {
+  "name": "знаки|mt50|s1.0|p0.9",
+  "text": "Точка. Запятая, двоеточие: точка с запятой; тире — и многоточие… конец?",
+  "max_tokens": 50,
+  "pause_scale": 1.0,
+  "paragraph_pause_s": 0.9,
+  "chunks": [
+   {
+    "text": "Точка. Запятая, двоеточие: точка с запятой; тире — и многоточие… конец?",
+    "is_last": true,
+    "soft_break": false
+   }
+  ],
+  "python_pauses": [
+   null
+  ],
+  "rust_pauses": [
+   null
+  ],
+  "divergent": [],
+  "fs": 24000,
+  "rust_pause_samples": [
+   null
+  ],
+  "rust_total_pause_s": 0
+ },
+ {
+  "name": "знаки|mt50|s1.5|p0.5",
+  "text": "Точка. Запятая, двоеточие: точка с запятой; тире — и многоточие… конец?",
+  "max_tokens": 50,
+  "pause_scale": 1.5,
+  "paragraph_pause_s": 0.5,
+  "chunks": [
+   {
+    "text": "Точка. Запятая, двоеточие: точка с запятой; тире — и многоточие… конец?",
+    "is_last": true,
+    "soft_break": false
+   }
+  ],
+  "python_pauses": [
+   null
+  ],
+  "rust_pauses": [
+   null
+  ],
+  "divergent": [],
+  "fs": 24000,
+  "rust_pause_samples": [
+   null
+  ],
+  "rust_total_pause_s": 0
+ },
+ {
+  "name": "знаки|mt120|s1.0|p0.9",
+  "text": "Точка. Запятая, двоеточие: точка с запятой; тире — и многоточие… конец?",
+  "max_tokens": 120,
+  "pause_scale": 1.0,
+  "paragraph_pause_s": 0.9,
+  "chunks": [
+   {
+    "text": "Точка. Запятая, двоеточие: точка с запятой; тире — и многоточие… конец?",
+    "is_last": true,
+    "soft_break": false
+   }
+  ],
+  "python_pauses": [
+   null
+  ],
+  "rust_pauses": [
+   null
+  ],
+  "divergent": [],
+  "fs": 24000,
+  "rust_pause_samples": [
+   null
+  ],
+  "rust_total_pause_s": 0
+ },
+ {
+  "name": "знаки|mt120|s1.5|p0.5",
+  "text": "Точка. Запятая, двоеточие: точка с запятой; тире — и многоточие… конец?",
+  "max_tokens": 120,
+  "pause_scale": 1.5,
+  "paragraph_pause_s": 0.5,
+  "chunks": [
+   {
+    "text": "Точка. Запятая, двоеточие: точка с запятой; тире — и многоточие… конец?",
+    "is_last": true,
+    "soft_break": false
+   }
+  ],
+  "python_pauses": [
+   null
+  ],
+  "rust_pauses": [
+   null
+  ],
+  "divergent": [],
+  "fs": 24000,
+  "rust_pause_samples": [
+   null
+  ],
+  "rust_total_pause_s": 0
+ },
+ {
+  "name": "монстр|mt50|s1.0|p0.9",
+  "text": "длинноесловораз длинноесловодва длинноесловотри длинноесловочетыре длинноесловопять длинноесловошесть длинноесловосемь длинноеслововосемь",
+  "max_tokens": 50,
+  "pause_scale": 1.0,
+  "paragraph_pause_s": 0.9,
+  "chunks": [
+   {
+    "text": "длинноесловораз длинноесловодва длинноесловотри длинноесловочетыре,",
+    "is_last": false,
+    "soft_break": true
+   },
+   {
+    "text": "длинноесловопять длинноесловошесть длинноесловосемь длинноеслововосемь.",
+    "is_last": true,
+    "soft_break": false
+   }
+  ],
+  "python_pauses": [
+   0.02,
+   null
+  ],
+  "rust_pauses": [
+   0.02,
+   null
+  ],
+  "divergent": [],
+  "fs": 24000,
+  "rust_pause_samples": [
+   480,
+   null
+  ],
+  "rust_total_pause_s": 0.02
+ },
+ {
+  "name": "монстр|mt50|s1.5|p0.5",
+  "text": "длинноесловораз длинноесловодва длинноесловотри длинноесловочетыре длинноесловопять длинноесловошесть длинноесловосемь длинноеслововосемь",
+  "max_tokens": 50,
+  "pause_scale": 1.5,
+  "paragraph_pause_s": 0.5,
+  "chunks": [
+   {
+    "text": "длинноесловораз длинноесловодва длинноесловотри длинноесловочетыре,",
+    "is_last": false,
+    "soft_break": true
+   },
+   {
+    "text": "длинноесловопять длинноесловошесть длинноесловосемь длинноеслововосемь.",
+    "is_last": true,
+    "soft_break": false
+   }
+  ],
+  "python_pauses": [
+   0.02,
+   null
+  ],
+  "rust_pauses": [
+   0.02,
+   null
+  ],
+  "divergent": [],
+  "fs": 24000,
+  "rust_pause_samples": [
+   480,
+   null
+  ],
+  "rust_total_pause_s": 0.02
+ },
+ {
+  "name": "монстр|mt120|s1.0|p0.9",
+  "text": "длинноесловораз длинноесловодва длинноесловотри длинноесловочетыре длинноесловопять длинноесловошесть длинноесловосемь длинноеслововосемь",
+  "max_tokens": 120,
+  "pause_scale": 1.0,
+  "paragraph_pause_s": 0.9,
+  "chunks": [
+   {
+    "text": "длинноесловораз длинноесловодва длинноесловотри длинноесловочетыре длинноесловопять длинноесловошесть длинноесловосемь длинноеслововосемь.",
+    "is_last": true,
+    "soft_break": false
+   }
+  ],
+  "python_pauses": [
+   null
+  ],
+  "rust_pauses": [
+   null
+  ],
+  "divergent": [],
+  "fs": 24000,
+  "rust_pause_samples": [
+   null
+  ],
+  "rust_total_pause_s": 0
+ },
+ {
+  "name": "монстр|mt120|s1.5|p0.5",
+  "text": "длинноесловораз длинноесловодва длинноесловотри длинноесловочетыре длинноесловопять длинноесловошесть длинноесловосемь длинноеслововосемь",
+  "max_tokens": 120,
+  "pause_scale": 1.5,
+  "paragraph_pause_s": 0.5,
+  "chunks": [
+   {
+    "text": "длинноесловораз длинноесловодва длинноесловотри длинноесловочетыре длинноесловопять длинноесловошесть длинноесловосемь длинноеслововосемь.",
+    "is_last": true,
+    "soft_break": false
+   }
+  ],
+  "python_pauses": [
+   null
+  ],
+  "rust_pauses": [
+   null
+  ],
+  "divergent": [],
+  "fs": 24000,
+  "rust_pause_samples": [
+   null
+  ],
+  "rust_total_pause_s": 0
+ }
+]

@@ -1,0 +1,21 @@
+Microsoft Visual C++ Redistributable runtime notice
+===================================================
+
+This package bundles the following Microsoft Visual C++ Redistributable
+runtime DLLs next to PocketTTS-GUI-Rust.exe:
+
+  msvcp140.dll
+  msvcp140_1.dll
+  vcruntime140.dll
+  vcruntime140_1.dll
+
+These files are Microsoft redistributable components. They are included so
+that the application can start on a Windows machine without a separately
+installed Visual C++ Redistributable. Their use and redistribution are
+governed by the Microsoft Visual Studio / Visual C++ Redistributable license
+terms. See:
+  https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist
+  https://visualstudio.microsoft.com/license-terms/
+
+The files were taken from the Windows System32 directory of the build
+machine, which has the Visual C++ Redistributable installed.

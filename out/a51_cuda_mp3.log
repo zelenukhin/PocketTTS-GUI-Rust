@@ -1,0 +1,12 @@
+поток: out/a4_text.txt | формат Mp3 (-V2 (Высокое)) | чанков-лимит 50 | паузы ×1.00 | абзац 0.90 с | cuda | воркеров 1
+[2026-11-08T23:51:25Z INFO  shtorm_engine::pocket] load mimi_encoder: 457 ms
+[2026-11-08T23:51:25Z INFO  shtorm_engine::pocket] load text_conditioner: 19 ms
+[2026-11-08T23:51:26Z INFO  shtorm_engine::pocket] load flow_lm_main: 575 ms
+[2026-11-08T23:51:26Z INFO  shtorm_engine::pocket] load flow_lm_flow: 112 ms
+[2026-11-08T23:51:26Z INFO  shtorm_engine::pocket] load mimi_decoder: 183 ms
+  [1/3] готов
+  [2/3] готов
+  [3/3] готов
+файл: out/a51_cuda.mp3 (18.45 с: речь 16.66 с + паузы 1.80 с; чанков 3; 10.07 с генерации, RTF 0.545)
+пул: воркеров 1, base_seed 42, буфер переупорядочивания <= 1 чанков / 726 КиБ PCM
+денойз: выключен

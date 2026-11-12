@@ -1,0 +1,4 @@
+target/
+deps/
+out/*.wav
+out/ep_traces/

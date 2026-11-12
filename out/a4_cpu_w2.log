@@ -1,0 +1,17 @@
+конвейер: out/a4_text.txt | чанков-лимит 50 ток. | паузы ×1.00 | абзац 0.90 с | устройство cpu | воркеров 2
+[2026-11-08T20:57:44Z INFO  shtorm_engine::pocket] load mimi_encoder: 199 ms
+[2026-11-08T20:57:44Z INFO  shtorm_engine::pocket] load mimi_encoder: 199 ms
+[2026-11-08T20:57:44Z INFO  shtorm_engine::pocket] load text_conditioner: 16 ms
+[2026-11-08T20:57:44Z INFO  shtorm_engine::pocket] load text_conditioner: 17 ms
+[2026-11-08T20:57:45Z INFO  shtorm_engine::pocket] load flow_lm_main: 821 ms
+[2026-11-08T20:57:45Z INFO  shtorm_engine::pocket] load flow_lm_main: 825 ms
+[2026-11-08T20:57:45Z INFO  shtorm_engine::pocket] load flow_lm_flow: 117 ms
+[2026-11-08T20:57:45Z INFO  shtorm_engine::pocket] load flow_lm_flow: 121 ms
+[2026-11-08T20:57:46Z INFO  shtorm_engine::pocket] load mimi_decoder: 201 ms
+[2026-11-08T20:57:46Z INFO  shtorm_engine::pocket] load mimi_decoder: 204 ms
+  [1/3] готов
+  [2/3] готов
+  [3/3] готов
+WAV: out/a4_cpu_w2.wav (18.45 с: речь 16.66 с + паузы 1.80 с; чанков 3; 14.64 с генерации, RTF 0.793)
+пул: воркеров 2, base_seed 42, буфер переупорядочивания <= 2
+денойз: выключен

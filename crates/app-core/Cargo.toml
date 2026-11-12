@@ -1,0 +1,29 @@
+[package]
+name = "app-core"
+description = "Orchestration layer: settings, worker model, smoke/bench CLIs (no GUI yet)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+shtorm-engine = { path = "../shtorm-engine" }
+text-processing = { path = "../text-processing" }
+audio-processing = { path = "../audio-processing" }
+anyhow.workspace = true
+crossbeam-channel = "0.5"
+ndarray.workspace = true
+log.workspace = true
+env_logger.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+ctrlc = "3"
+# бинарям (smoke/bench) нужен ort напрямую: init + версия dylib.
+ort = { version = "=2.0.0-rc.11", default-features = false, features = ["load-dynamic"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }

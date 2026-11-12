@@ -1,0 +1,51 @@
+[package]
+name = "pockettts-gui-rust"
+description = "PocketTTS-GUI-Rust — нативный GUI (eframe/egui): форма, валидация, настройки, фоновый синтез (G2)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eframe = "0.31"
+egui = "0.31"
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+app-core = { path = "../app-core" }
+text-processing = { path = "../text-processing" }
+shtorm-engine = { path = "../shtorm-engine" }
+# инициализация ORT в процессе GUI (load-dynamic, ORT_DYLIB_PATH)
+ort = { version = "=2.0.0-rc.11", default-features = false, features = ["load-dynamic"] }
+
+[lib]
+name = "pockettts_gui_rust"
+path = "src/lib.rs"
+
+[[bin]]
+name = "PocketTTS-GUI-Rust"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+# G6.4: HWND живого окна для однократного размещения по рабочей области
+# монитора запуска (физические пиксели, per-monitor DPI).
+raw-window-handle = "0.6"
+windows-sys = { version = "0.59", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_System_JobObjects",
+    # G6.6: свободная RAM для адаптации CPU-пресетов
+    "Win32_System_SystemInformation",
+    # G6.2.3: MessageBoxW для ошибок CLI при запуске без stderr (GUI-подсистема)
+    "Win32_System_Console",
+    "Win32_UI_WindowsAndMessaging",
+    # G6.4: рабочая область монитора и per-monitor DPI
+    "Win32_Graphics_Gdi",
+    "Win32_UI_HiDpi",
+] }

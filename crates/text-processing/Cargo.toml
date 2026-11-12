@@ -1,0 +1,12 @@
+[package]
+name = "text-processing"
+description = "Text front-end: stress notation (+/U+0301), port of synthesis_worker.py helpers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+unicode-normalization.workspace = true
+fancy-regex = "0.13"
+serde.workspace = true
+serde_json = { version = "1", features = ["preserve_order"] }

@@ -1,0 +1,13 @@
+[package]
+name = "audio-processing"
+description = "Audio helpers: PCM16 WAV writing, silence, concatenation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+hound.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }

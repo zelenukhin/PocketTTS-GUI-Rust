@@ -1,0 +1,14 @@
+[2026-11-08T14:39:01Z INFO  smoke] ORT_DYLIB_PATH = C:\PocketTTS-GUI-Rust\ShtormTTS-Windows\deps\ort-cpu\onnxruntime-win-x64-1.23.2\lib\onnxruntime.dll
+[2026-11-08T14:39:01Z INFO  smoke] model_dir = C:\Users\<user>\Downloads\pocket_tts_android\build\onnx\ru-v2-slow
+[2026-11-08T14:39:01Z INFO  smoke] onnxruntime dylib loaded OK
+[2026-11-08T14:39:01Z INFO  shtorm_engine::pocket] load mimi_encoder: 292 ms
+[2026-11-08T14:39:01Z INFO  shtorm_engine::pocket] load text_conditioner: 48 ms
+[2026-11-08T14:39:02Z INFO  shtorm_engine::pocket] load flow_lm_main: 731 ms
+[2026-11-08T14:39:02Z INFO  shtorm_engine::pocket] load flow_lm_flow: 112 ms
+[2026-11-08T14:39:02Z INFO  shtorm_engine::pocket] load mimi_decoder: 170 ms
+model load: 1.36 s
+text (model notation): Стре́лки часо́в показы́вали по́лночь.
+chunk 0: 3.04 s audio in 4.84 s (RTF 1.591, 0.6x realtime), peak 0.553, samples 72960
+WAV: out/smoke_a2_cpu.wav (3.04 s, 1 chunks, суммарный RTF 1.591)
+process RAM: WS +507 MB (peak 1480 MB), private +500 MB
+GPU total VRAM: 646 -> 634 MB (Δ -12 MB)
