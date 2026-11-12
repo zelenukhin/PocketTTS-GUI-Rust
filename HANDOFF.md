@@ -36,7 +36,15 @@
   менялась; фактическое состояние — через журнал выполнения.
 - **Тесты**: +3 юнит (таблица planned_pockets 6 кейсов, vram_need_mb,
   summary_line). 291 passed / 0 failed; clippy 0; fmt OK; release EXE
-  собран. Portable не пересобирался; миграции/JSON не менялись.
+  собран. Миграции/JSON не менялись.
+- **Portable g671 собран** (после ручной приёмки G6.7.1):
+  `C:\PocketTTS-GUI-Rust\dist\PocketTTS-GUI-Rust-Portable-2026-11-12-g671`
+  — git `224052e` dirty=false, 60 файлов, 3611.2 MiB, exe SHA256
+  `28189F8D849CD42C12647BC24B880857673F85899680AB34D6D1B08E65FE6CC0`,
+  `-HardLinkPayload` (диск C: заполнен). Проверки из комплекта с CWD `C:\`:
+  portable-check OK (всё exe-relative); smoke g62_hybrid_smoke — ALL PASS
+  (fake 2×2 чанк-конвейер: 2 процесса, 4 воркера, 6/6, сирот 0). Реальный
+  CUDA-прогон и визуальная проверка GUI — за пользователем.
 
 ## G6.7 — что сделано (текущий этап)
 
