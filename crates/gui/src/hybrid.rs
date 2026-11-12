@@ -1334,6 +1334,10 @@ struct Dispatch {
     slots: Vec<Slot>,
     workers: Vec<WState>,
     wpc: usize,
+    /// G6.6: предел ОДНОВРЕМЕННО выполняемых файлов (F ≤ P×W). Все Pocket
+    /// процессов создаются; диспетчер просто не назначает файл сверх
+    /// предела, пока активные не завершатся.
+    max_active: usize,
     /// G6.2.1: состояние каждого процесса (Starting…Exited).
     proc: Vec<ProcState>,
     /// G6.2.1: предел инициализации процесса без готовых воркеров.
@@ -1346,7 +1350,7 @@ struct Dispatch {
 }
 
 impl Dispatch {
-    fn new(jobs: usize, children: usize, wpc: usize) -> Self {
+    fn new(jobs: usize, children: usize, wpc: usize, max_active: usize) -> Self {
         let mut workers = Vec::with_capacity(children * wpc);
         for c in 0..children {
             for w in 0..wpc {
@@ -1370,6 +1374,7 @@ impl Dispatch {
                 .collect(),
             workers,
             wpc,
+            max_active: max_active.max(1),
             proc: vec![ProcState::Starting; children],
             startup_timeout: CHILD_STARTUP_TIMEOUT,
             startup_deadline: vec![Instant::now() + CHILD_STARTUP_TIMEOUT; children],
@@ -1518,6 +1523,12 @@ impl Dispatch {
 
     fn try_assign(&mut self, widx: usize) -> Option<Action> {
         if self.cancelled || self.queue.is_empty() {
+            return None;
+        }
+        // G6.6: предел одновременных файлов — назначение сверх F не выдаётся,
+        // пока хотя бы один файл не завершится (FileFinished/worker death
+        // освобождают слот и вызывают try_assign повторно).
+        if self.workers.iter().filter(|w| w.busy.is_some()).count() >= self.max_active {
             return None;
         }
         let w = &mut self.workers[widx];
@@ -1791,6 +1802,9 @@ pub struct HybridDriver<'a> {
     /// возвращает ошибку, процесс классифицируется как неработоспособный.
     /// Боевой путь — ipc::WRITE_WAIT_TIMEOUT; тесты уменьшают.
     pub write_timeout: Duration,
+    /// G6.6: предел одновременных файлов F (боевой путь — из конфигурации
+    /// параллельной обработки; тесты используют P×W).
+    pub max_active_files: usize,
 }
 
 pub fn run_hybrid(d: &HybridDriver) -> Result<HybridOutcome> {
@@ -1876,7 +1890,12 @@ pub fn run_hybrid(d: &HybridDriver) -> Result<HybridOutcome> {
     drop(tx);
 
     // --- основной цикл диспетчеризации ---
-    let mut dispatch = Dispatch::new(d.params.jobs.len(), children, d.params.workers_per_child);
+    let mut dispatch = Dispatch::new(
+        d.params.jobs.len(),
+        children,
+        d.params.workers_per_child,
+        d.max_active_files,
+    );
     dispatch.set_startup_timeout(d.startup_timeout);
     // процесс, который не запустился, не может инициализироваться
     for (ci, p) in procs_map.iter().enumerate() {
@@ -2335,7 +2354,7 @@ mod tests {
     /// новые назначения; отчёты полные, фазы терминальны, очередь динамическая.
     #[test]
     fn dispatch_full_run() {
-        let mut d = Dispatch::new(5, 2, 2);
+        let mut d = Dispatch::new(5, 2, 2, usize::MAX);
         let mut assign_count = 0usize;
         let finish = |d: &mut Dispatch, ci: usize, w: usize, pos: usize| -> usize {
             let rep = report(pos, FileStatus::Completed);
@@ -2368,11 +2387,93 @@ mod tests {
         assert!(d.slots.iter().all(|s| s.phase == Phase::Done));
     }
 
+    /// G6.6: предел одновременных файлов F. Все 4 воркера 2×2 готовы, но
+    /// max_active=2 — назначений не больше 2, пока активные не завершатся;
+    /// все файлы в итоге выполняются ровно один раз.
+    #[test]
+    fn dispatch_max_active_files_limit() {
+        let mut d = Dispatch::new(6, 2, 2, 2);
+        // все воркеры готовы
+        for (ci, w) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+            let actions = d.on_event(ci, &Ev::Ready { worker: w });
+            let busy = d.workers.iter().filter(|x| x.busy.is_some()).count();
+            assert!(
+                busy <= 2,
+                "одновременных назначений {busy} > предела 2 (после Ready {ci}/{w})"
+            );
+            let _ = actions;
+        }
+        // ровно два файла назначены
+        assert_eq!(d.workers.iter().filter(|x| x.busy.is_some()).count(), 2);
+        // Idle свободного воркера не назначает файл сверх предела
+        let idle_w = d
+            .workers
+            .iter()
+            .enumerate()
+            .find(|(_, x)| x.busy.is_none())
+            .map(|(i, x)| (x.child, x.wid, i))
+            .expect("есть свободный воркер");
+        assert!(d
+            .on_event(idle_w.0, &Ev::Idle { worker: idle_w.1 })
+            .is_empty());
+        assert_eq!(d.workers.iter().filter(|x| x.busy.is_some()).count(), 2);
+        // завершение активного файла освобождает слот → новое назначение
+        let busy = d
+            .workers
+            .iter()
+            .find(|x| x.busy.is_some())
+            .expect("занятый воркер");
+        let (ci, wid, pos) = (busy.child, busy.wid, busy.busy.unwrap());
+        let actions = d.on_event(
+            ci,
+            &Ev::FileFinished {
+                worker: wid,
+                pos,
+                report: report(pos, FileStatus::Completed),
+            },
+        );
+        assert_eq!(actions.len(), 1, "завершение открыло новый слот");
+        assert_eq!(d.workers.iter().filter(|x| x.busy.is_some()).count(), 2);
+        // дожимаем все файлы — потерь/дублей нет
+        let mut guard = 0;
+        while !d.all_done() {
+            guard += 1;
+            assert!(guard < 100, "очередь не зависла");
+            let Some((ci, wid, pos)) = d
+                .workers
+                .iter()
+                .find(|x| x.busy.is_some())
+                .map(|x| (x.child, x.wid, x.busy.unwrap()))
+            else {
+                break;
+            };
+            d.on_event(
+                ci,
+                &Ev::FileFinished {
+                    worker: wid,
+                    pos,
+                    report: report(pos, FileStatus::Completed),
+                },
+            );
+        }
+        assert!(d.all_done());
+        let done: Vec<usize> = d
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.report.is_some())
+            .map(|(i, _)| i)
+            .collect();
+        let mut sorted = done.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![0, 1, 2, 3, 4, 5], "все файлы ровно один раз");
+    }
+
     /// Повторный FileFinished того же файла — протокольная аномалия: второй
     /// результат НЕ заменяет первый (двойной публикации нет), лог диагностирует.
     #[test]
     fn dispatch_duplicate_finish_ignored() {
-        let mut d = Dispatch::new(1, 1, 1);
+        let mut d = Dispatch::new(1, 1, 1, usize::MAX);
         d.on_event(0, &Ev::Ready { worker: 0 });
         d.on_event(
             0,
@@ -2404,7 +2505,7 @@ mod tests {
     /// диагнозом; очередь доделывает выживший; ни один файл не потерян.
     #[test]
     fn dispatch_child_death_fails_its_files_survivor_finishes() {
-        let mut d = Dispatch::new(4, 2, 1); // 2 процесса × 1 воркер
+        let mut d = Dispatch::new(4, 2, 1, usize::MAX); // 2 процесса × 1 воркер
         assert_eq!(d.on_event(0, &Ev::Ready { worker: 0 }).len(), 1); // файл 0 → proc0
         assert_eq!(d.on_event(1, &Ev::Ready { worker: 0 }).len(), 1); // файл 1 → proc1
                                                                       // процесс 1 погиб, не завершив файл 1
@@ -2464,7 +2565,7 @@ mod tests {
     /// до запуска»; уже назначенные завершаются воркерами по своей семантике.
     #[test]
     fn dispatch_cancel_stops_assignments() {
-        let mut d = Dispatch::new(4, 1, 2);
+        let mut d = Dispatch::new(4, 1, 2, usize::MAX);
         assert_eq!(d.on_event(0, &Ev::Ready { worker: 0 }).len(), 1);
         assert_eq!(d.on_event(0, &Ev::Ready { worker: 1 }).len(), 1);
         d.on_cancel();
@@ -2517,7 +2618,7 @@ mod tests {
     /// Failed, оставшиеся — Failed «воркеры завершились».
     #[test]
     fn dispatch_process_fatal_error() {
-        let mut d = Dispatch::new(2, 1, 1);
+        let mut d = Dispatch::new(2, 1, 1, usize::MAX);
         assert_eq!(d.on_event(0, &Ev::Ready { worker: 0 }).len(), 1);
         d.on_event(
             0,
@@ -2540,7 +2641,7 @@ mod tests {
     /// протоколу, воркер мёртв, файлы доделывает сосед.
     #[test]
     fn dispatch_single_worker_error_poisons_only_him() {
-        let mut d = Dispatch::new(4, 1, 2);
+        let mut d = Dispatch::new(4, 1, 2, usize::MAX);
         for w in 0..2 {
             assert_eq!(d.on_event(0, &Ev::Ready { worker: w }).len(), 1);
         }
@@ -2616,7 +2717,7 @@ mod tests {
     /// Все процессы погибли, файлы остались — явный Failed, а не молчание.
     #[test]
     fn dispatch_no_workers_remaining_fails_files() {
-        let mut d = Dispatch::new(2, 1, 1);
+        let mut d = Dispatch::new(2, 1, 1, usize::MAX);
         assert_eq!(d.on_event(0, &Ev::Ready { worker: 0 }).len(), 1);
         d.on_child_dead(0, "упал");
         d.fail_remaining_no_workers();
@@ -2878,6 +2979,7 @@ mod tests {
             watchdog: Duration::from_secs(60),
             startup_timeout: Duration::from_secs(60),
             write_timeout: Duration::from_secs(10),
+            max_active_files: 4,
         };
         let outcome = run_hybrid(&driver).expect("гибридный прогон");
         assert_eq!(outcome.reports.len(), 5);
@@ -2961,6 +3063,7 @@ mod tests {
             watchdog: Duration::from_secs(60),
             startup_timeout: Duration::from_secs(60),
             write_timeout: Duration::from_secs(10),
+            max_active_files: 4,
         };
         let outcome = run_hybrid(&driver).expect("прогон с отменой");
         let completed = outcome
@@ -3062,6 +3165,7 @@ mod tests {
                 watchdog: Duration::from_secs(60),
                 startup_timeout: Duration::from_secs(60),
                 write_timeout: Duration::from_secs(10),
+                max_active_files: 4,
             };
             run_hybrid(&driver)
         });
@@ -3200,6 +3304,7 @@ mod tests {
             watchdog: Duration::from_secs(60),
             startup_timeout: Duration::from_secs(60),
             write_timeout: Duration::from_secs(10),
+            max_active_files: 4,
         };
         let outcome = run_hybrid(&driver).expect("E2E-A");
         done.store(true, Ordering::SeqCst);
@@ -3279,6 +3384,7 @@ mod tests {
             watchdog: Duration::from_secs(60),
             startup_timeout: Duration::from_secs(60),
             write_timeout: Duration::from_secs(10),
+            max_active_files: 4,
         };
         let outcome = run_hybrid(&driver).expect("E2E-B");
         done.store(true, Ordering::SeqCst);
@@ -3377,6 +3483,7 @@ mod tests {
             watchdog: Duration::from_secs(60),
             startup_timeout: Duration::from_secs(60),
             write_timeout: Duration::from_secs(10),
+            max_active_files: 4,
         };
         let outcome = run_hybrid(&driver).expect("E2E-C");
         done.store(true, Ordering::SeqCst);
@@ -3458,6 +3565,7 @@ mod tests {
             watchdog: Duration::from_secs(60),
             startup_timeout: Duration::from_secs(60),
             write_timeout: Duration::from_secs(10),
+            max_active_files: 4,
         };
         let outcome = run_hybrid(&driver).expect("E2E-D");
         done.store(true, Ordering::SeqCst);
@@ -3634,6 +3742,7 @@ mod tests {
             watchdog: Duration::from_secs(10),
             startup_timeout: Duration::from_secs(10),
             write_timeout: Duration::from_secs(10),
+            max_active_files: 4,
         };
         let err = run_hybrid(&driver).expect_err("2×2 не должен стартовать");
         assert!(format!("{err:#}").contains("Job Object"));
@@ -3849,6 +3958,7 @@ mod tests {
             watchdog: Duration::from_secs(60),
             startup_timeout: Duration::from_secs(60),
             write_timeout: Duration::from_millis(300),
+            max_active_files: 4,
         };
         let t0 = Instant::now();
         let res = run_hybrid(&driver);
@@ -3960,6 +4070,7 @@ mod tests {
             watchdog: Duration::from_secs(60),
             startup_timeout: Duration::from_secs(60),
             write_timeout: Duration::from_millis(300),
+            max_active_files: 4,
         };
         let t0 = Instant::now();
         let outcome = run_hybrid(&driver).expect("M2: диспетчер восстанавливается");

@@ -355,7 +355,14 @@ fn portable_selftest_hybrid(args: &[String]) -> i32 {
     // Путь гибрида включается для пакетного CUDA; fake-движок GPU не трогает.
     s.device = DeviceChoice::Cuda;
     s.device_id = 0;
-    s.batch_cuda_mode = pockettts_gui_rust::settings::BatchCudaMode::MaxSpeed;
+    // G6.6: мультипроцесс 2×2 — производительная конфигурация CUDA
+    s.parallel_cuda = pockettts_gui_rust::settings::ParallelSettings {
+        profile: pockettts_gui_rust::settings::ParallelProfile::Productive,
+        processes: 2,
+        workers_per_process: 2,
+        max_concurrent_files: 4,
+        ort_threads: 4,
+    };
     s.clamped();
     let text = std::fs::read_to_string(resources::resolve_user_path(&s.text_file))
         .unwrap_or_else(|_| FALLBACK_TEXT.to_string());

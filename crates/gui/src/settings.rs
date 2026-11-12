@@ -162,10 +162,14 @@ pub struct GuiSettings {
     pub paragraph_pause_s: f32,
     pub max_tokens: u32,
     /// None = автомат по устройству (CPU 2 / CUDA 1), ручной выбор не
-    /// перезаписывается при смене устройства.
+    /// перезаписывается при смене устройства. G6.6: поле управляет ТОЛЬКО
+    /// воркерами чанков одиночного файла; пакетная обработка —
+    /// `parallel_cpu`/`parallel_cuda`.
     pub workers: Option<u32>,
-    /// G6.2: режим пакетного CUDA (экономичный 1×2 / гибрид 2×2).
-    pub batch_cuda_mode: BatchCudaMode,
+    /// G6.6: пакетная параллельная обработка CPU (независимо от CUDA).
+    pub parallel_cpu: ParallelSettings,
+    /// G6.6: пакетная параллельная обработка CUDA (независимо от CPU).
+    pub parallel_cuda: ParallelSettings,
     // Вывод
     pub format: OutputFormatChoice,
     pub mp3_preset: String,
@@ -243,33 +247,263 @@ pub enum DeviceChoice {
     Cuda,
 }
 
+// ============ G6.6: единая модель параллельной обработки CPU/CUDA ============
+
+/// G6.6: профиль параллельной обработки. Пресеты задают ПОЛНУЮ конфигурацию
+/// (P/W/F/T); ручная правка любого поля переводит профиль в `Custom`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ParallelProfile {
+    #[default]
+    Optimal,
+    Productive,
+    /// Ручная конфигурация (состояние, а не кнопка).
+    Custom,
+}
+
+impl ParallelProfile {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Optimal => "Оптимальный",
+            Self::Productive => "Производительный",
+            Self::Custom => "Свой",
+        }
+    }
+}
+
+/// G6.6: единая модель параллельной обработки пакетов для CPU и CUDA.
+///
+/// Определения (ТЗ G6.6):
+/// - `processes` — число ДОЧЕРНИХ рабочих процессов с Pocket (не считая
+///   GUI-диспетчер);
+/// - `workers_per_process` — постоянных Pocket (ONNX-сессий) в каждом
+///   рабочем процессе; воркер файлового пула = один Pocket;
+/// - `max_concurrent_files` — верхний предел ОДНОВРЕМЕННО обрабатываемых
+///   файлов; Pocket сверх этого предела не создаются (однопроцессный пул)
+///   либо не получают назначений (мультипроцессный диспетчер);
+/// - `ort_threads` — intra-op потоки ONNX Runtime на ОДНУ ONNX-сессию.
+///
+/// `total_pockets = processes × workers_per_process`;
+/// `active_files = min(max_concurrent_files, total_pockets, eligible_files)`.
+/// Процесс, Pocket и ORT-поток — разные понятия и не взаимозаменяемы.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ParallelSettings {
+    pub profile: ParallelProfile,
+    pub processes: u32,
+    pub workers_per_process: u32,
+    pub max_concurrent_files: u32,
+    pub ort_threads: u32,
+}
+
+impl Default for ParallelSettings {
+    /// Дефолт = пресет «Оптимальный» (значения исследований на
+    /// i7-6700K/RTX 3060; адаптация под ресурсы — при применении пресета).
+    fn default() -> Self {
+        Self {
+            profile: ParallelProfile::Optimal,
+            processes: 1,
+            workers_per_process: 2,
+            max_concurrent_files: 2,
+            ort_threads: 4,
+        }
+    }
+}
+
+/// Диапазоны процессов/воркеров по устройству (начальный безопасный
+/// диапазон ТЗ G6.6: CPU P 1..=4 / W 1..=4; CUDA P 1..=2 / W 1..=2,
+/// всего не более 4 Pocket).
+pub fn parallel_limits(device: DeviceChoice) -> (u32, u32) {
+    match device {
+        DeviceChoice::Cpu => (4, 4),
+        DeviceChoice::Cuda => (2, 2),
+    }
+}
+
+/// Оценка RAM одного CPU-воркера (Pocket, 5 ONNX-сессий), МБ — по замерам
+/// docs/CPU_BATCH_WORKERS_RESEARCH.md (Slow FP32 ~0.85–1 ГБ, INT8 ~0.5 ГБ).
+fn ram_per_worker_mb(precision: ModelPrecision) -> u64 {
+    match precision {
+        ModelPrecision::Fp32 => 1100,
+        ModelPrecision::Int8 => 700,
+    }
+}
+
+/// Свободная RAM системы, МБ (None — определить не удалось).
+pub fn available_ram_mb() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        let mut st: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        st.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        if unsafe { GlobalMemoryStatusEx(&mut st) } != 0 {
+            Some(st.ullAvailPhys / (1024 * 1024))
+        } else {
+            None
+        }
+    }
+    #[cfg(not(windows))]
+    None
+}
+
+impl ParallelSettings {
+    pub fn total_pockets(&self) -> u32 {
+        self.processes.saturating_mul(self.workers_per_process)
+    }
+
+    /// Зажим в жёсткие диапазоны устройства (валидация ТЗ G6.6 §10:
+    /// F ≤ P×W; CUDA — всего ≤4 Pocket; без переполнений).
+    pub fn clamp_for_device(&mut self, device: DeviceChoice) {
+        let (pmax, wmax) = parallel_limits(device);
+        self.processes = self.processes.clamp(1, pmax);
+        self.workers_per_process = self.workers_per_process.clamp(1, wmax);
+        if device == DeviceChoice::Cuda {
+            // CUDA: всего Pocket не более 4 (уменьшаем воркеров процесса)
+            while self.total_pockets() > 4 && self.workers_per_process > 1 {
+                self.workers_per_process -= 1;
+            }
+            if self.total_pockets() > 4 && self.processes > 1 {
+                self.processes = 1;
+            }
+        }
+        self.ort_threads = self.ort_threads.clamp(1, 16);
+        let pockets = self.total_pockets();
+        self.max_concurrent_files = self.max_concurrent_files.clamp(1, pockets);
+    }
+
+    pub fn clamped_for_device(mut self, device: DeviceChoice) -> Self {
+        self.clamp_for_device(device);
+        self
+    }
+
+    /// Компактная информационная строка фактической конфигурации.
+    pub fn summary_line(&self) -> String {
+        let p = if self.processes == 1 {
+            "процесс"
+        } else {
+            "процесса"
+        };
+        format!(
+            "{} {} · {} Pocket · до {} файлов · ORT {}",
+            self.processes,
+            p,
+            self.total_pockets(),
+            self.max_concurrent_files,
+            self.ort_threads
+        )
+    }
+
+    /// Пресет «Оптимальный» (баланс скорости, RAM/VRAM и времени первого
+    /// результата). CPU: 1 процесс, W = clamp(floor(logical/4), 1, 4) с
+    /// ограничением по свободной RAM (исследованное правило), T=4.
+    /// CUDA: 1×2, F=2, T=4 (проверенный экономичный режим G6.1).
+    pub fn preset_optimal(
+        device: DeviceChoice,
+        logical_cpus: usize,
+        precision: ModelPrecision,
+    ) -> Self {
+        match device {
+            DeviceChoice::Cpu => {
+                let mut w = (logical_cpus / 4).clamp(1, 4) as u32;
+                w = ram_limit_workers(w, available_ram_mb(), precision);
+                Self {
+                    profile: ParallelProfile::Optimal,
+                    processes: 1,
+                    workers_per_process: w,
+                    max_concurrent_files: w,
+                    ort_threads: 4,
+                }
+            }
+            DeviceChoice::Cuda => Self {
+                profile: ParallelProfile::Optimal,
+                processes: 1,
+                workers_per_process: 2,
+                max_concurrent_files: 2,
+                ort_threads: 4,
+            },
+        }
+    }
+
+    /// Пресет «Производительный» (приоритет общей скорости пакета).
+    /// CPU: 1 процесс × до 4 Pocket × T=1 (W = clamp(floor(logical/2), 2, 4),
+    /// ограничен RAM); CUDA: 2×2, F=4, T=4 (гибрид H22 P2B.3).
+    pub fn preset_productive(
+        device: DeviceChoice,
+        logical_cpus: usize,
+        precision: ModelPrecision,
+    ) -> Self {
+        match device {
+            DeviceChoice::Cpu => {
+                let mut w = (logical_cpus / 2).clamp(2, 4) as u32;
+                w = ram_limit_workers(w, available_ram_mb(), precision);
+                Self {
+                    profile: ParallelProfile::Productive,
+                    processes: 1,
+                    workers_per_process: w,
+                    max_concurrent_files: w,
+                    ort_threads: 1,
+                }
+            }
+            DeviceChoice::Cuda => Self {
+                profile: ParallelProfile::Productive,
+                processes: 2,
+                workers_per_process: 2,
+                max_concurrent_files: 4,
+                ort_threads: 4,
+            },
+        }
+    }
+
+    /// Профиль по совпадению с КАНОНИЧЕСКИМИ таблицами пресетов (ТЗ G6.6 §6,
+    /// значения исследований i7-6700K/RTX 3060). Используется только при
+    /// миграции старых конфигов; в GUI профиль меняется на «Свой» в момент
+    /// ручной правки поля и хранится как есть.
+    pub fn detect_profile(&self, device: DeviceChoice) -> ParallelProfile {
+        let canonical = |p: u32, w: u32, t: u32| {
+            self.processes == p
+                && self.workers_per_process == w
+                && self.max_concurrent_files == p * w
+                && self.ort_threads == t
+        };
+        match device {
+            DeviceChoice::Cpu => {
+                if canonical(1, 2, 4) {
+                    ParallelProfile::Optimal
+                } else if canonical(1, 4, 1) {
+                    ParallelProfile::Productive
+                } else {
+                    ParallelProfile::Custom
+                }
+            }
+            DeviceChoice::Cuda => {
+                if canonical(1, 2, 4) {
+                    ParallelProfile::Optimal
+                } else if canonical(2, 2, 4) {
+                    ParallelProfile::Productive
+                } else {
+                    ParallelProfile::Custom
+                }
+            }
+        }
+    }
+}
+
+/// Ограничить число воркеров доступной RAM (порог на воркера + запас 1.5 ГБ
+/// для GUI/ОС; минимум 1 — конфигурация не становится пустой).
+fn ram_limit_workers(requested: u32, free_mb: Option<u64>, precision: ModelPrecision) -> u32 {
+    let Some(free) = free_mb else {
+        return requested;
+    };
+    const RESERVE_MB: u64 = 1500;
+    let per = ram_per_worker_mb(precision);
+    let fit = free.saturating_sub(RESERVE_MB) / per;
+    requested.min(fit.max(1) as u32)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OutputFormatChoice {
     Wav,
     Mp3,
     Opus,
-}
-
-/// G6.2: режим пакетного синтеза CUDA. Экономичный — проверенный G6.1 пул
-/// 1 процесс × 2 воркера (~4.9 ГБ VRAM); «Максимум скорости» — гибрид
-/// 2 процесса × 2 постоянных воркера (~9.2 ГБ, по CUDA-P2B.3 быстрее всех).
-/// Выбор осознанный: по умолчанию экономичный, гибрид молча не включается.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum BatchCudaMode {
-    /// 1 процесс × 2 воркера (постоянный пул G6.1).
-    #[default]
-    Economy,
-    /// 2 процесса × 2 воркера (гибрид H22 из P2B.3; нужен префлайт VRAM).
-    MaxSpeed,
-}
-
-impl BatchCudaMode {
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::Economy => "Экономичный (1×2)",
-            Self::MaxSpeed => "Максимальная скорость (2×2)",
-        }
-    }
 }
 
 impl OutputFormatChoice {
@@ -337,7 +571,8 @@ impl Default for GuiSettings {
             paragraph_pause_s: 0.9,
             max_tokens: 50,
             workers: None,
-            batch_cuda_mode: BatchCudaMode::Economy,
+            parallel_cpu: ParallelSettings::default(),
+            parallel_cuda: ParallelSettings::default(),
             format: OutputFormatChoice::Wav,
             mp3_preset: "-V2 (Высокое)".into(),
             opus_preset: "opus 64k".into(),
@@ -400,6 +635,27 @@ impl GuiSettings {
         if let Some(w) = self.workers {
             self.workers = Some(w.clamp(1, 12));
         }
+        // G6.6: жёсткие диапазоны параллельной обработки по устройствам
+        self.parallel_cpu.clamp_for_device(DeviceChoice::Cpu);
+        self.parallel_cuda.clamp_for_device(DeviceChoice::Cuda);
+    }
+
+    /// G6.6: конфигурация пакетной параллельной обработки текущего
+    /// устройства (клампы применены в `clamped()`).
+    pub fn parallel_config(&self) -> ParallelSettings {
+        match self.device {
+            DeviceChoice::Cpu => self.parallel_cpu,
+            DeviceChoice::Cuda => self.parallel_cuda,
+        }
+    }
+
+    /// G6.6: записать конфигурацию устройства (CPU и CUDA независимы —
+    /// переключение устройства не сбрасывает ручной выбор другого).
+    pub fn set_parallel_config(&mut self, device: DeviceChoice, cfg: ParallelSettings) {
+        match device {
+            DeviceChoice::Cpu => self.parallel_cpu = cfg,
+            DeviceChoice::Cuda => self.parallel_cuda = cfg,
+        }
     }
 }
 
@@ -430,9 +686,52 @@ pub fn legacy_settings_path() -> PathBuf {
 pub fn load_settings(path: &Path) -> Result<GuiSettings> {
     let raw =
         std::fs::read_to_string(path).with_context(|| format!("прочитать {}", path.display()))?;
-    let s: GuiSettings =
+    let mut s: GuiSettings =
         serde_json::from_str(&raw).with_context(|| format!("разобрать {}", path.display()))?;
+    migrate_parallel_settings(&mut s, &raw);
     Ok(s)
+}
+
+/// G6.6: одноразовая миграция пакетной параллельной конфигурации из старых
+/// ключей G6.2/G6.1 (`batch_cuda_mode`, ручные `workers` + `threads`).
+/// Выполняется ТОЛЬКО когда в конфиге нет нового ключа `parallel_cuda`:
+/// повторные загрузки уже мигрированных/пользовательских настроек ничего не
+/// подменяют. Старые ключи не удаляются (unknown-key round-trip в `extra`).
+fn migrate_parallel_settings(s: &mut GuiSettings, raw: &str) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return; // повреждённый конфиг обрабатывается политикой вызывающего
+    };
+    if v.get("parallel_cuda").is_some() {
+        return;
+    }
+    let legacy_threads = v.get("threads").and_then(|t| t.as_u64()).unwrap_or(4) as u32;
+    let legacy_workers = v.get("workers").and_then(|w| w.as_u64()).map(|w| w as u32);
+    let max_speed = v.get("batch_cuda_mode").and_then(|m| m.as_str()) == Some("MaxSpeed");
+    s.parallel_cuda = if max_speed {
+        // прежний гибрид 2×2 → «Производительный» CUDA (та же топология)
+        ParallelSettings {
+            profile: ParallelProfile::Productive,
+            processes: 2,
+            workers_per_process: 2,
+            max_concurrent_files: 4,
+            ort_threads: legacy_threads.clamp(1, 16),
+        }
+    } else if let Some(w) = legacy_workers {
+        // прежний ручной выбор воркеров пула CUDA (Economy) — сохраняем
+        // выбор в пределах поддерживаемого диапазона (1..=2)
+        let w = w.clamp(1, 2);
+        ParallelSettings {
+            profile: ParallelProfile::Custom,
+            processes: 1,
+            workers_per_process: w,
+            max_concurrent_files: w,
+            ort_threads: legacy_threads.clamp(1, 16),
+        }
+    } else {
+        ParallelSettings::default()
+    };
+    s.parallel_cuda = s.parallel_cuda.clamped_for_device(DeviceChoice::Cuda);
+    s.parallel_cuda.profile = s.parallel_cuda.detect_profile(DeviceChoice::Cuda);
 }
 
 /// Эксклюзивная запись НОВОГО файла (`create_new`): занятое имя — отказ,
@@ -851,33 +1150,229 @@ mod tests {
         );
     }
 
-    /// G6.2: режим пакетного CUDA по умолчанию экономичный (гибрид — только
-    /// осознанный выбор), переживает round-trip, старый конфиг без ключа
-    /// читается как Economy.
+    /// G6.6: дефолт параллельной обработки — «Оптимальный» 1×2/F2/T4 для
+    /// обоих устройств; конфигурации CPU и CUDA независимы и переживают
+    /// round-trip; смена устройства не сбрасывает ручной выбор другого.
     #[test]
-    fn batch_cuda_mode_default_economy_and_round_trip() {
-        assert_eq!(
-            GuiSettings::default().batch_cuda_mode,
-            BatchCudaMode::Economy,
-            "гибрид 2×2 НЕ включается молча"
-        );
-        let d = tmpdir("hybrid_mode");
+    fn parallel_settings_default_independent_and_round_trip() {
+        let def = GuiSettings::default();
+        assert_eq!(def.parallel_cpu, ParallelSettings::default());
+        assert_eq!(def.parallel_cuda, ParallelSettings::default());
+        assert_eq!(def.parallel_cpu.profile, ParallelProfile::Optimal);
+        let d = tmpdir("par_rt");
         let p = d.join("s.json");
-        let s = GuiSettings {
-            batch_cuda_mode: BatchCudaMode::MaxSpeed,
+        let mut s = GuiSettings {
+            parallel_cuda: ParallelSettings {
+                profile: ParallelProfile::Productive,
+                processes: 2,
+                workers_per_process: 2,
+                max_concurrent_files: 4,
+                ort_threads: 4,
+            },
+            parallel_cpu: ParallelSettings {
+                profile: ParallelProfile::Custom,
+                processes: 2,
+                workers_per_process: 1,
+                max_concurrent_files: 2,
+                ort_threads: 4,
+            },
             ..Default::default()
         };
+        s.parallel_cpu = ParallelSettings {
+            profile: ParallelProfile::Custom,
+            processes: 2,
+            workers_per_process: 1,
+            max_concurrent_files: 2,
+            ort_threads: 4,
+        };
+        s.parallel_cuda = ParallelSettings {
+            profile: ParallelProfile::Custom,
+            processes: 1,
+            workers_per_process: 2,
+            max_concurrent_files: 2,
+            ort_threads: 3,
+        };
         save_settings(&s, &p).unwrap();
-        assert_eq!(
-            load_settings(&p).unwrap().batch_cuda_mode,
-            BatchCudaMode::MaxSpeed
-        );
+        let s2 = load_settings(&p).unwrap();
+        assert_eq!(s2.parallel_cuda, s.parallel_cuda, "CUDA round-trip");
+        assert_eq!(s2.parallel_cpu, s.parallel_cpu, "CPU round-trip");
+        // переключение устройства не трогает конфигурации
+        let s3 = GuiSettings {
+            device: DeviceChoice::Cuda,
+            ..s2
+        };
+        assert_eq!(s3.parallel_cpu, s2.parallel_cpu);
+        assert_eq!(s3.parallel_config(), s2.parallel_cuda);
+        // старый конфиг без новых ключей — дефолт «Оптимальный»
         std::fs::write(&p, r#"{"temperature": 0.4}"#).unwrap();
+        let s4 = load_settings(&p).unwrap();
+        assert_eq!(s4.parallel_cpu, ParallelSettings::default());
+        assert_eq!(s4.parallel_cuda, ParallelSettings::default());
+    }
+
+    /// G6.6: клампы по устройствам (CPU P/W ≤4; CUDA P/W ≤2 и всего ≤4
+    /// Pocket; F ≤ P×W; T ≤16).
+    #[test]
+    fn parallel_clamp_for_device_limits() {
+        let mut ps = ParallelSettings {
+            profile: ParallelProfile::Custom,
+            processes: 9,
+            workers_per_process: 8,
+            max_concurrent_files: 99,
+            ort_threads: 32,
+        };
+        ps.clamp_for_device(DeviceChoice::Cpu);
+        assert_eq!((ps.processes, ps.workers_per_process), (4, 4));
+        assert_eq!(ps.max_concurrent_files, 16);
+        assert_eq!(ps.ort_threads, 16);
+        let mut ps = ParallelSettings {
+            profile: ParallelProfile::Custom,
+            processes: 4,
+            workers_per_process: 4,
+            max_concurrent_files: 16,
+            ort_threads: 1,
+        };
+        ps.clamp_for_device(DeviceChoice::Cuda);
+        assert!(ps.total_pockets() <= 4, "CUDA: всего ≤4 Pocket");
+        assert_eq!(ps.max_concurrent_files, ps.total_pockets());
+        // F меньше P×W — легальная конфигурация, хранится как есть
+        let mut ps = ParallelSettings {
+            profile: ParallelProfile::Custom,
+            processes: 2,
+            workers_per_process: 2,
+            max_concurrent_files: 2,
+            ort_threads: 4,
+        };
+        ps.clamp_for_device(DeviceChoice::Cuda);
+        assert_eq!(ps.max_concurrent_files, 2);
+        assert_eq!(ps.total_pockets(), 4);
+        // clamped() затрагивает обе конфигурации
+        let mut s = GuiSettings::default();
+        s.parallel_cpu.processes = 77;
+        s.parallel_cuda.workers_per_process = 9;
+        s.clamped();
+        assert_eq!(s.parallel_cpu.processes, 4);
+        assert!(s.parallel_cuda.total_pockets() <= 4);
+    }
+
+    /// G6.6: пресеты (канонические значения ТЗ §6 при 8 логических CPU и
+    /// без RAM-ограничения — RAM-адаптация проверяется отдельно через
+    /// `ram_limit_workers`-поведение при None).
+    #[test]
+    fn parallel_presets_canonical_values() {
+        let logical = 8;
+        let fp32 = shtorm_engine::ModelPrecision::Fp32;
+        let cpu_opt = ParallelSettings::preset_optimal(DeviceChoice::Cpu, logical, fp32);
         assert_eq!(
-            load_settings(&p).unwrap().batch_cuda_mode,
-            BatchCudaMode::Economy,
-            "старый конфиг без ключа — экономичный режим"
+            (
+                cpu_opt.processes,
+                cpu_opt.workers_per_process,
+                cpu_opt.ort_threads
+            ),
+            (1, 2, 4)
         );
+        assert_eq!(cpu_opt.max_concurrent_files, cpu_opt.total_pockets());
+        assert_eq!(cpu_opt.profile, ParallelProfile::Optimal);
+        let cpu_prod = ParallelSettings::preset_productive(DeviceChoice::Cpu, logical, fp32);
+        assert_eq!(
+            (
+                cpu_prod.processes,
+                cpu_prod.workers_per_process,
+                cpu_prod.ort_threads
+            ),
+            (1, 4, 1)
+        );
+        let cuda_opt = ParallelSettings::preset_optimal(DeviceChoice::Cuda, logical, fp32);
+        assert_eq!(
+            (
+                cuda_opt.processes,
+                cuda_opt.workers_per_process,
+                cuda_opt.max_concurrent_files,
+                cuda_opt.ort_threads
+            ),
+            (1, 2, 2, 4)
+        );
+        let cuda_prod = ParallelSettings::preset_productive(DeviceChoice::Cuda, logical, fp32);
+        assert_eq!(
+            (
+                cuda_prod.processes,
+                cuda_prod.workers_per_process,
+                cuda_prod.max_concurrent_files,
+                cuda_prod.ort_threads
+            ),
+            (2, 2, 4, 4)
+        );
+        // малое число CPU не даёт бессмысленных воркеров
+        let small = ParallelSettings::preset_optimal(DeviceChoice::Cpu, 2, fp32);
+        assert_eq!(small.workers_per_process, 1);
+        // detect_profile по каноническим таблицам
+        assert_eq!(
+            ParallelSettings::default().detect_profile(DeviceChoice::Cpu),
+            ParallelProfile::Optimal
+        );
+        let prod = ParallelSettings {
+            profile: ParallelProfile::Productive,
+            processes: 2,
+            workers_per_process: 2,
+            max_concurrent_files: 4,
+            ort_threads: 4,
+        };
+        assert_eq!(
+            prod.detect_profile(DeviceChoice::Cuda),
+            ParallelProfile::Productive
+        );
+        assert_eq!(
+            prod.detect_profile(DeviceChoice::Cpu),
+            ParallelProfile::Custom,
+            "2×2 для CPU — не пресет"
+        );
+    }
+
+    /// G6.6: миграция старых конфигов G6.2/G6.1 (batch_cuda_mode/workers)
+    /// в parallel_cuda; повторная загрузка мигрированного файла ничего не
+    /// подменяет; прежний выбор пользователя не теряется.
+    #[test]
+    fn parallel_migration_from_legacy_batch_cuda() {
+        let d = tmpdir("par_mig");
+        let p = d.join("s.json");
+        // MaxSpeed (гибрид 2×2) → Производительный CUDA
+        std::fs::write(&p, r#"{"batch_cuda_mode": "MaxSpeed", "threads": 4}"#).unwrap();
+        let s = load_settings(&p).unwrap();
+        assert_eq!(s.parallel_cuda.profile, ParallelProfile::Productive);
+        assert_eq!(
+            (
+                s.parallel_cuda.processes,
+                s.parallel_cuda.workers_per_process
+            ),
+            (2, 2)
+        );
+        assert_eq!(s.parallel_cuda.max_concurrent_files, 4);
+        // Economy + ручные workers=1 → Custom 1×1 (выбор сохранён)
+        std::fs::write(&p, r#"{"batch_cuda_mode": "Economy", "workers": 1}"#).unwrap();
+        let s = load_settings(&p).unwrap();
+        assert_eq!(s.parallel_cuda.profile, ParallelProfile::Custom);
+        assert_eq!(s.parallel_cuda.workers_per_process, 1);
+        // Economy без workers → дефолт Оптимальный
+        std::fs::write(&p, r#"{"batch_cuda_mode": "Economy"}"#).unwrap();
+        let s = load_settings(&p).unwrap();
+        assert_eq!(s.parallel_cuda, ParallelSettings::default());
+        // мигрированный файл: повторная загрузка сохраняет пользовательские
+        // правки (parallel_cuda уже есть — миграция не выполняется)
+        std::fs::write(
+            &p,
+            r#"{"parallel_cuda": {"profile": "Custom", "processes": 1,
+                "workers_per_process": 1, "max_concurrent_files": 1,
+                "ort_threads": 2}, "batch_cuda_mode": "MaxSpeed"}"#,
+        )
+        .unwrap();
+        let s = load_settings(&p).unwrap();
+        assert_eq!(s.parallel_cuda.profile, ParallelProfile::Custom);
+        assert_eq!(s.parallel_cuda.workers_per_process, 1);
+        assert_eq!(s.parallel_cuda.ort_threads, 2);
+        // неизвестный ключ batch_cuda_mode пережил round-trip (extra)
+        save_settings(&s, &p).unwrap();
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(raw.contains("\"batch_cuda_mode\": \"MaxSpeed\""), "{raw}");
     }
 
     #[test]

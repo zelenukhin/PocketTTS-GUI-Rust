@@ -1205,10 +1205,6 @@ impl ShtormApp {
                 .open(Some(s.pauses_open))
                 .show(ui, |ui| {
                     let auto_workers = s.effective_workers();
-                    // G6.2: режим пакетного CUDA. Гибрид 2×2 включается ТОЛЬКО
-                    // осознанным выбором (дефолт — экономичный 1×2); выбор
-                    // сохраняется в настройках.
-                    let batch_cuda = s.batch && s.device == DeviceChoice::Cuda;
                     two_columns(
                         ui,
                         |ui| {
@@ -1245,42 +1241,15 @@ impl ShtormApp {
                                 ui.add(egui::DragValue::new(&mut s.threads).range(1..=16));
                             });
                             hint(ui, "intra-op, паритет с CLI --threads (по умолчанию 4)");
-                            if batch_cuda {
-                                combo_row(
-                                    ui,
-                                    "Пакетный CUDA:",
-                                    "batch_cuda_mode",
-                                    s.batch_cuda_mode.label(),
-                                    |ui| {
-                                        ui.selectable_value(
-                                            &mut s.batch_cuda_mode,
-                                            crate::settings::BatchCudaMode::Economy,
-                                            crate::settings::BatchCudaMode::Economy.label(),
-                                        );
-                                        ui.selectable_value(
-                                            &mut s.batch_cuda_mode,
-                                            crate::settings::BatchCudaMode::MaxSpeed,
-                                            crate::settings::BatchCudaMode::MaxSpeed.label(),
-                                        );
-                                    },
-                                );
-                                hint(
-                                    ui,
-                                    match s.batch_cuda_mode {
-                                        crate::settings::BatchCudaMode::Economy => {
-                                            "1 процесс × 2 постоянных воркера, ~4.9 ГБ VRAM — \
-                                         проверенный режим"
-                                        }
-                                        crate::settings::BatchCudaMode::MaxSpeed => {
-                                            "2 процесса × 2 постоянных воркера, ~9.2 ГБ VRAM: \
-                                         быстрее, но нужен запас свободной VRAM (префлайт; \
-                                         иначе — экономичный режим)"
-                                        }
-                                    },
-                                );
-                            }
                         },
                     );
+                    // G6.6: универсальный блок параллельной обработки каталога
+                    // (одинаковые поля/порядок/пресеты для CPU и CUDA;
+                    // устройства отличаются только диапазонами и оценкой
+                    // ресурсов).
+                    if s.batch {
+                        parallel_processing_block(ui, s);
+                    }
                 });
         header_clicked(&resp, &mut s.pauses_open);
         ui.add_space(8.0);
@@ -1656,6 +1625,175 @@ fn combo_row(
 /// Фиксированная ширина кнопки «Обзор…»: поле получает ровно остаток
 /// строки, поэтому длинный путь не выталкивает кнопку за пределы окна.
 const BROWSE_BUTTON_WIDTH: f32 = 92.0;
+
+/// G6.6: универсальный блок «Параллельная обработка» для каталога.
+/// Одинаковые поля/порядок/пресеты для CPU и CUDA; устройства отличаются
+/// только диапазонами (parallel_limits) и оценкой ресурсов. Кнопки пресетов
+/// задают ПОЛНУЮ конфигурацию (адаптация под CPU/RAM текущей машины);
+/// ручная правка любого поля переводит профиль в «Свой». Конфигурации CPU и
+/// CUDA хранятся независимо (parallel_cpu / parallel_cuda).
+fn parallel_processing_block(ui: &mut egui::Ui, s: &mut GuiSettings) {
+    use crate::settings::{parallel_limits, ParallelProfile, ParallelSettings};
+
+    let device = s.device;
+    let (pmax, wmax) = parallel_limits(device);
+    let mut cfg = s.parallel_config();
+    let logical = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8);
+    let precision = s.model.precision();
+
+    // правка поля: профиль → «Свой», значения зажимаются, F ≤ P×W
+    let edited = |cfg: &mut ParallelSettings| {
+        cfg.clamp_for_device(device);
+        cfg.profile = ParallelProfile::Custom;
+    };
+
+    ui.add_space(4.0);
+    ui.group(|ui| {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Параллельная обработка (каталог)").strong())
+                .on_hover_text(
+                    "Процесс — дочерний рабочий процесс с карманами Pocket (воркерами). \
+                 Воркер файлового пула = один Pocket (набор ONNX-сессий). \
+                 ORT-потоки — intra-op потоки одной ONNX-сессии; это разные вещи.",
+                );
+        });
+        ui.horizontal(|ui| {
+            ui.label("Профиль:");
+            let optimal = ui
+                .button("Оптимальный")
+                .on_hover_text("Баланс скорости, RAM/VRAM и времени первого результата");
+            let productive = ui
+                .button("Производительный")
+                .on_hover_text("Приоритет общей скорости пакетной обработки (больше ресурсов)");
+            if optimal.clicked() {
+                cfg = ParallelSettings::preset_optimal(device, logical, precision);
+            } else if productive.clicked() {
+                cfg = ParallelSettings::preset_productive(device, logical, precision);
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                secondary_label(ui, format!("Режим: {}", cfg.profile.label()));
+            });
+        });
+        // правки полей выполняются в копиях (две колонки — два замыкания);
+        // слияние и перевод профиля в «Свой» — после two_columns
+        let (mut processes, mut wpp) = (cfg.processes, cfg.workers_per_process);
+        let (mut files, mut threads_t) = (cfg.max_concurrent_files, cfg.ort_threads);
+        let mut left_changed = false;
+        let mut right_changed = false;
+        let pockets_for_files = cfg.total_pockets();
+        two_columns(
+            ui,
+            |ui| {
+                combo_row(
+                    ui,
+                    "Процессов:",
+                    "par_processes",
+                    &processes.to_string(),
+                    |ui| {
+                        for p in 1..=pmax {
+                            left_changed |= ui
+                                .selectable_value(&mut processes, p, p.to_string())
+                                .clicked();
+                        }
+                    },
+                );
+                combo_row(
+                    ui,
+                    "Воркеров на процесс:",
+                    "par_workers",
+                    &wpp.to_string(),
+                    |ui| {
+                        for w in 1..=wmax {
+                            left_changed |=
+                                ui.selectable_value(&mut wpp, w, w.to_string()).clicked();
+                        }
+                    },
+                );
+            },
+            |ui| {
+                combo_row(
+                    ui,
+                    "Одновременных файлов:",
+                    "par_files",
+                    &files.to_string(),
+                    |ui| {
+                        for f in 1..=pockets_for_files {
+                            right_changed |=
+                                ui.selectable_value(&mut files, f, f.to_string()).clicked();
+                        }
+                    },
+                )
+                .on_hover_text(
+                    "Верхний предел файлов, обрабатываемых одновременно. Pocket сверх \
+                     предела не создаются (однопроцессный пул) либо не получают \
+                     назначений (мультипроцессный диспетчер).",
+                );
+                combo_row(
+                    ui,
+                    "Потоков ORT:",
+                    "par_threads",
+                    &threads_t.to_string(),
+                    |ui| {
+                        for t in 1..=16u32 {
+                            right_changed |= ui
+                                .selectable_value(&mut threads_t, t, t.to_string())
+                                .clicked();
+                        }
+                    },
+                )
+                .on_hover_text(
+                    "Intra-op потоки ONNX Runtime на одну ONNX-сессию (Pocket). \
+                     Изменение потоков ORT может изменить побитовый результат синтеза.",
+                );
+            },
+        );
+        if left_changed || right_changed {
+            cfg.processes = processes;
+            cfg.workers_per_process = wpp;
+            cfg.max_concurrent_files = files;
+            cfg.ort_threads = threads_t;
+            edited(&mut cfg);
+        }
+        // компактная фактическая конфигурация + оценка ресурсов
+        ui.horizontal(|ui| {
+            secondary_label(ui, cfg.summary_line());
+            let pockets = cfg.total_pockets();
+            match device {
+                DeviceChoice::Cuda => {
+                    let need_gb =
+                        (pockets as f64 * 2.355 + if pockets > 2 { 1.5 } else { 0.9 }) / 1000.0;
+                    secondary_label(ui, format!("· ~{need_gb:.1} ГБ VRAM (оценка)"));
+                }
+                DeviceChoice::Cpu => {
+                    let per = match precision {
+                        shtorm_engine::ModelPrecision::Fp32 => 1.1,
+                        shtorm_engine::ModelPrecision::Int8 => 0.7,
+                    };
+                    secondary_label(
+                        ui,
+                        format!("· ~{:.1} ГБ RAM (приблизительно)", pockets as f64 * per),
+                    );
+                }
+            }
+        })
+        .response
+        .on_hover_text(
+            "Процессы = дочерние рабочие процессы с Pocket; воркер файлового пула = \
+             один Pocket; ORT — потоки одной ONNX-сессии. Одновременные файлы \
+             ограничивают параллельные задания, но не создают дополнительные Pocket.",
+        );
+        if cfg.ort_threads != 4 {
+            hint(
+                ui,
+                "Изменение потоков ORT может изменить побитовый результат синтеза",
+            );
+        }
+    });
+    // запись обратно в независимую конфигурацию устройства
+    s.set_parallel_config(device, cfg);
+}
 
 /// Ширины (поле, кнопка) для строки пути: сумма + отступ не превышает
 /// доступную ширину. Вынесено для юнит-теста адаптивности.
@@ -2937,7 +3075,13 @@ mod tests {
         app.settings.temperature = 0.65;
         app.settings.model = ModelChoice::Fast;
         app.settings.device = DeviceChoice::Cuda;
-        app.settings.batch_cuda_mode = crate::settings::BatchCudaMode::MaxSpeed;
+        app.settings.parallel_cuda = crate::settings::ParallelSettings {
+            profile: crate::settings::ParallelProfile::Productive,
+            processes: 2,
+            workers_per_process: 2,
+            max_concurrent_files: 4,
+            ort_threads: 4,
+        };
         app.settings.theme_dark = false;
         app.settings.pauses_open = false;
         // A6: неизвестный ключ не теряется автосохранением
@@ -2955,9 +3099,8 @@ mod tests {
         assert_eq!(reloaded.model, ModelChoice::Fast);
         assert_eq!(reloaded.device, DeviceChoice::Cuda);
         assert_eq!(
-            reloaded.batch_cuda_mode,
-            crate::settings::BatchCudaMode::MaxSpeed,
-            "A2: MaxSpeed 2×2 сохраняется"
+            reloaded.parallel_cuda, app.settings.parallel_cuda,
+            "A2: производительная конфигурация CUDA сохраняется"
         );
         assert!(!reloaded.theme_dark, "A3: тема сохраняется");
         assert!(!reloaded.pauses_open, "A3: свёртки сохраняются");

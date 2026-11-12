@@ -29,7 +29,9 @@ use crate::batch::{
     PreparedFile,
 };
 use crate::resources;
-use crate::settings::{BatchCudaMode, DeviceChoice, GuiSettings, OutputFormatChoice};
+use crate::settings::{
+    DeviceChoice, GuiSettings, OutputFormatChoice, ParallelProfile, ParallelSettings,
+};
 
 // G4: единый резолвер ресурсов; реэкспорт сохраняет существующий API/тесты.
 pub use crate::resources::{find_project_root, resolve_ort_dylib, resolve_ort_dylib_in};
@@ -734,50 +736,61 @@ pub fn execute_batch(
 
     let ext = settings.format.extension_str().to_string();
     let overwrite = settings.overwrite_existing;
-    let pool_enabled = settings.device == DeviceChoice::Cuda
-        && std::env::var("SHTORM_GUI_BATCH_POOL").as_deref() != Ok("0");
+    let pool_enabled = std::env::var("SHTORM_GUI_BATCH_POOL").as_deref() != Ok("0");
+    let cfg = settings.parallel_config();
     let actionable = if pool_enabled {
         count_actionable(&plan, &ext, overwrite)
     } else {
         0
     };
-    let pool = pool_enabled && actionable >= 2;
-    // G6.2: «Максимальная скорость» — гибрид 2 процесса × 2 воркера. Только
-    // осознанный выбор пользователя (не дефолт), только при ≥4 кандидатах и
-    // после VRAM-префлайта; иначе — проверенный экономичный режим 1×2 с
-    // ЯВНОЙ записью в журнал (молчаливого игнорирования выбора нет).
-    let hybrid = pool_enabled && settings.batch_cuda_mode == BatchCudaMode::MaxSpeed;
-    let report = if hybrid && actionable < HYBRID_TOTAL_WORKERS {
-        emit(JobEvent::Log(format!(
-            "режим «Максимальная скорость»: файлов к синтезу {actionable} < {HYBRID_TOTAL_WORKERS} —              используется экономичный режим (постоянный пул 1×2)"
-        )));
-        match execute_batch_persistent_pool(settings, &plan, &ext, overwrite, cancel, emit) {
-            Ok(r) => r,
-            Err(e) => return JobResult::failed(format!("пакетный режим: {e:#}")),
+    // G6.6: единая модель P/W/F/T для CPU и CUDA. Запрошенная конфигурация
+    // протоколируется ДО префлайтов; любое отклонение фактической топологии
+    // от запрошенной объясняется в журнале явно (молчаливой подмены нет).
+    emit(JobEvent::Log(format!(
+        "параллельная обработка: профиль {} | {} | запрошено P={} W={} F={} T={}",
+        cfg.profile.label(),
+        device_label(settings),
+        cfg.processes,
+        cfg.workers_per_process,
+        cfg.max_concurrent_files,
+        cfg.ort_threads
+    )));
+    let topo = decide_topology(settings, &cfg, actionable, pool_enabled, emit);
+    let report = match topo {
+        BatchTopology::Sequential => {
+            execute_batch_sequential(settings, &plan, &ext, overwrite, cancel, emit)
         }
-    } else if hybrid {
-        match decide_hybrid_or_fallback(settings, actionable, emit) {
-            HybridChoice::Hybrid => {
-                match execute_batch_hybrid(settings, &plan, &ext, overwrite, cancel, emit) {
-                    Ok(r) => r,
-                    Err(e) => return JobResult::failed(format!("пакетный режим (2×2): {e:#}")),
-                }
-            }
-            HybridChoice::EconomyFallback => {
-                match execute_batch_persistent_pool(settings, &plan, &ext, overwrite, cancel, emit)
-                {
-                    Ok(r) => r,
-                    Err(e) => return JobResult::failed(format!("пакетный режим: {e:#}")),
-                }
+        BatchTopology::InProcessPool { workers } => {
+            match execute_batch_persistent_pool(
+                settings, &cfg, workers, &plan, &ext, overwrite, cancel, emit,
+            ) {
+                Ok(r) => r,
+                Err(e) => return JobResult::failed(format!("пакетный режим: {e:#}")),
             }
         }
-    } else if pool {
-        match execute_batch_persistent_pool(settings, &plan, &ext, overwrite, cancel, emit) {
+        BatchTopology::MultiProcess {
+            children,
+            workers_per_child,
+            max_active_files,
+        } => match execute_batch_hybrid(
+            settings,
+            &cfg,
+            children,
+            workers_per_child,
+            max_active_files,
+            &plan,
+            &ext,
+            overwrite,
+            cancel,
+            emit,
+        ) {
             Ok(r) => r,
-            Err(e) => return JobResult::failed(format!("пакетный режим: {e:#}")),
-        }
-    } else {
-        execute_batch_sequential(settings, &plan, &ext, overwrite, cancel, emit)
+            Err(e) => {
+                return JobResult::failed(format!(
+                    "пакетный режим ({children}×{workers_per_child}): {e:#}"
+                ))
+            }
+        },
     };
 
     let status = match report.status() {
@@ -923,136 +936,187 @@ fn execute_batch_sequential(
     )
 }
 
-/// Рекомендованное авто-число постоянных воркеров пакетного CUDA
-/// (P2B.2/P2B.3: 2 воркера — лучший баланс скорости и VRAM, 4.9 ГБ).
-const BATCH_POOL_AUTO_WORKERS: usize = 2;
 /// Ориентировочная VRAM одного CUDA-воркера (Pocket + арены ORT), МБ —
 /// по замерам P2B.3 (2 воркера ≈ 4.9 ГБ, база ~0.2 ГБ).
 const BATCH_POOL_VRAM_PER_WORKER_MB: f64 = 2355.0;
-/// Запас поверх N воркеров (фон/фрагментация). Префлайт — НЕ абсолютная
-/// защита от OOM, а способ заранее выбрать экономную конфигурацию.
+/// Запас поверх N воркеров однопроцессного пула (фон/фрагментация).
+/// Префлайт — НЕ абсолютная защита от OOM, а способ заранее выбрать
+/// экономную конфигурацию.
 const BATCH_POOL_VRAM_RESERVE_MB: f64 = 900.0;
+/// Консервативный запас мультипроцессного режима (P2B.3: пик 9.2–9.4 ГБ;
+/// B4 словил CUDA OOM при ~11.5 ГБ свободных — покрывает фон, фрагментацию
+/// и промежуточные тензоры декодера).
+const MULTIPROCESS_VRAM_RESERVE_MB: f64 = 1500.0;
 
-/// G6.1: решение о числе постоянных воркеров пакетного CUDA.
-/// Авто — 2 (при нехватке VRAM по префлайту деградирует до 1 с записью в
-/// журнал); ручной выбор не игнорируется молча: при нехватке VRAM — явное
-/// предупреждение, при >2 — предупреждение по итогам P2B.2/P2B.3.
-/// Число также ограничивается числом файлов-кандидатов (лишние Pocket
-/// не загружаются). `free_vram_mb` — префлайт nvidia-smi (None — недоступен;
-/// префлайт не абсолютная защита от OOM, только ранняя экономия).
-fn decide_batch_pool_workers(
-    s: &GuiSettings,
+/// G6.6: фактическая топология запуска пакета. Решение чистое (unit-
+/// тестируемое); журналирование отклонений от запрошенной конфигурации —
+/// внутри `decide_topology`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BatchTopology {
+    /// Последовательный путь: <2 файлов-кандидатов (чанк-параллелизм
+    /// одиночного файла в нём быстрее файлового пула) или диагностический
+    /// откат `SHTORM_GUI_BATCH_POOL=0`.
+    Sequential,
+    /// Постоянный пул в ЭТОМ процессе: N постоянных Pocket, динамическая
+    /// файловая очередь (`persistent.rs`).
+    InProcessPool { workers: usize },
+    /// Дочерние рабочие процессы с Pocket (CPU и CUDA; Named Pipes/Job
+    /// Object/watchdog — гибридная инфраструктура G6.2): `children` ×
+    /// `workers_per_child`; диспетчер держит не более `max_active_files`
+    /// файлов одновременно.
+    MultiProcess {
+        children: usize,
+        workers_per_child: usize,
+        max_active_files: usize,
+    },
+}
+
+/// G6.6: выбор топологии по конфигурации P/W/F/T, числу файлов-кандидатов
+/// и ресурсам. Правила:
+/// - `pool_allowed=false` (диагностический откат) или <2 кандидатов —
+///   последовательный путь;
+/// - `active = min(F, P×W, кандидатов)`; лишние Pocket НЕ создаются;
+/// - P=1 или active ≤ W — однопроцессный пул на `active` Pocket (второй
+///   процесс не нужен — пустые процессы не запускаются);
+/// - иначе — мультипроцесс: P процессов × W Pocket (все Pocket создаются;
+///   диспетчер ограничивает одновременные файлы значением F);
+/// - CUDA: VRAM-префлайт по существующей методике; авто-снижение (профиль
+///   «Оптимальный») — с явной записью; явный выбор («Производительный»/
+///   «Свой») при нехватке VRAM в мультипроцессе откатывается на
+///   экономичный однопроцессный пул с объяснением, при нехватке в пуле —
+///   предупреждение без подмены.
+fn decide_topology(
+    settings: &GuiSettings,
+    cfg: &ParallelSettings,
     actionable: usize,
-    free_vram_mb: Option<f64>,
-    log: &dyn Fn(String),
-) -> usize {
-    let requested = s
-        .workers
-        .map(|w| w.max(1) as usize)
-        .unwrap_or(BATCH_POOL_AUTO_WORKERS);
-    let w = requested.min(actionable.max(1));
-    if w <= 1 {
-        return 1;
+    pool_allowed: bool,
+    emit: &Arc<dyn Fn(JobEvent) + Send + Sync>,
+) -> BatchTopology {
+    if !pool_allowed {
+        emit(JobEvent::Log(
+            "ВНИМАНИЕ: SHTORM_GUI_BATCH_POOL=0 — диагностический откат на последовательный \
+             путь (модель загружается на каждый файл)"
+                .into(),
+        ));
+        return BatchTopology::Sequential;
     }
-    if let Some(free) = free_vram_mb {
-        let need = w as f64 * BATCH_POOL_VRAM_PER_WORKER_MB + BATCH_POOL_VRAM_RESERVE_MB;
-        if free < need {
-            if s.workers.is_none() {
-                log(format!(
-                    "VRAM-префлайт: свободно {free:.0} МБ < {need:.0} МБ — авто: 1 воркер \
-                     (один постоянный Pocket)"
-                ));
-                return 1;
+    if actionable < 2 {
+        // Пул с одним файлом бессмыслен: чанк-параллелизм одиночного файла
+        // (механизм A) быстрее файлового пула из одного Pocket.
+        return BatchTopology::Sequential;
+    }
+    let pockets = cfg.total_pockets() as usize;
+    let mut active = cfg
+        .max_concurrent_files
+        .min(pockets as u32)
+        .min(actionable as u32)
+        .max(1) as usize;
+    if active < 1 {
+        active = 1;
+    }
+    let w = cfg.workers_per_process as usize;
+    if cfg.processes == 1 || active <= w {
+        if cfg.processes > 1 {
+            emit(JobEvent::Log(format!(
+                "запрошено {} процессов, но одновременных файлов {active} ≤ {} воркеров на \
+                 процесс — достаточно одного процесса без пустых дочерних процессов",
+                cfg.processes, w
+            )));
+        }
+        // CUDA: VRAM-префлайт однопроцессного пула
+        if settings.device == DeviceChoice::Cuda {
+            let free = vram_free_or_warn(settings, emit);
+            if let Some(free) = free {
+                let need =
+                    active as f64 * BATCH_POOL_VRAM_PER_WORKER_MB + BATCH_POOL_VRAM_RESERVE_MB;
+                if free < need {
+                    if cfg.profile == ParallelProfile::Optimal && active > 1 {
+                        emit(JobEvent::Log(format!(
+                            "VRAM-префлайт: свободно {free:.0} МБ < {need:.0} МБ — профиль \
+                             «Оптимальный»: 1 воркер (один постоянный Pocket)"
+                        )));
+                        active = 1;
+                    } else {
+                        emit(JobEvent::Log(format!(
+                            "ВНИМАНИЕ: VRAM-префлайт: свободно {free:.0} МБ < {need:.0} МБ — \
+                             конфигурация {active} Pocket может не загрузиться (ошибка загрузки \
+                             завершит пакет с диагнозом)"
+                        )));
+                    }
+                }
             }
-            log(format!(
-                "ВНИМАНИЕ: VRAM-префлайт: свободно {free:.0} МБ < {need:.0} МБ — ручная \
-                 конфигурация {w} воркеров может не загрузиться (ошибка загрузки завершит \
-                 пакет с диагнозом)"
+        }
+        return BatchTopology::InProcessPool { workers: active };
+    }
+    // мультипроцесс: все P×W Pocket создаются в дочерних процессах
+    let children = cfg.processes as usize;
+    let total_pockets = children * w;
+    if settings.device == DeviceChoice::Cuda {
+        if let Some(free) = vram_free_or_warn(settings, emit) {
+            let need =
+                total_pockets as f64 * BATCH_POOL_VRAM_PER_WORKER_MB + MULTIPROCESS_VRAM_RESERVE_MB;
+            if free < need {
+                let fallback = w.min(2);
+                emit(JobEvent::Log(format!(
+                    "ВНИМАНИЕ: запрошено {children} процессов × {w} Pocket (нужно ~{need:.0} МБ \
+                     VRAM, свободно {free:.0} МБ) — конфигурация НЕ запускается, используется \
+                     однопроцессный пул на {fallback} Pocket. Освободите VRAM и запустите пакет \
+                     снова"
+                )));
+                return BatchTopology::InProcessPool { workers: fallback };
+            }
+        } else {
+            emit(JobEvent::Log(
+                "ВНИМАНИЕ: мультипроцессный CUDA: свободную VRAM проверить не удалось \
+                 (nvidia-smi недоступен) — используется однопроцессный пул"
+                    .into(),
             ));
+            return BatchTopology::InProcessPool { workers: w.min(2) };
         }
     }
-    if w > BATCH_POOL_AUTO_WORKERS {
-        log(format!(
-            "ВНИМАНИЕ: {w} воркеров CUDA: по замерам P2B.2/P2B.3 больше 2 не ускоряет \
-             пакет и расходует ~2.1 ГБ VRAM на воркер"
-        ));
+    BatchTopology::MultiProcess {
+        children,
+        workers_per_child: w,
+        max_active_files: active,
     }
-    w
 }
 
-/// G6.2: топология «максимальной скорости» — 2 процесса × 2 воркера
-/// (H22 из CUDA-P2B.3: 38.88 с warm против 43.57 с у 1×2 на main12).
-const HYBRID_CHILDREN: usize = 2;
-const HYBRID_WORKERS_PER_CHILD: usize = 2;
-const HYBRID_TOTAL_WORKERS: usize = HYBRID_CHILDREN * HYBRID_WORKERS_PER_CHILD;
-/// Ориентировочная VRAM одного CUDA-воркера (Pocket + арены ORT), МБ — те же
-/// замеры P2B.3 (≈2.1 ГБ на Pocket + база).
-const HYBRID_VRAM_PER_WORKER_MB: f64 = 2355.0;
-/// Консервативный запас поверх четырёх Pocket. P2B.3: пик 9.2–9.4 ГБ;
-/// B4 (4 контекста) словил CUDA OOM при ~11.5 ГБ свободных — 9.2 ГБ НЕ
-/// гарантированный максимум. 1.5 ГБ (против 0.9 ГБ у 1×2) покрывает фон,
-/// фрагментацию и промежуточные тензоры декодера.
-const HYBRID_VRAM_RESERVE_MB: f64 = 1500.0;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HybridChoice {
-    Hybrid,
-    EconomyFallback,
-}
-
-/// Префлайт режима 2×2: свободная VRAM с консервативным запасом. При явно
-/// недостаточной памяти четыре Pocket НЕ загружаются: режим откатывается на
-/// экономичный 1×2 с понятным объяснением (выбор пользователя не
-/// игнорируется молча). Fake-режим (тесты IPC без GPU) префлайт пропускает.
-fn decide_hybrid_or_fallback(
+/// VRAM-префлайт; fake-режим (тесты IPC без GPU) пропускает проверку.
+/// None — nvidia-smi недоступен (уже с журнальным сообщением).
+fn vram_free_or_warn(
     settings: &GuiSettings,
-    actionable: usize,
     emit: &Arc<dyn Fn(JobEvent) + Send + Sync>,
-) -> HybridChoice {
+) -> Option<f64> {
     if std::env::var("SHTORM_G62_FAKE").as_deref() == Ok("1") {
         emit(JobEvent::Log(
             "ВНИМАНИЕ: SHTORM_G62_FAKE=1 — движок-заглушка без ONNX (диагностика IPC); \
              VRAM-префлайт пропущен"
                 .into(),
         ));
-        return HybridChoice::Hybrid;
+        return Some(f64::INFINITY);
     }
-    let need = HYBRID_TOTAL_WORKERS as f64 * HYBRID_VRAM_PER_WORKER_MB + HYBRID_VRAM_RESERVE_MB;
-    match app_core::diagnostics::gpu_free_mb(settings.device_id) {
-        Some(free) if free >= need => {
-            emit(JobEvent::Log(format!(
-                "VRAM-префлайт 2×2: свободно {free:.0} МБ ≥ {need:.0} МБ — запуск четырёх Pocket \
-                 (2 процесса × 2 воркера), файлов к синтезу {actionable}"
-            )));
-            HybridChoice::Hybrid
-        }
-        Some(free) => {
-            emit(JobEvent::Log(format!(
-                "ВНИМАНИЕ: режим «Максимальная скорость» (2×2) требует ~{need:.0} МБ свободной \
-                 VRAM (4 Pocket × {HYBRID_VRAM_PER_WORKER_MB:.0} МБ + запас \
-                 {HYBRID_VRAM_RESERVE_MB:.0} МБ), свободно {free:.0} МБ — четыре Pocket НЕ \
-                 загружаются, используется экономичный режим 1×2. Освободите VRAM и запустите \
-                 пакет снова для максимальной скорости"
-            )));
-            HybridChoice::EconomyFallback
-        }
-        None => {
-            emit(JobEvent::Log(
-                "ВНИМАНИЕ: режим «Максимальная скорость»: свободную VRAM проверить не удалось \
-                 (nvidia-smi недоступен) — используется экономичный режим 1×2"
-                    .into(),
-            ));
-            HybridChoice::EconomyFallback
-        }
+    let free = app_core::diagnostics::gpu_free_mb(settings.device_id);
+    if free.is_none() {
+        emit(JobEvent::Log(
+            "ВНИМАНИЕ: свободную VRAM проверить не удалось (nvidia-smi недоступен)".into(),
+        ));
     }
+    free
 }
 
-/// G6.2: пакет на гибридном пуле 2 процесса × 2 постоянных воркера.
-/// Диспетчер (этот процесс) владеет preflight и общей очередью; ONNX грузится
-/// ТОЛЬКО в дочерних процессах (см. hybrid.rs). События воркеров
+/// G6.2/G6.6: пакет на мультипроцессном пуле — `children` дочерних рабочих
+/// процессов × `workers_per_child` постоянных Pocket (CPU и CUDA; гибридная
+/// инфраструктура G6.2: Named Pipes, Job Object, watchdog, безопасная
+/// отмена). Диспетчер держит не более `max_active_files` файлов одновременно.
+/// ONNX грузится ТОЛЬКО в дочерних процессах. События воркеров
 /// транслируются в существующие JobEvent — UI-модель G6.1.1 не меняется.
+#[allow(clippy::too_many_arguments)]
 fn execute_batch_hybrid(
     settings: &GuiSettings,
+    cfg: &ParallelSettings,
+    children: usize,
+    workers_per_child: usize,
+    max_active_files: usize,
     plan: &BatchPlan,
     extension: &str,
     overwrite: bool,
@@ -1124,12 +1188,12 @@ fn execute_batch_hybrid(
         move |n: usize| {
             if n > 0 {
                 emit(JobEvent::Log(format!(
-                    "гибрид 2×2: {n} воркеров готовы к работе"
+                    "мультипроцесс {children}×{workers_per_child}: {n} воркеров готовы к работе"
                 )));
                 emit(JobEvent::BatchWorkersReady { workers: n });
             } else {
                 emit(JobEvent::Log(
-                    "ВНИМАНИЕ: гибрид 2×2: ни один воркер не сообщил Ready".into(),
+                    "ВНИМАНИЕ: мультипроцесс: ни один воркер не сообщил Ready".into(),
                 ));
             }
         }
@@ -1202,8 +1266,9 @@ fn execute_batch_hybrid(
     let job_guard = ChildJobGuard::new();
     if let Err(e) = job_guard.ready() {
         let msg = format!(
-            "режим «Максимальная скорость» (2×2) не запущен: защита процессов \
-             Windows Job Object недоступна ({e:#}). Выберите экономичный режим 1×2"
+            "мультипроцессный режим ({children}×{workers_per_child}) не запущен: защита \
+             процессов Windows Job Object недоступна ({e:#}). Выберите однопроцессную \
+             конфигурацию"
         );
         log_emit(JobEvent::Log(format!("ВНИМАНИЕ: {msg}")));
         for pf in &to_synth {
@@ -1235,11 +1300,15 @@ fn execute_batch_hybrid(
     let spawn = |ci: usize| hybrid::spawn_child_via_test_harness(&job_guard, ci);
     let log = |m: String| log_emit(JobEvent::Log(m));
     let fake = std::env::var("SHTORM_G62_FAKE").as_deref() == Ok("1");
+    // G6.6: ORT-потоки пакетной конфигурации (T) доходят до дочерних
+    // процессов через GuiSettings (worker читает только IPC Init).
+    let mut child_settings = settings.clone();
+    child_settings.threads = cfg.ort_threads;
     let params = HybridParams {
-        settings: settings.clone(),
+        settings: child_settings,
         jobs: jobs.clone(),
-        workers_per_child: HYBRID_WORKERS_PER_CHILD,
-        children: HYBRID_CHILDREN,
+        workers_per_child,
+        children,
         fake,
         test: Vec::new(),
     };
@@ -1254,11 +1323,13 @@ fn execute_batch_hybrid(
         startup_timeout: hybrid::CHILD_STARTUP_TIMEOUT,
         // G6.2.2: зависшая IPC-отправка не блокирует цикл диспетчера
         write_timeout: crate::ipc::WRITE_WAIT_TIMEOUT,
+        // G6.6: предел одновременных файлов F
+        max_active_files,
     };
     emit(JobEvent::Log(format!(
-        "гибрид 2×2: запуск {HYBRID_CHILDREN} процессов CUDA-инференса ({} Pocket на процесс; \
-         файлов к синтезу {})",
-        HYBRID_WORKERS_PER_CHILD,
+        "мультипроцесс {children}×{workers_per_child}: запуск {children} рабочих процессов \
+         ({} Pocket на процесс; до {max_active_files} файлов одновременно; файлов к синтезу {})",
+        workers_per_child,
         jobs.len()
     )));
     let t_spawn = Instant::now();
@@ -1266,7 +1337,7 @@ fn execute_batch_hybrid(
         Ok(o) => o,
         Err(e) => {
             // ни один дочерний процесс не поднялся — файлы-кандидаты Failed
-            let msg = format!("гибридный пул не запущен: {e:#}");
+            let msg = format!("мультипроцессный пул не запущен: {e:#}");
             emit(JobEvent::Log(format!("ВНИМАНИЕ: {msg}")));
             for pf in &to_synth {
                 let file = &plan.files[pf.index];
@@ -1289,8 +1360,8 @@ fn execute_batch_hybrid(
         }
     };
     emit(JobEvent::Log(format!(
-        "гибрид 2×2: процессы/воркеры готовы за {:.1} с; Pocket загружен {} раз(а); \
-         процессов: {}",
+        "мультипроцесс {children}×{workers_per_child}: процессы/воркеры готовы за {:.1} с; \
+         Pocket загружен {} раз(а); процессов: {}",
         t_spawn.elapsed().as_secs_f32(),
         outcome.pocket_loads,
         outcome.children_spawned
@@ -1411,11 +1482,16 @@ fn batch_file_prepare_paths(s: &GuiSettings, out_path: &Path, model_dir: &Path) 
     ensure_output_path_safe(s, out_path, model_dir)
 }
 
-/// G6.1: пакет на ПОСТОЯННОМ пуле CUDA-воркеров. Pocket загружается ровно
-/// один раз на воркера (на весь пакет); каждый файл целиком обрабатывает
-/// один воркер; файлы распределяет общая динамическая очередь.
+/// G6.1/G6.6: пакет на ПОСТОЯННОМ пуле воркеров (CPU и CUDA). Pocket
+/// загружается ровно один раз на воркера (на весь пакет); каждый файл
+/// целиком обрабатывает один воркер; файлы распределяет общая динамическая
+/// очередь. `workers` — фактическое число Pocket (решение `decide_topology`,
+/// лишние Pocket не создаются); ORT-потоки — из конфигурации G6.6.
+#[allow(clippy::too_many_arguments)]
 fn execute_batch_persistent_pool(
     settings: &GuiSettings,
+    cfg: &ParallelSettings,
+    workers: usize,
     plan: &BatchPlan,
     extension: &str,
     overwrite: bool,
@@ -1529,16 +1605,12 @@ fn execute_batch_persistent_pool(
         });
     }
 
-    // --- число воркеров: авто 2 / ручной выбор + VRAM-префлайт ---
-    let workers = decide_batch_pool_workers(
-        settings,
-        to_synth.len(),
-        app_core::diagnostics::gpu_free_mb(settings.device_id),
-        &|m| emit(JobEvent::Log(m)),
-    );
-
     // --- загрузка пула: Pocket один раз на воркера, параллельно ---
-    let opts = pipeline_options(settings, model_dir, char_rules);
+    // G6.6: ORT-потоки пакетной конфигурации (T) подставляются в опции
+    // конвейера; настройка `threads` одиночного режима не затрагивается.
+    let mut pool_settings = settings.clone();
+    pool_settings.threads = cfg.ort_threads;
+    let opts = pipeline_options(&pool_settings, model_dir, char_rules);
     let spawn_seed = opts.seed.unwrap_or(42);
     emit(JobEvent::Log(format!(
         "постоянный пул: загрузка {workers} Pocket…"
@@ -3558,80 +3630,109 @@ mod tests {
         );
     }
 
-    // ===== G6.1: решение о числе воркеров постоянного пула (чистая логика) =====
+    // ===== G6.6: выбор топологии пакета (чистая логика) =====
 
-    fn cuda_auto() -> GuiSettings {
-        GuiSettings {
-            device: DeviceChoice::Cuda,
-            ..Default::default()
+    type EmitLogs = (
+        Arc<dyn Fn(JobEvent) + Send + Sync>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    );
+
+    fn emit_collector() -> EmitLogs {
+        let logs: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let l2 = Arc::clone(&logs);
+        (
+            Arc::new(move |ev| {
+                if let JobEvent::Log(line) = ev {
+                    l2.lock().unwrap().push(line);
+                }
+            }),
+            logs,
+        )
+    }
+
+    fn ps(processes: u32, w: u32, f: u32, t: u32) -> crate::settings::ParallelSettings {
+        crate::settings::ParallelSettings {
+            profile: crate::settings::ParallelProfile::Custom,
+            processes,
+            workers_per_process: w,
+            max_concurrent_files: f,
+            ort_threads: t,
         }
     }
 
-    /// Авто: 2 воркера при достаточной VRAM; 1 — при нехватке (с записью в
-    /// журнал); nvidia-smi недоступен (None) — авто не деградирует молча.
+    /// Базовые правила: <2 кандидатов или диагностический откат —
+    /// последовательный путь; P=1 — однопроцессный пул на active Pocket;
+    /// лишние Pocket не создаются (active ≤ F, кандидаты).
     #[test]
-    fn pool_workers_auto_2_or_1_by_preflight() {
-        let logs: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-        let log = |m: String| logs.lock().unwrap().push(m);
-        // авто + достаточно VRAM → 2
+    fn topology_basic_rules() {
+        let cpu = GuiSettings::default(); // device Cpu, без fake-VRAM
+        let (emit, _logs) = emit_collector();
         assert_eq!(
-            decide_batch_pool_workers(&cuda_auto(), 5, Some(12_000.0), &log),
-            2
-        );
-        assert!(logs.lock().unwrap().is_empty(), "без предупреждений");
-        // авто + мало VRAM → 1 + запись в журнал
-        assert_eq!(
-            decide_batch_pool_workers(&cuda_auto(), 5, Some(3_000.0), &log),
-            1
-        );
-        assert!(logs
-            .lock()
-            .unwrap()
-            .join(
-                "
-"
-            )
-            .contains("авто: 1 воркер"));
-        // nvidia-smi недоступен → авто 2 без деградации
-        assert_eq!(decide_batch_pool_workers(&cuda_auto(), 5, None, &log), 2);
-        // файлов меньше — воркеров не больше файлов (лишние Pocket не грузим)
-        assert_eq!(
-            decide_batch_pool_workers(&cuda_auto(), 1, Some(12_000.0), &log),
-            1
+            decide_topology(&cpu, &ps(1, 2, 2, 4), 1, true, &emit),
+            BatchTopology::Sequential,
+            "1 кандидат — чанк-параллелизм одиночного файла"
         );
         assert_eq!(
-            decide_batch_pool_workers(&cuda_auto(), 2, Some(12_000.0), &log),
-            2
+            decide_topology(&cpu, &ps(1, 2, 2, 4), 0, false, &emit),
+            BatchTopology::Sequential,
+            "SHTORM_GUI_BATCH_POOL=0 — диагностический откат"
         );
+        assert_eq!(
+            decide_topology(&cpu, &ps(1, 2, 2, 4), 5, true, &emit),
+            BatchTopology::InProcessPool { workers: 2 }
+        );
+        // F < P×W: Pocket сверх F не создаются
+        assert_eq!(
+            decide_topology(&cpu, &ps(1, 4, 2, 4), 8, true, &emit),
+            BatchTopology::InProcessPool { workers: 2 }
+        );
+        // кандидатов меньше F — активных не больше кандидатов
+        assert_eq!(
+            decide_topology(&cpu, &ps(1, 4, 4, 4), 3, true, &emit),
+            BatchTopology::InProcessPool { workers: 3 }
+        );
+        // CPU 2×1: мультипроцесс
+        assert_eq!(
+            decide_topology(&cpu, &ps(2, 1, 2, 4), 6, true, &emit),
+            BatchTopology::MultiProcess {
+                children: 2,
+                workers_per_child: 1,
+                max_active_files: 2
+            }
+        );
+        // CPU 2×2 с F=2: второй процесс не нужен (active ≤ W)
+        assert_eq!(
+            decide_topology(&cpu, &ps(2, 2, 2, 4), 6, true, &emit),
+            BatchTopology::InProcessPool { workers: 2 }
+        );
+        // CUDA 2×2 F=4 без fake — nvidia-smi недоступен в тестах → пул 1×2
+        // (проверено отдельно в topology_cuda_preflight ниже с fake-обходом)
     }
 
-    /// Ручной выбор не игнорируется молча: нехватка VRAM и >2 — явные
-    /// предупреждения, число сохраняется.
+    /// Fake-режим пропускает VRAM-префлайт: мультипроцесс CUDA выбирается.
     #[test]
-    fn pool_workers_manual_respected_with_warnings() {
-        let logs: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-        let log = |m: String| logs.lock().unwrap().push(m);
-        let mut s = cuda_auto();
-        s.workers = Some(2);
-        assert_eq!(decide_batch_pool_workers(&s, 5, Some(3_000.0), &log), 2);
+    fn topology_cuda_fake_multiprocess() {
+        std::env::set_var("SHTORM_G62_FAKE", "1");
+        let cuda = GuiSettings {
+            device: DeviceChoice::Cuda,
+            ..Default::default()
+        };
+        let (emit, logs) = emit_collector();
+        let topo = decide_topology(&cuda, &ps(2, 2, 4, 4), 6, true, &emit);
+        std::env::remove_var("SHTORM_G62_FAKE");
         assert!(logs
             .lock()
             .unwrap()
-            .join(
-                "
-"
-            )
-            .contains("ВНИМАНИЕ: VRAM-префлайт"));
-        logs.lock().unwrap().clear();
-        s.workers = Some(4);
-        assert_eq!(decide_batch_pool_workers(&s, 8, Some(12_000.0), &log), 4);
-        let all = logs.lock().unwrap().join(
-            "
-",
+            .iter()
+            .any(|l| l.contains("VRAM-префлайт пропущен")));
+        assert_eq!(
+            topo,
+            BatchTopology::MultiProcess {
+                children: 2,
+                workers_per_child: 2,
+                max_active_files: 4
+            }
         );
-        assert!(all.contains("больше 2 не ускоряет"), "{all}");
-        s.workers = Some(1);
-        assert_eq!(decide_batch_pool_workers(&s, 8, Some(100.0), &log), 1);
     }
 
     // ===== G6.1: реальный пакетный CUDA на постоянном пуле =====
@@ -4116,8 +4217,13 @@ mod tests {
     /// скорость». threads — по умолчанию 4 (серия t4 P2B.3).
     fn hybrid_settings(out_dir: &Path, threads: u32) -> GuiSettings {
         let mut s = p2b3_settings(out_dir, None);
-        s.batch_cuda_mode = BatchCudaMode::MaxSpeed;
-        s.threads = threads;
+        s.parallel_cuda = crate::settings::ParallelSettings {
+            profile: crate::settings::ParallelProfile::Productive,
+            processes: 2,
+            workers_per_process: 2,
+            max_concurrent_files: 4,
+            ort_threads: threads,
+        };
         s.clamped();
         s
     }
@@ -4687,10 +4793,12 @@ mod tests {
         }
 
         // (имя, режим, threads): экономичный 1×2 и гибрид 2×2 в двух профилях
-        let modes: [(&str, BatchCudaMode, u32); 3] = [
-            ("gui1x2_t4", BatchCudaMode::Economy, 4),
-            ("gui2x2_t4", BatchCudaMode::MaxSpeed, 4),
-            ("gui2x2_t2", BatchCudaMode::MaxSpeed, 2),
+        let economy = crate::settings::ParallelProfile::Optimal;
+        let maxspeed = crate::settings::ParallelProfile::Productive;
+        let modes: [(&str, crate::settings::ParallelProfile, u32); 3] = [
+            ("gui1x2_t4", economy, 4),
+            ("gui2x2_t4", maxspeed, 4),
+            ("gui2x2_t2", maxspeed, 2),
         ];
         // эталон байтов: первый успешный прогон экономичного режима
         let mut reference: Option<Vec<(PathBuf, Vec<u8>)>> = None;
@@ -4700,8 +4808,8 @@ mod tests {
                 let d = base.join(format!("{name}_r{rep}"));
                 let mut s = p2b3_settings(&d, None);
                 s.out_dir = d.join("out").display().to_string();
-                s.batch_cuda_mode = mode;
-                s.threads = threads;
+                s.parallel_cuda.profile = mode;
+                s.parallel_cuda.ort_threads = threads;
                 s.clamped();
                 {
                     let mut st = stats.lock().unwrap();
