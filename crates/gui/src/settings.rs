@@ -293,7 +293,6 @@ pub struct ParallelSettings {
     pub profile: ParallelProfile,
     pub processes: u32,
     pub workers_per_process: u32,
-    #[serde(alias = "max_concurrent_files")]
     pub max_concurrent_chunks: u32,
     pub ort_threads: u32,
 }
@@ -687,10 +686,32 @@ pub fn legacy_settings_path() -> PathBuf {
 pub fn load_settings(path: &Path) -> Result<GuiSettings> {
     let raw =
         std::fs::read_to_string(path).with_context(|| format!("прочитать {}", path.display()))?;
-    let mut s: GuiSettings =
+    let mut v: serde_json::Value =
         serde_json::from_str(&raw).with_context(|| format!("разобрать {}", path.display()))?;
+    migrate_legacy_parallel_keys(&mut v);
+    let mut s: GuiSettings =
+        serde_json::from_value(v).with_context(|| format!("разобрать {}", path.display()))?;
     migrate_parallel_settings(&mut s, &raw);
     Ok(s)
+}
+
+/// G6.7: перенос устаревшего ключа `max_concurrent_files` (G6.6, семантика
+/// предела файлов) в `max_concurrent_chunks` ДО разбора структуры: при
+/// наличии ОБОИХ ключей приоритетен новый (дубль не ломает загрузку), при
+/// наличии только старого его числовое значение становится стартовым C.
+fn migrate_legacy_parallel_keys(v: &mut serde_json::Value) {
+    let Some(obj) = v.as_object_mut() else {
+        return;
+    };
+    for key in ["parallel_cpu", "parallel_cuda"] {
+        if let Some(serde_json::Value::Object(sub)) = obj.get_mut(key) {
+            if !sub.contains_key("max_concurrent_chunks") {
+                if let Some(old) = sub.remove("max_concurrent_files") {
+                    sub.insert("max_concurrent_chunks".into(), old);
+                }
+            }
+        }
+    }
 }
 
 /// G6.6: одноразовая миграция пакетной параллельной конфигурации из старых
@@ -1375,6 +1396,44 @@ mod tests {
         save_settings(&s, &p).unwrap();
         let raw = std::fs::read_to_string(&p).unwrap();
         assert!(raw.contains("\"batch_cuda_mode\": \"MaxSpeed\""), "{raw}");
+    }
+
+    /// G6.7: старый ключ `max_concurrent_files` (семантика файлов G6.6)
+    /// загружается как стартовое значение `max_concurrent_chunks` (алиас);
+    /// конфликт старого и нового ключей невозможен (новый приоритетен и
+    /// переименовывает поле при сохранении).
+    #[test]
+    fn parallel_migration_files_to_chunks_alias() {
+        let d = tmpdir("par_alias");
+        let p = d.join("s.json");
+        std::fs::write(
+            &p,
+            r#"{"parallel_cpu": {"profile": "Custom", "processes": 1,
+                "workers_per_process": 2, "max_concurrent_files": 2,
+                "ort_threads": 4}}"#,
+        )
+        .unwrap();
+        let s = load_settings(&p).unwrap();
+        assert_eq!(s.parallel_cpu.max_concurrent_chunks, 2, "F→C перенос");
+        assert_eq!(s.parallel_cpu.processes, 1);
+        // повторный save пишет только новый ключ
+        save_settings(&s, &p).unwrap();
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(raw.contains("max_concurrent_chunks"), "{raw}");
+        assert!(!raw.contains("max_concurrent_files"), "{raw}");
+        // новый ключ в конфиге не затирается старым (проверка «конфликта»)
+        std::fs::write(
+            &p,
+            r#"{"parallel_cpu": {"profile": "Custom", "processes": 1,
+                "workers_per_process": 4, "max_concurrent_files": 1,
+                "max_concurrent_chunks": 3, "ort_threads": 4}}"#,
+        )
+        .unwrap();
+        let s = load_settings(&p).unwrap();
+        assert_eq!(
+            s.parallel_cpu.max_concurrent_chunks, 3,
+            "новый ключ приоритетен"
+        );
     }
 
     #[test]

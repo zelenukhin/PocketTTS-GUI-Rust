@@ -59,7 +59,10 @@ GUI для Pocket-TTS на Rust; репозиторий —
   backpressure, catch_unwind, строгий порядок, отмена), `persistent.rs`
   (G6.1: постоянный пул для пакетов — слоты, одалживание `Loaned` с
   per-file seed, параллельный `spawn_workers`, динамическая очередь
-  `run_dynamic_queue`, отравление слота при сбое движка), `worker.rs`
+  `run_dynamic_queue`, отравление слота при сбое движка; G6.7:
+  `synthesize_stream_pooled` + `pooled_real_worker_factory`/`PoisonLoan`/
+  `live_slots` — чанки файла на постоянном пуле, `build_file_tasks` —
+  единый план чанков), `worker.rs`
   (RealWorker: Pocket+DSP на воркер, base_seed, G6.1 `set_seed`),
   `sink.rs` (AudioSink: `finish()` +
   `FinalizedSink::publish()`; WavSink/FfmpegSink — writer-поток stdin,
@@ -96,6 +99,10 @@ GUI для Pocket-TTS на Rust; репозиторий —
   полагаемся), `job.rs` (G2: резолв модели fast/slow, ORT env + init
   один раз на процесс, конвертация GuiSettings→PipelineOptions с паритетом
   CLI, execute_job в фоновом потоке — напрямую app-core, НЕ subprocess;
+  G6.7: execute_batch — файлы каталога СТРОГО последовательно, чанки
+  текущего файла параллельно на постоянном пуле (P=1 → InProcessChunkPool
+  min(W,C) Pocket; P>1 → chunkpipe); topology/префлайты в decide_topology;
+  диагностика G6.6 — SHTORM_GUI_G66_FILE_POOL=1 / SHTORM_GUI_BATCH_POOL=0;
   G5.1: `ensure_output_path_safe` ДО создания каталогов,
   `create_dir_all_no_reparse`, повторная валидация, семантика
   «создан/обновлён/пропущен/отменён/ошибка публикации»),
@@ -109,13 +116,16 @@ GUI для Pocket-TTS на Rust; репозиторий —
   Named Pipes, duplex, OVERLAPPED I/O, кадры u32+JSON, проверка PID
   клиента, PIPE_REJECT_REMOTE_CLIENTS; синхронные handle для duplex-
   протокола непригодны — взаимная блокировка чтения/записи),
-  `hybrid.rs` (G6.2: гибридный пул 2 процесса × 2 постоянных воркера —
-  протокол, внутренний worker-режим (Pocket на процесс), диспетчер с
-  общей очередью и state machine файла, Job Object KILL_ON_JOB_CLOSE,
-  watchdog, контролируемый shutdown; настройки worker НЕ читает/не пишет —
-  всё приходит по IPC; G6.6: параметризован P×W и пределом одновременных
-  файлов F, используется и для CPU-мультипроцесса; см.
-  `docs/G6_6_PARALLEL_PROCESSING.md`), `main.rs`
+  `hybrid.rs` (G6.2: гибридная IPC-инфраструктура — Named Pipes duplex,
+  протокол Cmd/Ev, внутренний worker-режим `--internal-batch-worker`
+  (Pocket на процесс), Job Object KILL_ON_JOB_CLOSE, watchdog,
+  контролируемый shutdown; файловый мультипроцесс G6.6 сохранён как
+  диагностический), `chunkpipe.rs` (G6.7: мультипроцессный ЧАНК-конвейер —
+  диспетчер владеет файлами строго последовательно, чанки текущего файла
+  распределяются между Pocket дочерних процессов, PCM возвращается
+  бинарными кадрами f32 LE за JSON-заголовком ChunkDone, упорядоченная
+  сборка/публикация у диспетчера, окно C+2; см.
+  `docs/G6_7_UNIFIED_CHUNK_POOL.md`), `main.rs`
   (шрифты/кириллица + диагностические `--portable-*` режимы через cli.rs;
   G6.2.3: release — `windows_subsystem="windows"` (консольного окна нет;
   debug остаётся консольным), диагностика в том же EXE через явные

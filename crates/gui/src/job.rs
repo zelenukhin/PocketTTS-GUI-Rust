@@ -3403,6 +3403,305 @@ mod tests {
         );
     }
 
+    // ===== G6.7: real-батарея единого чанк-пула (модели + ORT DLL) =====
+    // Запуск (по одному устройству на процесс):
+    //   cargo test -p pockettts-gui-rust --release --lib real_g67_cpu -- --ignored --nocapture
+    //   SHTORM_GUI_TEST_DEVICE=cuda cargo test ... real_g67_cuda -- --ignored --nocapture
+
+    fn g67_parallel(p: u32, w: u32, c: u32, t: u32) -> crate::settings::ParallelSettings {
+        crate::settings::ParallelSettings {
+            profile: crate::settings::ParallelProfile::Custom,
+            processes: p,
+            workers_per_process: w,
+            max_concurrent_chunks: c,
+            ort_threads: t,
+        }
+    }
+
+    /// Длинный текст (~30 чанков при max_tokens 40) — параллелизм чанков
+    /// реален, а не декоративен.
+    fn g67_long_text(chunks: usize) -> String {
+        (0..chunks)
+            .map(|i| {
+                format!(
+                    "Стр+елки час+ов показ+ывали п+олночь, а главн+ый гер+ой читал \
+                     главу номер {i} своей люб+имой книги о дал+ёких странствиях. "
+                )
+            })
+            .collect()
+    }
+
+    fn sha256_file(p: &Path) -> String {
+        use std::io::Read;
+        let mut f = std::fs::File::open(p).unwrap();
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).unwrap();
+        let mut h = [0u8; 32];
+        // простая обёртка над sha2 нет в зависимостях GUI — используем
+        // внешнее сравнение байтов в тесте; здесь контрольная сумма через
+        // длину+первые/последние байты не подходит, поэтому просто читаем
+        let _ = &mut h;
+        format!("len={}", buf.len())
+    }
+
+    /// G6.7 real (§11C): ручное ограничение C реально меняет параллелизм —
+    /// длинный одиночный TXT на 1×4, C=1 против C=4: wall C=4 заметно
+    /// меньше (на чанках одного файла).
+    #[test]
+    #[ignore = "реальный синтез: модели + ORT DLL; 2 прогона"]
+    fn real_g67_climit_effect() {
+        let device = test_device();
+        let text = g67_long_text(24);
+        let run = |c: u32| {
+            let d = tmpdir(&format!("g67_c{c}"));
+            let mut s = real_settings(OutputFormatChoice::Wav, &d);
+            s.device = device;
+            s.set_parallel_config(device, g67_parallel(1, 4, c, 4));
+            s.text_file = d.join("book.txt").display().to_string();
+            std::fs::write(d.join("book.txt"), &text).unwrap();
+            let out = derive_out_path(&s);
+            let t0 = Instant::now();
+            let res = execute_job(
+                &JobConfig {
+                    settings: s,
+                    text: text.clone(),
+                    out_path: out,
+                },
+                &Arc::new(AtomicBool::new(false)),
+                &|_| {},
+            );
+            let wall = t0.elapsed().as_secs_f32();
+            assert_eq!(res.status, JobStatus::Completed, "{}", res.summary);
+            eprintln!("[g67_climit] C={c}: {wall:.1} с");
+            wall
+        };
+        let w1 = run(1);
+        let w4 = run(4);
+        match device {
+            DeviceChoice::Cpu => assert!(
+                w4 < w1 * 0.85,
+                "CPU: C=4 ({w4:.1} с) должен быть ощутимо быстрее C=1 ({w1:.1} с)"
+            ),
+            // CUDA одиночный TXT latency-bound (P2B.2: воркеры в одном
+            // процессе дают на одиночном файле лишь единицы процентов) —
+            // фиксируем факт, без жёсткого ассерта на кратно меньшее время
+            DeviceChoice::Cuda => eprintln!(
+                "[g67_climit] CUDA: C=1 {w1:.1} с, C=4 {w4:.1} с (одиночный файл                  latency-bound — выигрыш от C на одиночном TXT мал по P2B.2)"
+            ),
+        }
+    }
+
+    /// G6.7 real: сравнение G6.7 (последовательные файлы, параллельные
+    /// чанки, постоянный пул) с G6.6 (параллельные файлы, файловый пул,
+    /// SHTORM_GUI_G66_FILE_POOL=1) на ОДНОМ корпусе и одинаковых P/W/T.
+    /// Скорость не обещается — фиксируются фактические wall-времена.
+    #[test]
+    #[ignore = "реальный бенчмарк: модели + ORT DLL; 2 прогона"]
+    fn real_g67_bench_vs_g66() {
+        let device = test_device();
+        // фиксированный корпус: 12 файлов по 4 чанка (сопоставимо с main12)
+        let corpus = tmpdir("g67_bench_corpus");
+        let src = corpus.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        for i in 0..12 {
+            std::fs::write(src.join(format!("f{i:02}.txt")), g67_long_text(4)).unwrap();
+        }
+        let run = |tag: &str, legacy: bool| {
+            if legacy {
+                std::env::set_var("SHTORM_GUI_G66_FILE_POOL", "1");
+            }
+            let d = tmpdir(&format!("g67_bench_{tag}"));
+            let out = d.join("out");
+            std::fs::create_dir_all(&out).unwrap();
+            let mut s = real_settings(OutputFormatChoice::Wav, &out);
+            s.device = device;
+            s.set_parallel_config(device, g67_parallel(1, 2, 2, 4));
+            s.clamped();
+            let noop: Arc<dyn Fn(JobEvent) + Send + Sync> = Arc::new(|_| {});
+            let t0 = Instant::now();
+            let res = execute_batch(&s, &src, &Arc::new(AtomicBool::new(false)), &noop);
+            let wall = t0.elapsed().as_secs_f32();
+            if legacy {
+                std::env::remove_var("SHTORM_GUI_G66_FILE_POOL");
+            }
+            assert_eq!(res.status, JobStatus::Completed, "[{tag}] {}", res.summary);
+            eprintln!("[g67_bench/{tag}] {wall:.1} с | {}", res.summary);
+            wall
+        };
+        let w67 = run("g67_chunk", false);
+        let w66 = run("g66_files", true);
+        let ratio = w67 / w66;
+        eprintln!(
+            "[g67_bench] G6.7 чанк-пул {w67:.1} с vs G6.6 файловый пул {w66:.1} с              (×{ratio:.2}; устройство {device:?})"
+        );
+    }
+
+    /// G6.7 real CPU: одиночный длинный TXT на новом чанк-пуле 1×2/C2/T4
+    /// ПОБИТОВО равен прежнему одиночному пути G6.6 (workers=2, T=4).
+    #[test]
+    #[ignore = "реальный синтез: модели + ORT DLL; ~3 мин CPU"]
+    fn real_g67_single_txt_pool_parity() {
+        let device = test_device();
+        let text = g67_long_text(24);
+
+        // новый путь: чанк-пул 1×2/C2/T4
+        let d1 = tmpdir("g67_new");
+        let mut s1 = real_settings(OutputFormatChoice::Wav, &d1);
+        s1.device = device;
+        s1.set_parallel_config(device, g67_parallel(1, 2, 2, 4));
+        s1.text_file = d1.join("book.txt").display().to_string();
+        std::fs::write(d1.join("book.txt"), &text).unwrap();
+        let out1 = derive_out_path(&s1);
+        let res1 = execute_job(
+            &JobConfig {
+                settings: s1,
+                text: text.clone(),
+                out_path: out1.clone(),
+            },
+            &Arc::new(AtomicBool::new(false)),
+            &|_| {},
+        );
+        assert_eq!(res1.status, JobStatus::Completed, "{}", res1.summary);
+
+        // прежний одиночный путь G6.6 (модель на задание, workers=2, T=4)
+        std::env::set_var("SHTORM_GUI_G66_FILE_POOL", "1");
+        let d2 = tmpdir("g67_old");
+        let mut s2 = real_settings(OutputFormatChoice::Wav, &d2);
+        s2.device = device;
+        s2.threads = 4;
+        s2.workers = Some(2);
+        s2.text_file = d2.join("book.txt").display().to_string();
+        std::fs::write(d2.join("book.txt"), &text).unwrap();
+        let out2 = derive_out_path(&s2);
+        let res2 = execute_job(
+            &JobConfig {
+                settings: s2,
+                text: text.clone(),
+                out_path: out2.clone(),
+            },
+            &Arc::new(AtomicBool::new(false)),
+            &|_| {},
+        );
+        std::env::remove_var("SHTORM_GUI_G66_FILE_POOL");
+        assert_eq!(res2.status, JobStatus::Completed, "{}", res2.summary);
+
+        let a = std::fs::read(&out1).expect("WAV нового пула");
+        let b = std::fs::read(&out2).expect("WAV прежнего пути");
+        eprintln!(
+            "[g67_single] new {} байт ({}) | old {} байт ({})",
+            a.len(),
+            sha256_file(&out1),
+            b.len(),
+            sha256_file(&out2)
+        );
+        assert_eq!(a, b, "побитовый паритет нового чанк-пула и пути G6.6 (T=4)");
+    }
+
+    /// G6.7 real: каталог 12 TXT на чанк-пуле — файлы строго последовательно,
+    /// Pocket загружен ровно `pockets` раз на задание, все файлы готовы.
+    /// `p`/`w`/`c`/`t` — конфигурация; multiprocess=true → P>1 (chunkpipe).
+    #[allow(clippy::too_many_arguments)]
+    fn real_g67_catalog_inner(
+        tag: &str,
+        p: u32,
+        w: u32,
+        c: u32,
+        t: u32,
+        files: usize,
+        expect_pocket_loads: usize,
+    ) -> Vec<PathBuf> {
+        let d = tmpdir(tag);
+        let src = d.join("src");
+        let out = d.join("out");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        for i in 0..files {
+            std::fs::write(src.join(format!("f{i:02}.txt")), g67_long_text(2)).unwrap();
+        }
+        let device = test_device();
+        let mut s = real_settings(OutputFormatChoice::Wav, &out);
+        s.device = device;
+        s.set_parallel_config(device, g67_parallel(p, w, c, t));
+        s.clamped();
+        let events: Arc<std::sync::Mutex<Vec<JobEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let emit: Arc<dyn Fn(JobEvent) + Send + Sync> = {
+            let events = Arc::clone(&events);
+            Arc::new(move |ev| events.lock().unwrap().push(ev.clone()))
+        };
+        let t0 = Instant::now();
+        let res = execute_batch(&s, &src, &Arc::new(AtomicBool::new(false)), &emit);
+        eprintln!(
+            "[{tag}] {} за {:.1} с | {}",
+            res.status.label(),
+            t0.elapsed().as_secs_f32(),
+            res.summary
+        );
+        assert_eq!(res.status, JobStatus::Completed, "{}", res.summary);
+        let report = res.batch.expect("отчёт");
+        assert_eq!(report.completed(), files, "{}", report.summary());
+        // Pocket один раз на задание (реальные счётчики, не сообщения GUI)
+        assert_eq!(
+            report.pool_loads,
+            Some(expect_pocket_loads),
+            "Pocket загружен ровно {expect_pocket_loads} раз: {}",
+            report.summary()
+        );
+        // строго последовательные файлы: FileStarted(k+1) после FileDone(k)
+        let evs = events.lock().unwrap().clone();
+        for k in 1..files {
+            let done_k = evs
+                .iter()
+                .position(|e| matches!(e, JobEvent::FileDone { index, .. } if *index == k))
+                .unwrap_or_else(|| panic!("нет FileDone({k})"));
+            let started_k1 = evs
+                .iter()
+                .position(|e| matches!(e, JobEvent::FileStarted { index, .. } if *index == k + 1))
+                .unwrap_or_else(|| panic!("нет FileStarted({})", k + 1));
+            assert!(
+                started_k1 > done_k,
+                "файл {} начался до терминального завершения {k}",
+                k + 1
+            );
+        }
+        (0..files)
+            .map(|i| out.join(format!("f{i:02}.wav")))
+            .collect()
+    }
+
+    /// G6.7 real (device из SHTORM_GUI_TEST_DEVICE): каталог 12 TXT,
+    /// 1×2/C2/T4 — последовательные файлы, параллельные чанки, Pocket×2.
+    #[test]
+    #[ignore = "реальный синтез: модели + ORT DLL; ~2-4 мин"]
+    fn real_g67_catalog_1x2() {
+        let outs = real_g67_catalog_inner("g67_cat12", 1, 2, 2, 4, 12, 2);
+        for o in &outs {
+            assert!(o.is_file(), "{}", o.display());
+        }
+    }
+
+    /// G6.7 real: каталог 12 TXT, 1×4/C4/T1 (CPU-профиль «Производительный») —
+    /// Pocket×4, T=1; WAV тех же текстов при T=4 отличаются (порядок
+    /// редукции ORT) — сравнивать их между собой НЕЛЬЗЯ (ТЗ §10).
+    #[test]
+    #[ignore = "реальный синтез: модели + ORT DLL; ~2-4 мин"]
+    fn real_g67_catalog_1x4_t1() {
+        real_g67_catalog_inner("g67_cat12_t1", 1, 4, 4, 1, 12, 4);
+    }
+
+    /// G6.7 real CPU: мультипроцесс 2×1/C2/T4 на 4 файлах — PCM возвращается
+    /// по IPC, WAV побитово равен однопроцессному 1×2/C2/T4 (тот же T=4).
+    #[test]
+    #[ignore = "реальный синтез: модели + ORT DLL; ~3 мин CPU"]
+    fn real_g67_multiprocess_parity() {
+        let a = real_g67_catalog_inner("g67_mp_a", 1, 2, 2, 4, 4, 2);
+        let b = real_g67_catalog_inner("g67_mp_b", 2, 1, 2, 4, 4, 2);
+        for (wa, wb) in a.iter().zip(b.iter()) {
+            let (ba, bb) = (std::fs::read(wa).unwrap(), std::fs::read(wb).unwrap());
+            assert_eq!(ba, bb, "мультипроцесс 2×1 побитово = пул 1×2 (T=4)");
+        }
+    }
+
     // ============ реальные прогоны (нужны модели + ORT DLL + ffmpeg) ============
     // Запускать ПО ОДНОМУ устройству на процесс (ORT грузится в процесс
     // один раз; смена CPU/CUDA внутри процесса невозможна — честная ошибка):
@@ -5202,14 +5501,19 @@ mod tests {
         assert_eq!(rep2.completed(), parts.len() - completed1);
         assert_eq!(rep2.skipped(), completed1);
         // политика проекта: .partial отменённых файлов СОХРАНЯЮТСЯ для
-        // диагностики и не удаляются автоматически — их наличие ожидаемо
-        assert!(
-            std::fs::read_dir(&out)
-                .unwrap()
-                .filter_map(|e| e.ok())
-                .any(|e| e.file_name().to_string_lossy().contains(".partial")),
-            "черновики отмены сохранены для диагностики"
-        );
+        // диагностики и не удаляются автоматически. G6.7: файлы строго
+        // последовательны — отмена между файлами НЕ создаёт .partial у
+        // незапущенных файлов; требуем непустой черновик только от файлов,
+        // которые реально были в генерации в момент отмены
+        for f in &rep1.files {
+            if let Some(pp) = &f.partial_path {
+                assert!(
+                    pp.exists(),
+                    "черновик отменённого файла сохранён: {}",
+                    pp.display()
+                );
+            }
+        }
         assert_eq!(ffmpeg_process_count(), 0, "сиротских ffmpeg нет");
     }
 
