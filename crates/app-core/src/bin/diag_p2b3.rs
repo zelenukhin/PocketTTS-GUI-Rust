@@ -90,6 +90,9 @@ struct SynthArgs {
     device_id: i32,
     #[arg(long, default_value_t = 4)]
     threads: usize,
+    /// CPU-исследование: точность графов (fp32|int8), как в synthesize.exe.
+    #[arg(long, default_value = "fp32")]
+    precision: String,
     #[arg(long, default_value_t = 0.3)]
     temperature: f32,
     #[arg(long, default_value_t = 1)]
@@ -486,12 +489,17 @@ impl SynthArgs {
         if self.seed < 0 {
             bail!("диагностический runner требует фиксированный seed (>= 0)");
         }
+        let precision = match self.precision.as_str() {
+            "fp32" => ModelPrecision::Fp32,
+            "int8" => ModelPrecision::Int8,
+            other => bail!("--precision fp32|int8, получено {other}"),
+        };
         Ok(PipelineOptions {
             model_dir: self.model_dir.clone(),
             voice: self.voice.clone(),
             device,
             threads: self.threads,
-            precision: ModelPrecision::Fp32,
+            precision,
             seed: Some(self.seed as u64),
             temperature: self.temperature,
             decode_steps: self.decode_steps as usize,
@@ -530,6 +538,7 @@ fn run_hybrid(a: &HybridArgs) -> Result<()> {
             "files": names,
             "tag": a.tag,
             "device": a.synth.device,
+            "precision": a.synth.precision,
             "threads": a.synth.threads,
             "io_binding_env": std::env::var("SHTORM_CUDA_IO_BINDING").ok(),
         }),
