@@ -1,33 +1,69 @@
 # PocketTTS-GUI-Rust
 
-Приложение PocketTTS-GUI-Rust (ранее называлось ShtormTTS-Windows) —
-нативный (Rust) движок Shtorm PocketTTS RU для Windows и GUI к нему: FP32
-и INT8, CPU и CUDA, без Python/PyTorch в рантайме.
+Нативное (Rust) приложение для Windows x64: движок Shtorm PocketTTS RU
+(ONNX) + GUI для синтеза аудиокниг. FP32 **и INT8**, CPU и NVIDIA CUDA,
+без Python/PyTorch в рантайме. Готовые сборки — в
+[Releases](https://github.com/zelenukhin/PocketTTS-GUI-Rust/releases)
+(портативные `v1.0 CPU` / `v1.0 GPU`, установки не требуют).
 
-- Движок — производное [teratts-android](https://github.com/9208499-ship-it/teratts-android)
-  (ветка `teratts`, commit `edb614e8…`), лицензия **GPL-3.0** (см.
-  `LICENSE-TERATTS-ANDROID`, происхождение файлов — в шапках исходников).
-- Модели: локальные ONNX-каталоги Shtorm-v2 (`build/onnx/ru-v2-fast`, `ru-v2-slow`);
-  загрузчик строго FP32 (int8-файлы игнорируются), HuggingFace не используется.
-- onnxruntime подключается динамически: `ORT_DYLIB_PATH` → onnxruntime.dll 1.23.2
-  (CPU- или GPU-сборка); для CUDA нужны DLL CUDA 12 + cuDNN 9 в PATH процесса.
+## Модели
 
-## Быстрый старт
+Модель **Shtorm-PocketTTS-RU v2** (fast/slow) взята отсюда:
+**https://huggingface.co/ArtShtorm/Shtorm-PocketTTS-RU**
+
+Приложение работает с её ONNX-экспортом (`ru-v2-fast`, `ru-v2-slow`):
+
+- **FP32** — режим по умолчанию, все пять графов FP32;
+- **INT8** — явный выбор в списке моделей (динамически-квантованные
+  `flow_lm_main/flow_lm_flow/mimi_decoder` + FP32 `mimi_encoder/
+  text_conditioner`); на CPU быстрее FP32 на 25–32 % и вдвое легче по
+  памяти; на CUDA — экспериментальный режим (квантованные узлы идут на
+  CPU EP, ~2.7× медленнее FP32). Молчаливых переключений точности нет:
+  отсутствие INT8-графа — явная ошибка.
+
+HuggingFace в рантайме не используется — модели загружаются локально.
+
+## Возможности
+
+- Чанкинг / char_rules (runtime.json) / паузы по пунктуации —
+  golden-паритет с Python-оригиналом (96 + 314 + 20 кейсов).
+- Потоковая запись **WAV / MP3 / Opus** без накопления аудио в памяти;
+  уникальные `.partial`, атомарная публикация, явный флаг перезаписи.
+- Безопасный пакетный режим: preflight, защита путей (junction/symlink),
+  конфликты имён, skip/overwrite существующих результатов.
+- **Единый постоянный чанк-пул P/W/C/T** (G6.7): файлы каталога — строго
+  последовательно, чанки текущего файла — параллельно; профили
+  «Оптимальный»/«Производительный»/«Свой»; мультипроцессный чанк-конвейер
+  (Named Pipes, PCM бинарными кадрами, Job Object — без сиротских
+  процессов). Детерминизм: WAV зависит только от модели/точности/T/seed.
+- EOS / анти-повторы / «яркость» (high-shelf +8 дБ) / денойз DPDFNet —
+  как в teratts-android.
+- Настройки — собственный JSON с round-trip неизвестных ключей.
+
+## Сборка из исходников
+
+Требуется Rust (stable, MSVC) и ONNX Runtime 1.23.2 (CPU и/или GPU DLL;
+`ORT_DYLIB_PATH` / авто-поиск `deps/ort-*` относительно корня).
 
 ```powershell
-tools\build.ps1                                   # сборка + тесты
+cargo build --release          # GUI: target\release\PocketTTS-GUI-Rust.exe
+cargo test                     # юнит + golden (без GPU)
 tools\smoke-cpu.ps1  -ModelDir <onnx\ru-v2-slow> -Voice <voice.wav>
 tools\smoke-cuda.ps1 -ModelDir <onnx\ru-v2-slow> -Voice <voice.wav>
-# бенчмарк: target\release\bench.exe --model-dir … --voice … --device cuda --chunks 100 --tag x
-# стресс  : bench.exe … --text-file book.txt --chunks 1000 --csv out\stress.csv --sample-every 10
-# TF32/EP-проба: target\release\ep_probe.exe --model-dir … --voice …   (нужен GPU-dylib)
-# график памяти: venv-питоном tools\plot_memory.py stress_cuda_slow.csv …
-# golden чанкования: venv-питоном tools\gen_chunking_golden.py (git-ветка comma-semantics)
+tools\build-portable.ps1 -?    # портативный комплект
 ```
 
-Движок всегда строгий FP32: `use_tf32=0` передаётся CUDA EP явно (дефолт
-провайдера — включён, доказано ep_probe). int8-модели игнорируются.
+## Лицензия и происхождение
 
-Структура, решения, статус: `docs/PREPARATION_REPORT.md`, `docs/ARCHITECTURE.md`,
-`docs/CUDA_FEASIBILITY.md`, `docs/FEATURE_PARITY.md`, `docs/BENCHMARKS.md`,
-`docs/NEXT_STEPS.md`.
+Движок — производное [teratts-android](https://github.com/9208499-ship-it/teratts-android)
+(ветка `teratts`, commit `edb614e8…`), лицензия **GPL-3.0** (полный текст —
+`LICENSE-TERATTS-ANDROID`, происхождение файлов — в шапках исходников).
+Модель Shtorm-PocketTTS-RU — [ArtShtorm/Shtorm-PocketTTS-RU](https://huggingface.co/ArtShtorm/Shtorm-PocketTTS-RU);
+в этот репозиторий модели и голоса не входят (лицензия на
+редистрибуцию не подтверждена — используйте ссылки выше).
+
+## Документация
+
+Архитектура и этапы разработки — в `docs/` (`G6_7_UNIFIED_CHUNK_POOL.md` —
+актуальная архитектура параллелизма, `ARCHITECTURE.md`, `BENCHMARKS.md`,
+`SAFETY_AUDIT.md`, `PORTABLE_BUILD.md` и др.).
