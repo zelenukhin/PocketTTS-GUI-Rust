@@ -40,7 +40,13 @@ $settingsJson = @"
   "format": "Wav",
   "out_dir": "$outDir",
   "overwrite_existing": false,
-  "batch_cuda_mode": "MaxSpeed",
+  "parallel_cuda": {
+    "profile": "Productive",
+    "processes": 2,
+    "workers_per_process": 2,
+    "max_concurrent_files": 4,
+    "ort_threads": 4
+  },
   "theme_dark": true
 }
 "@

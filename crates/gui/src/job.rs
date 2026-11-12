@@ -1065,6 +1065,11 @@ fn decide_topology(
                 )));
                 return BatchTopology::InProcessPool { workers: fallback };
             }
+            emit(JobEvent::Log(format!(
+                "VRAM-префлайт {children}×{w}: свободно {free:.0} МБ ≥ {need:.0} МБ — запуск \
+                 {total_pockets} Pocket ({children} процесса × {w} воркера), до {active} файлов \
+                 одновременно"
+            )));
         } else {
             emit(JobEvent::Log(
                 "ВНИМАНИЕ: мультипроцессный CUDA: свободную VRAM проверить не удалось \
