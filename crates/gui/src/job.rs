@@ -3019,6 +3019,227 @@ mod tests {
         );
     }
 
+    /// G6.6: короткий реальный тест НОВОЙ ручной конфигурации CUDA —
+    /// мультипроцесс 2×1/T4 (2 процесса × 1 Pocket, F=2) на поднаборе из
+    /// 4 файлов main12. WAV обязаны совпадать побитово с пулом 1×2/T4
+    /// (равный T). Прогон 1×2/T4 на том же поднаборе — внутренний эталон.
+    /// 2×2/T4 покрыт real_batch_cuda_hybrid, 1×2/T4 — real_batch_cuda_pool.
+    #[test]
+    #[ignore = "реальный CUDA: модели + ORT GPU DLL (~3 мин)"]
+    fn real_batch_cuda_manual_g66() {
+        let parts = p2b3_parts();
+        let src_dir = {
+            let d = tmpdir("g66_cuda_short");
+            std::fs::create_dir_all(&d).unwrap();
+            for p in &parts[..4] {
+                std::fs::copy(p, d.join(p.file_name().unwrap())).unwrap();
+            }
+            d
+        };
+        let run = |tag: &str, cfg: crate::settings::ParallelSettings| -> Vec<(String, Vec<u8>)> {
+            let d = tmpdir(tag);
+            let mut s = p2b3_settings(&d, None);
+            s.out_dir = d.join("out").display().to_string();
+            s.parallel_cuda = cfg.clamped_for_device(DeviceChoice::Cuda);
+            s.clamped();
+            let emit: Arc<dyn Fn(JobEvent) + Send + Sync> = Arc::new(|_| {});
+            let t0 = Instant::now();
+            let res = execute_batch(&s, &src_dir, &Arc::new(AtomicBool::new(false)), &emit);
+            eprintln!(
+                "[{tag}] {} | {:.1} с | {}",
+                res.status.label(),
+                t0.elapsed().as_secs_f32(),
+                res.summary
+            );
+            assert_eq!(res.status, JobStatus::Completed, "{}", res.summary);
+            let rep = res.batch.expect("отчёт");
+            assert_eq!(rep.completed(), 4, "{}", rep.summary());
+            read_batch_wavs(&d.join("out"))
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        let ref_wavs = run("g66_cuda_ref_1x2", ps_custom(1, 2, 2, 4));
+        let mp_wavs = run("g66_cuda_2x1", ps_custom(2, 1, 2, 4));
+        assert_eq!(ref_wavs.len(), 4);
+        assert_eq!(mp_wavs.len(), 4);
+        for ((name_r, bytes_r), (name_m, bytes_m)) in ref_wavs.iter().zip(mp_wavs.iter()) {
+            assert_eq!(name_r, name_m);
+            assert_eq!(
+                bytes_r, bytes_m,
+                "{name_r}: 1×2/T4 и 2×1/T4 обязаны совпадать побитово"
+            );
+        }
+    }
+    // Запуск (один тест — один процесс; таймаут снаружи):
+    //   cargo test -p pockettts-gui-rust --release --lib \
+    //     real_batch_cpu_pool_g66 -- --exact --ignored --nocapture --test-threads=1
+
+    /// Настройки CPU-пула на корпусе P2B.3 (main12) с конфигурацией P/W/F/T.
+    fn cpu_pool_settings(out_dir: &Path, cfg: crate::settings::ParallelSettings) -> GuiSettings {
+        let mut s = p2b3_settings(out_dir, None);
+        s.device = DeviceChoice::Cpu;
+        s.parallel_cpu = cfg.clamped_for_device(DeviceChoice::Cpu);
+        s.clamped();
+        s
+    }
+
+    fn ps_custom(processes: u32, w: u32, f: u32, t: u32) -> crate::settings::ParallelSettings {
+        crate::settings::ParallelSettings {
+            profile: crate::settings::ParallelProfile::Custom,
+            processes,
+            workers_per_process: w,
+            max_concurrent_files: f,
+            ort_threads: t,
+        }
+    }
+
+    /// Читает WAV-итоги пакета в map имя→байты (только completed).
+    fn read_batch_wavs(out_root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        let mut map = std::collections::BTreeMap::new();
+        fn walk(dir: &Path, map: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, map);
+                } else if p.extension().and_then(|e| e.to_str()) == Some("wav") {
+                    let name = p.file_name().unwrap().to_string_lossy().to_string();
+                    map.insert(name, std::fs::read(&p).unwrap());
+                }
+            }
+        }
+        walk(out_root, &mut map);
+        map
+    }
+
+    /// G6.6: обязательная матрица реального CPU-пакета —
+    /// A) Slow FP32 пул 1×2/T4 (профессия «Оптимальный»);
+    /// B) Slow FP32 пул 1×4/T1 («Производительный»);
+    /// C) Slow FP32 мультипроцесс 2×1/T4 на коротком поднаборе (4 файла);
+    /// D) Fast INT8 пул 1×2/T4.
+    /// Паритет: A ≡ C побайтово на общих файлах (равный T=4, разные
+    /// топологии — правило «WAV зависит только от T»); B отличается от A
+    /// (T=1 меняет порядок редукции ORT).
+    #[test]
+    #[ignore = "реальный CPU-синтез: модели + ORT CPU DLL (~8 мин)"]
+    fn real_batch_cpu_pool_g66() {
+        let parts = p2b3_parts();
+        let src_dir = parts[0].parent().unwrap().to_path_buf();
+        let short_src = {
+            // короткий поднабор: копия 4 файлов в отдельный каталог
+            let d = tmpdir("g66_short");
+            std::fs::create_dir_all(&d).unwrap();
+            for p in &parts[..4] {
+                let name = p.file_name().unwrap();
+                std::fs::copy(p, d.join(name)).unwrap();
+            }
+            d
+        };
+        let run = |tag: &str,
+                   cfg: crate::settings::ParallelSettings,
+                   src: &Path,
+                   model: ModelChoice|
+         -> (
+            BatchReport,
+            std::collections::BTreeMap<String, Vec<u8>>,
+            Vec<String>,
+        ) {
+            let d = tmpdir(tag);
+            let mut s = cpu_pool_settings(&d, cfg);
+            s.model = model;
+            s.out_dir = d.join("out").display().to_string();
+            s.clamped();
+            let logs: Arc<std::sync::Mutex<Vec<String>>> =
+                Arc::new(std::sync::Mutex::new(Vec::new()));
+            let emit: Arc<dyn Fn(JobEvent) + Send + Sync> = {
+                let logs = Arc::clone(&logs);
+                Arc::new(move |ev| {
+                    if let JobEvent::Log(line) = ev {
+                        logs.lock().unwrap().push(line);
+                    }
+                })
+            };
+            let t0 = Instant::now();
+            let res = execute_batch(&s, src, &Arc::new(AtomicBool::new(false)), &emit);
+            eprintln!(
+                "[{tag}] {} | {:.1} с | {}",
+                res.status.label(),
+                t0.elapsed().as_secs_f32(),
+                res.summary
+            );
+            assert_eq!(res.status, JobStatus::Completed, "{}", res.summary);
+            let rep = res.batch.expect("отчёт");
+            let wavs = read_batch_wavs(&d.join("out"));
+            let logs = logs.lock().unwrap().clone();
+            (rep, wavs, logs)
+        };
+
+        // A) Slow FP32 пул 1×2/T4
+        let (rep_a, wavs_a, logs_a) = run(
+            "g66_a_1x2_t4",
+            ps_custom(1, 2, 2, 4),
+            &src_dir,
+            ModelChoice::Slow,
+        );
+        assert_eq!(rep_a.completed(), 12, "{}", rep_a.summary());
+        assert_eq!(rep_a.pool_loads, Some(2), "Pocket загружен ровно 2 раза");
+        assert_eq!(rep_a.pool_workers, Some(2));
+        assert_eq!(wavs_a.len(), 12);
+        assert!(logs_a.iter().any(|l| l.contains("постоянный пул")));
+
+        // B) Slow FP32 пул 1×4/T1 (производительный профиль)
+        let (rep_b, wavs_b, _) = run(
+            "g66_b_1x4_t1",
+            ps_custom(1, 4, 4, 1),
+            &src_dir,
+            ModelChoice::Slow,
+        );
+        assert_eq!(rep_b.completed(), 12);
+        assert_eq!(rep_b.pool_loads, Some(4));
+        // T=1 меняет побитовый результат (порядок редукции intra-op ORT)
+        let common_ab: Vec<_> = wavs_a.keys().cloned().collect();
+        assert!(
+            common_ab.iter().any(|n| wavs_a[n] != wavs_b[n]),
+            "T4 и T1 должны отличаться побитово хотя бы на одном файле"
+        );
+
+        // C) мультипроцесс 2×1/T4, короткий поднабор
+        let (rep_c, wavs_c, logs_c) = run(
+            "g66_c_2x1_t4",
+            ps_custom(2, 1, 2, 4),
+            &short_src,
+            ModelChoice::Slow,
+        );
+        assert_eq!(rep_c.completed(), 4, "{}", rep_c.summary());
+        assert_eq!(rep_c.pool_processes, Some(2), "два дочерних процесса");
+        assert_eq!(rep_c.pool_loads, Some(2), "Pocket в дочерних процессах");
+        assert!(logs_c.iter().any(|l| l.contains("мультипроцесс 2×1")));
+        // паритет A ≡ C на общих файлах (равный T, разная топология)
+        for (name, bytes_c) in &wavs_c {
+            let bytes_a = wavs_a
+                .get(name)
+                .unwrap_or_else(|| panic!("файл {name} отсутствует в прогоне A"));
+            assert_eq!(
+                bytes_a, bytes_c,
+                "{name}: 1×2/T4 и 2×1/T4 обязаны совпадать побитово"
+            );
+        }
+
+        // D) Fast INT8 пул 1×2/T4
+        let (rep_d, wavs_d, _) = run(
+            "g66_d_int8",
+            ps_custom(1, 2, 2, 4),
+            &src_dir,
+            ModelChoice::FastInt8,
+        );
+        assert_eq!(rep_d.completed(), 12);
+        assert_eq!(rep_d.pool_loads, Some(2));
+        // INT8 ≠ FP32 (разные графы)
+        assert!(
+            wavs_a.keys().any(|n| wavs_a[n] != wavs_d[n]),
+            "INT8 и FP32 обязаны отличаться"
+        );
+    }
+
     /// G5/G5.1: реальная перезапись WAV — существующий файл, новый файл при
     /// включённой перезаписи, отмена до публикации, повтор после отмены.
     /// Старый файл заменяется только после успешного синтеза; при отмене
