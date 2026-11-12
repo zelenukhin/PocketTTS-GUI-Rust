@@ -68,8 +68,18 @@ G6.5).
   кладёт `PocketTTS-GUI-Rust.exe` + `PocketTTS-GUI-Rust.json` (+example),
   manifest `product = "PocketTTS-GUI-Rust portable"`. Прежние комплекты
   (`g62/g623/g63/…`) — исторические артефакты, не переименовывались.
-  **Полный portable НЕ пересобирался** (по ТЗ — после проверки EXE
-  пользователем).
+- **Portable G6.5 собран и принят (headless)**:
+  `C:\PocketTTS-GUI-Rust\dist\PocketTTS-GUI-Rust-Portable-2026-11-12-g65-final`
+  — 60 файлов, 3611 MiB, git `c3c9074` dirty=false, exe SHA256
+  `D41C175DEF327BD5A4A6BB718E08877954A7CEE50C276D6CE17D006D78FBF5BD`,
+  `-HardLinkPayload` (диск C: заполнен; лог `out/g65_portable_build.log`).
+  Проверено из комплекта с CWD `C:\`: portable-check OK (всё exe-relative);
+  `--portable-selftest-hybrid` — 2 процесса/4 воркера/6/6 OK; в
+  manifest/README-PORTABLE/THIRD_PARTY_NOTICES упоминаний ShtormTTS нет;
+  миграция: EXE в песочнице с только `shtorm_gui_settings.json`
+  (model=FastInt8, UTF-8 без BOM) → portable-check выбирает FastInt8
+  (read-only fallback). Реальный CUDA-прогон и визуальная проверка GUI из
+  комплекта — за пользователем.
 - **Скрипты/документация**: smoke `g611/g612/g62` и headless-gpu — новое
   имя EXE/настроек/процесса (`Get-Process PocketTTS-GUI-Rust`); README,
   portable-шаблоны (README-PORTABLE/NOTICES), AGENTS.md, актуальные разделы
@@ -846,15 +856,16 @@ bash out/p2a1/bench_clean.sh auto 1 <tag>
 
 ## NEXT TASK (НЕ НАЧИНАТЬ без явного задания)
 
-G6.5 завершён (переименование в PocketTTS-GUI-Rust; portable НЕ пересобран —
-ожидается визуальная проверка EXE пользователем). Возможные направления
-(только по явному заданию):
+G6.5 завершён (переименование в PocketTTS-GUI-Rust; portable
+`PocketTTS-GUI-Rust-Portable-2026-11-12-g65-final` собран и принят
+headless — осталась визуальная проверка GUI пользователем и реальный
+CUDA-прогон из комплекта). Возможные направления (только по явному
+заданию):
 
-1. **Portable-комплект G6.5** — после визуальной проверки пользователем
-   нового EXE и заголовка окна: `tools\build-portable.ps1` в новый каталог
-   `C:\PocketTTS-GUI-Rust\dist\PocketTTS-GUI-Rust-Portable-<дата>-g65-*` +
-   приёмка (portable-check, selftest CPU/CUDA, hybrid fake 2×2, миграция
-   настроек из комплектного прежнего JSON).
+1. **Финальная приёмка комплекта g65** — визуальная проверка заголовка
+   окна `PocketTTS-GUI-Rust v1.0` из комплекта + реальный CUDA
+   selftest/batch; после неё — запись раздела G6.5 в
+   `docs/PORTABLE_BUILD.md`.
 2. **Оптимизация покадрового пути ORT/CUDA** (по смыслу P2B.1 §13):
    убрать 222 CPU-EP узла/кадр и межEP-синхронизации main-графа
    (переэкспорт с shape-операциями на CUDA/статическими формами), затем
