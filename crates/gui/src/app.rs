@@ -950,7 +950,7 @@ impl ShtormApp {
                 });
                 hint(
                     ui,
-                    "Голосовой референс: поддерживается WAV (.safetensors — в будущих этапах).",
+                    "Голосовой референс: поддерживается WAV.",
                 );
             });
         header_clicked(&resp, &mut s.source_open);
