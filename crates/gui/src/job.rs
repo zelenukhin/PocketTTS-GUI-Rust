@@ -1197,17 +1197,11 @@ fn execute_batch_sequential(
     )
 }
 
-/// Ориентировочная VRAM одного CUDA-воркера (Pocket + арены ORT), МБ —
-/// по замерам P2B.3 (2 воркера ≈ 4.9 ГБ, база ~0.2 ГБ).
-const BATCH_POOL_VRAM_PER_WORKER_MB: f64 = 2355.0;
-/// Запас поверх N воркеров однопроцессного пула (фон/фрагментация).
-/// Префлайт — НЕ абсолютная защита от OOM, а способ заранее выбрать
-/// экономную конфигурацию.
-const BATCH_POOL_VRAM_RESERVE_MB: f64 = 900.0;
-/// Консервативный запас мультипроцессного режима (P2B.3: пик 9.2–9.4 ГБ;
-/// B4 словил CUDA OOM при ~11.5 ГБ свободных — покрывает фон, фрагментацию
-/// и промежуточные тензоры декодера).
-const MULTIPROCESS_VRAM_RESERVE_MB: f64 = 1500.0;
+// G6.7.1: методика расчёта потребности VRAM (N×2355 МБ + запас 900/1500 МБ)
+// вынесена в единую чистую функцию `settings::vram_need_mb` — GUI и этот
+// префлайт больше не могут разойтись по формулам/единицам измерения.
+// Префлайт — НЕ абсолютная защита от OOM, а способ заранее выбрать
+// экономную конфигурацию (обоснование запасов — замеры P2B.3).
 
 /// G6.6/G6.7: фактическая топология запуска пакета. Решение чистое (unit-
 /// тестируемое); журналирование отклонений от запрошенной конфигурации —
@@ -1287,8 +1281,7 @@ fn decide_topology(
         let mut pockets = (cfg.workers_per_process as usize).min(c).max(1);
         if settings.device == DeviceChoice::Cuda {
             if let Some(free) = vram_free_or_warn(settings, emit) {
-                let need =
-                    pockets as f64 * BATCH_POOL_VRAM_PER_WORKER_MB + BATCH_POOL_VRAM_RESERVE_MB;
+                let need = crate::settings::vram_need_mb(pockets as u32, false) as f64;
                 if free < need {
                     if cfg.profile == ParallelProfile::Optimal && pockets > 1 {
                         emit(JobEvent::Log(format!(
@@ -1313,8 +1306,7 @@ fn decide_topology(
     let w = cfg.workers_per_process as usize;
     if settings.device == DeviceChoice::Cuda {
         if let Some(free) = vram_free_or_warn(settings, emit) {
-            let need =
-                pockets_total as f64 * BATCH_POOL_VRAM_PER_WORKER_MB + MULTIPROCESS_VRAM_RESERVE_MB;
+            let need = crate::settings::vram_need_mb(pockets_total as u32, true) as f64;
             if free < need {
                 let fallback = w.min(2);
                 emit(JobEvent::Log(format!(

@@ -1736,15 +1736,20 @@ fn parallel_processing_block(ui: &mut egui::Ui, s: &mut GuiSettings) {
             cfg.ort_threads = threads_t;
             edited(&mut cfg);
         }
-        // компактная фактическая конфигурация + оценка ресурсов
+        // компактная конфигурация + оценка ресурсов по ПЛАНИРУЕМЫМ к
+        // загрузке Pocket (P=1 → min(W,C); P>1 → P×W) — G6.7.1. VRAM —
+        // единая формула префлайта (settings::vram_need_mb, МБ); перевод
+        // MB → GB выполняется ровно один раз, здесь
         ui.horizontal(|ui| {
             secondary_label(ui, cfg.summary_line());
-            let pockets = cfg.total_pockets();
+            let pockets = cfg.planned_pockets();
             match device {
                 DeviceChoice::Cuda => {
-                    let need_gb =
-                        (pockets as f64 * 2.355 + if pockets > 2 { 1.5 } else { 0.9 }) / 1000.0;
-                    secondary_label(ui, format!("· ~{need_gb:.1} ГБ VRAM (оценка)"));
+                    let need_mb = crate::settings::vram_need_mb(pockets, cfg.processes > 1);
+                    secondary_label(
+                        ui,
+                        format!("· ~{:.1} ГБ VRAM (оценка)", need_mb as f64 / 1000.0),
+                    );
                 }
                 DeviceChoice::Cpu => {
                     let per = match precision {

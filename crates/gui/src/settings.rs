@@ -321,6 +321,21 @@ pub fn parallel_limits(device: DeviceChoice) -> (u32, u32) {
     }
 }
 
+/// G6.7.1: расчётная потребность VRAM (МБ) по методике VRAM-префлайта
+/// G6.1/G6.6: N × 2355 МБ на Pocket + запас 900 МБ (однопроцессный пул,
+/// ≤2 Pocket) / 1500 МБ (мультипроцесс или >2 Pocket — консервативный
+/// запас по пикам P2B.3). ЕДИНАЯ формула для GUI и preflight (`job.rs`);
+/// перевод MB → GB выполняется ровно один раз — в GUI.
+pub fn vram_need_mb(pockets: u32, multiprocess: bool) -> u64 {
+    let per_worker_mb: u64 = 2355;
+    let reserve_mb: u64 = if multiprocess || pockets > 2 {
+        1500
+    } else {
+        900
+    };
+    pockets as u64 * per_worker_mb + reserve_mb
+}
+
 /// Оценка RAM одного CPU-воркера (Pocket, 5 ONNX-сессий), МБ — по замерам
 /// docs/CPU_BATCH_WORKERS_RESEARCH.md (Slow FP32 ~0.85–1 ГБ, INT8 ~0.5 ГБ).
 fn ram_per_worker_mb(precision: ModelPrecision) -> u64 {
@@ -375,13 +390,42 @@ impl ParallelSettings {
         self
     }
 
-    /// Компактная информационная строка фактической конфигурации.
+    /// G6.7.1: планируемое к ЗАГРУЗКЕ число Pocket — единая семантика для
+    /// GUI и production. P=1: однопроцессный чанк-пул создаёт min(W, C)
+    /// Pocket (лишние сверх C не создаются); P>1: мультипроцессная топология
+    /// создаёт все P×W Pocket независимо от C.
+    pub fn planned_pockets(&self) -> u32 {
+        if self.processes <= 1 {
+            self.workers_per_process
+                .min(self.max_concurrent_chunks)
+                .max(1)
+        } else {
+            self.total_pockets()
+        }
+    }
+
+    /// Компактная информационная строка конфигурации. G6.7.1: различает
+    /// настроенное и планируемое к загрузке число Pocket (однопроцессный
+    /// пул при C < W грузит меньше настроенного); оценка не называется
+    /// «фактической» — реальное состояние сообщает журнал выполнения.
     pub fn summary_line(&self) -> String {
         let p = if self.processes == 1 {
             "процесс"
         } else {
             "процесса"
         };
+        let planned = self.planned_pockets();
+        if self.processes == 1 && planned < self.total_pockets() {
+            return format!(
+                "{} {} · настроено {} Pocket · будет загружен {} Pocket · до {} чанков · ORT {}",
+                self.processes,
+                p,
+                self.total_pockets(),
+                planned,
+                self.max_concurrent_chunks,
+                self.ort_threads
+            );
+        }
         format!(
             "{} {} · {} Pocket · до {} чанков · ORT {}",
             self.processes,
@@ -1396,6 +1440,86 @@ mod tests {
         save_settings(&s, &p).unwrap();
         let raw = std::fs::read_to_string(&p).unwrap();
         assert!(raw.contains("\"batch_cuda_mode\": \"MaxSpeed\""), "{raw}");
+    }
+
+    /// G6.7.1: планируемое к загрузке число Pocket (P=1 → min(W,C);
+    /// P>1 → все P×W независимо от C).
+    #[test]
+    fn planned_pockets_matches_pool_semantics() {
+        let ps = |p: u32, w: u32, c: u32| ParallelSettings {
+            profile: ParallelProfile::Custom,
+            processes: p,
+            workers_per_process: w,
+            max_concurrent_chunks: c,
+            ort_threads: 4,
+        };
+        // (P, W, C) -> планируемых Pocket
+        for (p, w, c, want) in [
+            (1u32, 4u32, 1u32, 1u32),
+            (1, 4, 2, 2),
+            (1, 4, 4, 4),
+            (2, 2, 1, 4),
+            (2, 2, 2, 4),
+            (2, 2, 4, 4),
+        ] {
+            assert_eq!(ps(p, w, c).planned_pockets(), want, "P{p}×W{w} C{c}");
+        }
+    }
+
+    /// G6.7.1: расчёт VRAM в МБ по методике префлайта; MB→GB один раз и
+    /// без обнуления от смешения единиц (прежний баг: ГБ-коэффициенты
+    /// делились на 1000 ещё раз → «0.0 ГБ»).
+    #[test]
+    fn vram_need_mb_matches_preflight_methodology() {
+        // 2 Pocket (однопроцессный пул): 2×2355 + 900 = 5610 МБ ≈ 5.6 ГБ
+        assert_eq!(vram_need_mb(2, false), 5610);
+        assert!((vram_need_mb(2, false) as f64 / 1000.0 - 5.6).abs() < 0.05);
+        // 4 Pocket (мультипроцесс или >2): 4×2355 + 1500 = 10920 МБ ≈ 10.9 ГБ
+        assert_eq!(vram_need_mb(4, true), 10920);
+        assert_eq!(
+            vram_need_mb(4, false),
+            10920,
+            ">2 Pocket — консервативный запас"
+        );
+        assert!((vram_need_mb(4, true) as f64 / 1000.0 - 10.9).abs() < 0.05);
+        // 2 Pocket мультипроцесс (например 2×1): запас 1500
+        assert_eq!(vram_need_mb(2, true), 6210);
+        // никакая конфигурация не даёт нулевую/абсурдную оценку
+        for pockets in 1..=4u32 {
+            for mp in [false, true] {
+                let gb = vram_need_mb(pockets, mp) as f64 / 1000.0;
+                assert!(gb > 3.0 && gb < 12.0, "pockets={pockets} mp={mp}: {gb}");
+            }
+        }
+    }
+
+    /// G6.7.1: summary_line различает настроенное и планируемое число
+    /// Pocket (однопроцессный пул при C < W) и не меняет компактную форму
+    /// в остальных случаях.
+    #[test]
+    fn summary_line_distinguishes_planned_pockets() {
+        let base = |p: u32, w: u32, c: u32| ParallelSettings {
+            profile: ParallelProfile::Custom,
+            processes: p,
+            workers_per_process: w,
+            max_concurrent_chunks: c,
+            ort_threads: 4,
+        };
+        // P=1, W=4, C=1: настроено 4, будет загружен 1
+        assert_eq!(
+            base(1, 4, 1).summary_line(),
+            "1 процесс · настроено 4 Pocket · будет загружен 1 Pocket · до 1 чанков · ORT 4"
+        );
+        // P=2, W=2, C=1: мультипроцесс — все 4 Pocket, компактная форма
+        assert_eq!(
+            base(2, 2, 1).summary_line(),
+            "2 процесса · 4 Pocket · до 1 чанков · ORT 4"
+        );
+        // P=1, W=2, C=2: стандартная компактная строка
+        assert_eq!(
+            base(1, 2, 2).summary_line(),
+            "1 процесс · 2 Pocket · до 2 чанков · ORT 4"
+        );
     }
 
     /// G6.7: старый ключ `max_concurrent_files` (семантика файлов G6.6)
