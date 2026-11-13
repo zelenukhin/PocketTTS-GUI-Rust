@@ -58,6 +58,7 @@ tools\build-portable.ps1 -?    # портативный комплект
 Движок — производное [teratts-android](https://github.com/9208499-ship-it/teratts-android)
 (ветка `teratts`, commit `edb614e8…`), лицензия **GPL-3.0** (полный текст —
 `LICENSE-TERATTS-ANDROID`, происхождение файлов — в шапках исходников).
+
 Модель Shtorm-PocketTTS-RU — [ArtShtorm/Shtorm-PocketTTS-RU](https://huggingface.co/ArtShtorm/Shtorm-PocketTTS-RU).
 
 ## Документация
