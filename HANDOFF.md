@@ -71,8 +71,20 @@
   `ShtormTTS-Windows-full-f7e6f5b-20261113-145304.zip` (SHA256
   `0D168493AC430385158A9CBBF35F4EC8934B36ADAC033916B4F2151C31D4178C`,
   целостность zip OK).
-- **Не делалось (по ТЗ)**: portable-комплект не пересобирался, релиз не
-  публиковался; движок/IPC/чанк-пул/математика не менялись.
+- **Portable g68 собран и принят (headless)**:
+  `C:\PocketTTS-GUI-Rust\dist\PocketTTS-GUI-Rust-Portable-2026-11-13-g68`
+  — git `f25e8a9` dirty=false, **61 файл** (+`PocketTTS-GUI-Rust-cpu.exe`),
+  3623.3 MiB, `-HardLinkPayload`; SHA256: GL-EXE `94E95FD6…C3AEE`,
+  cpu-EXE `842FE4FD…1301E8`. `build-portable.ps1` теперь включает cpu-EXE
+  (сборка `--no-default-features --features sw`; `-SkipCpuExe` — исключить);
+  README-PORTABLE описывает оба EXE. Приёмка из комплекта с CWD `C:\`:
+  portable-check OK обоими EXE; cpu-EXE hybrid fake 2×2 — 6/6, сирот 0;
+  GUI-смоук cpu-EXE из комплекта — шаблонный конфиг побайтово не тронут.
+  Полный раздел — `docs/PORTABLE_BUILD.md` (G6.8). Реальный CUDA-прогон и
+  проверка на целевой машине Win10 19045 — за пользователем.
+- **Не делалось (по ТЗ G6.8)**: релиз не публиковался, push не выполнялся;
+  движок/IPC/чанк-пул/математика не менялись; прежние комплекты не
+  тронуты.
 - **Ограничения**: целевая машина пользователя GitHub (Win10 19045, отказ
   WGL) не проверена — EXE для неё подготовлен; производительность
   отрисовки не мерилась; DPI >100 % на стенде недоступен (100 %, как и в

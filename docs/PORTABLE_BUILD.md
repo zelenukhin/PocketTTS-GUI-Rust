@@ -504,3 +504,49 @@ README) — не считается эталонным, не удалялся, �
 Автосохранение выбора точности и отсутствие консольных окон проверены на
 том же exe вне комплекта (`out/g63_gui_e2e4.ps1`, 9/9 PASS); GUI-подсистема
 и спавны детей не менялись со времён G6.2.3.
+
+## Результаты сборки G6.8 (2026-11-13)
+
+Комплект: `dist\PocketTTS-GUI-Rust-Portable-2026-11-13-g68` — из чистого
+дерева git `f25e8a9` (dirty=false), **61 файл** (60 прежних +
+`PocketTTS-GUI-Rust-cpu.exe`), 3623.3 MiB, hardlink-payload
+(`-HardLinkPayload`, диск C: заполнен). Оба EXE:
+
+- `PocketTTS-GUI-Rust.exe` — SHA256
+  `94E95FD650339C7C3F5A27A8D05E176B80AB0EB11C4F0BA6D37E71E1E31C3AEE`
+  (eframe/glow, OpenGL; не менялся с G6.7.1);
+- `PocketTTS-GUI-Rust-cpu.exe` — SHA256
+  `842FE4FD6C9FE49D756A5B35B2A3A1A783F818B8D810C143729666EC4E1301E8`
+  (программная отрисовка GUI на CPU: egui_software_backend-растеризатор +
+  softbuffer/GDI + собственный winit-цикл; в импортах PE нет
+  opengl32/d3d/dxgi — для машин, где glow падает с ошибкой WGL; «cpu» —
+  только про рендер GUI, CUDA/CPU-инференс тот же).
+
+Сборка (`tools/build-portable.ps1` теперь включает cpu-EXE автоматически;
+`-SkipCpuExe` — компактный комплект без него):
+
+```powershell
+powershell -File tools/build-portable.ps1 `
+  -Destination C:\PocketTTS-GUI-Rust\dist\PocketTTS-GUI-Rust-Portable-2026-11-13-g68 `
+  -ModelsDir C:\Users\<user>\Downloads\pocket_tts_android\build\onnx `
+  -Ffmpeg C:\PocketTTS-GUI\ffmpeg\ffmpeg.exe -HardLinkPayload
+```
+
+Приёмка (запуски с CWD `C:\`; конфиг комплекта — нетронутый шаблон):
+
+- `--portable-check` — OK из ОБЕИХ программ (все пути exe-relative:
+  модель/ORT/ffmpeg из каталога комплекта);
+- cpu-EXE `--portable-selftest-hybrid` (fake 2×2): процессов 2, воркеров 4,
+  6/6, HYBRID SELFTEST OK, сирот 0 — мультипроцессный конвейер G6.7
+  spawning'ит cpu-EXE без окна и графического рантайма;
+- GUI-смоук cpu-EXE из комплекта: окно открывается, закрытие exit 0,
+  шаблонный `PocketTTS-GUI-Rust.json` побайтово не тронут (no-change
+  закрытие ничего не пишет), осиротевших процессов нет;
+- реальный CPU FP32 WAV из cpu-EXE на тех же ресурсах (hardlink-песочница
+  g671): побитово = glow-EXE (SHA256 `E2267CAE…89E2`); batch-пул 2/2 —
+  см. `docs/G6_8_SOFTWARE_RENDERING.md`.
+
+Ограничение: целевая машина пользователя GitHub (Windows 10 x64 22H2
+19045.6454, отказ «extension to create ES context with wgl is not
+present») — комплект для неё подготовлен, проверка на ней за
+пользователем; до неё гарантий не заявляется.
