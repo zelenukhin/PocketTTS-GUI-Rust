@@ -1,25 +1,85 @@
 # HANDOFF.md — оперативный снимок проекта (читать первым вместе с AGENTS.md)
 
-- **Дата обновления**: 2026-11-12 (G6.7: единый постоянный ЧАНК-пул
-  P/W/C/T для CPU/CUDA, одиночного TXT и каталога — файлы строго
-  последовательно, чанки текущего файла параллельно; мультипроцессный
+- **Дата обновления**: 2026-11-13 (G6.8: второй EXE
+  **PocketTTS-GUI-Rust-cpu.exe** — полностью программная отрисовка GUI на CPU
+  без OpenGL/D3D/GPU; egui/eframe 0.31→0.34; общий кадр `update_ui` и общая
+  точка входа `entry` для обоих бинарников; собственный winit-цикл с
+  протоколом закрытия eframe (CancelClose/Close) для машины G6.2.3; отчёт
+  `docs/G6_8_SOFTWARE_RENDERING.md`. Ранее G6.7/G6.7.1: единый постоянный
+  ЧАНК-пул P/W/C/T для CPU/CUDA, одиночного TXT и каталога; мультипроцессный
   чанк-конвейер с бинарным PCM по IPC; отчёт
-  `docs/G6_7_UNIFIED_CHUNK_POOL.md`. Ранее G6.6: постоянный CPU-пул каталогов +
-  единая модель параллелизма P/W/F/T для CPU/CUDA, пресеты
-  «Оптимальный»/«Производительный» + режим «Свой», ручной мультипроцесс —
-  отчёт `docs/G6_6_PARALLEL_PROCESSING.md`. Ранее G6.5: полное
-  переименование приложения в
-  **PocketTTS-GUI-Rust** — exe, Cargo-крейт, заголовки GUI, файл настроек с
-  миграцией, portable-шаблоны/скрипты, документация; названия моделей
-  Shtorm-v2 и каталогов движка не менялись). Ранее 2026-11-11 (G6.4 —
-  адаптивный GUI; G6.4-compact — типографика Python-масштаба — отчёт
-  `docs/G6_4_RESPONSIVE_GUI.md`; G6.3 — INT8-модели v2, G6.2.3 —
-  автосохранение + GUI без консоли, G6.2.2a — IPC hardening, G6.2.1 —
-  жизненный цикл гибрида, G6.2 — гибридный пакетный CUDA 2×2; G6.1.2 —
-  запрет повторных CLI-опций).
+  `docs/G6_7_UNIFIED_CHUNK_POOL.md`. Ранее G6.6: постоянный CPU-пул
+  каталогов + единая модель параллелизма; G6.5: переименование в
+  **PocketTTS-GUI-Rust**; G6.4: адаптивный GUI; G6.3: INT8; G6.2.3:
+  автосохранение + GUI без консоли; G6.2: гибридный пакетный CUDA 2×2).
 - **HEAD**: только из Git (`git log -1 --oneline`), не из этого файла.
 
-## G6.7.1 — исправление GUI (текущий этап, малый фикс)
+## G6.8 — что сделано (текущий этап)
+
+- **EXE**: `cargo build --release --no-default-features --features sw` →
+  `target\release\PocketTTS-GUI-Rust-cpu.exe` (рядом с ресурсами
+  существующего portable-комплекта работает — portable-check OK из
+  hardlink-песочницы g671). Обычный `cargo build --release` — прежний
+  GL-EXE. В cpu-сборке eframe — опциональная (feature `sw` без `glow`)
+  зависимость: в PE-импортах НЕТ opengl32/d3d/dxgi (gdi32-вывод через
+  softbuffer), GL-fallback невозможен by construction. CUDA/CPU-инференс не
+  отключаются — «cpu» только про отрисовку.
+- **Версии**: egui/eframe 0.31→**0.34.3** (требование
+  egui_software_backend 0.0.3; eframe — default-features=false + glow,
+  т.к. wgpu стал умолчанием 0.34), egui_software_backend 0.0.3 (только
+  растеризатор, default-features=false/std), egui-winit 0.34.3 (default,
+  clipboard), winit 0.30.13, softbuffer 0.4.8, bytemuck (sw).
+- **Архитектура**: `app.rs` — общий кадр `ShtormApp::update_ui(ctx)` +
+  общий `on_exit_save()`; `eframe::App::ui` (0.34) вызывает update_ui.
+  `entry.rs` — общая точка входа/CLI/шрифты для ДВУХ бинарников
+  (`main.rs` — glow, `sw_main.rs` — программный); `--portable-*` и
+  `--internal-batch-worker` выполняются ДО окна, воркеры G6.7 из cpu-EXE
+  спавнят current_exe() без графического рантайма. `sw.rs` — собственный
+  winit-цикл (библиотечный рантайм крейта закрывает окно при CloseRequested
+  немедленно — несовместим с CloseFlow): протокол eframe — CloseRequested →
+  `ViewportEvent::Close` в viewport-инфу → CancelClose удерживает окно →
+  `ViewportCommand::Close` закрывает на следующем кадре; пробуждение из
+  потока синтеза — `set_request_repaint_callback`→EventLoopProxy с
+  дедупликацией по cumulative_pass_nr. Миграция 0.34: run→run_ui,
+  style→global_style; deprecated-панели на контексте сохранены с
+  allow(deprecated) (виджеты не переписывались).
+- **Проверки**: fmt OK; clippy `-D warnings` — 0 (glow; glow+sw; только
+  sw); `cargo test --release --features sw` — **293 passed / 0 failed**
+  (+2 sw-теста протокола закрытия). Найден и исправлен дефект собственного
+  цикла: протухший `ControlFlow::WaitUntil` крутил цикл вхолостую (87 %
+  ядра, ноль кадров) — планирование переписано по модели eframe
+  (`check_repaint`: наступившее → redraw, будущее → WaitUntil, ничего →
+  Wait; явный Wait в start) — простой **0 % CPU**, ввод — по событиям
+  (визуально подтверждено пользователем). Real из песочницы g671: cpu-EXE
+  portable-check OK; CPU FP32 WAV selftest OK; **WAV побитово ≡ GL-EXE**
+  (SHA256 `E2267CAE…89E2`); batch-пул 2/2; hybrid fake 2×2 — 6/6, сирот 0.
+  GUI-смоук обоих EXE: открытие/закрытие exit 0, FirstRun-автосохранение
+  создаёт конфиг, no-change закрытие байт-в-байт, сирот 0. Тёмная тема,
+  кириллица, реакция на мышь — визуальная приёмка пользователя.
+  **Закрытие во время синтеза (интерактивно, cpu-EXE)**: задание реально
+  шло (Pocket загружен, писался `.partial.wav`), крестик в генерации →
+  «закрытие: ожидаю отмену задания…» → отмена → автосохранение (конфиг
+  переписан) → штатный выход; `.partial` + diagnostic_log отмены на месте,
+  финальный файл НЕ опубликован (G5.1), сирот 0.
+  Финальные артефакты: `target\release\PocketTTS-GUI-Rust-cpu.exe`
+  11 592 192 Б, SHA256
+  `842FE4FD6C9FE49D756A5B35B2A3A1A783F818B8D810C143729666EC4E1301E8`
+  (импорты PE: без opengl32/d3d/dxgi); `target\release\PocketTTS-GUI-Rust.exe`
+  SHA256
+  `94E95FD650339C7C3F5A27A8D05E176B80AB0EB11C4F0BA6D37E71E1E31C3AEE`.
+  NAS-бэкап ДО этапа:
+  `ShtormTTS-Windows-full-f7e6f5b-20261113-145304.zip` (SHA256
+  `0D168493AC430385158A9CBBF35F4EC8934B36ADAC033916B4F2151C31D4178C`,
+  целостность zip OK).
+- **Не делалось (по ТЗ)**: portable-комплект не пересобирался, релиз не
+  публиковался; движок/IPC/чанк-пул/математика не менялись.
+- **Ограничения**: целевая машина пользователя GitHub (Win10 19045, отказ
+  WGL) не проверена — EXE для неё подготовлен; производительность
+  отрисовки не мерилась; DPI >100 % на стенде недоступен (100 %, как и в
+  G6.4); egui-панели на контексте — deprecated API (работает, миграция —
+  будущий этап).
+
+## G6.7.1 — исправление GUI (завершён)
 
 - **VRAM-оценка**: прежний код делил на 1000 уже гигабайтовые коэффициенты
   (показывал ~0.0 ГБ). Формула префлайта вынесена в единую чистую функцию

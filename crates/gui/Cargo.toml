@@ -6,8 +6,31 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-eframe = "0.31"
-egui = "0.31"
+# G6.8: egui 0.31 -> 0.34 (требование egui_software_backend 0.0.3; эталон
+# миграции — Demagog-RS b25f1ab). Оба рантайма (glow и программный) делят
+# одну версию egui.
+egui = "0.34"
+# G6.8: eframe без default-фич: в 0.34 умолчанием стал wgpu — явно glow;
+# рендерер не меняется. Опционален: EXE -cpu не линкует OpenGL вообще.
+eframe = { version = "0.34", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "glow",
+], optional = true }
+# G6.8: программный рантайм (feature sw): растеризация egui на CPU
+# (egui_software_backend — только ядро-растеризатор, без его winit-рантайма:
+# тот закрывает окно при CloseRequested немедленно и несовместим с машиной
+# закрытия CloseFlow G6.2.3), вывод пикселей — softbuffer (GDI на Windows),
+# окно/ввод/DPI/IME — winit + egui-winit, пробуждение GUI из фоновых
+# потоков — EventLoopProxy через ctx.set_request_repaint_callback.
+egui_software_backend = { version = "0.0.3", default-features = false, features = [
+    "std",
+], optional = true }
+egui-winit = { version = "0.34", optional = true }
+softbuffer = { version = "0.4", optional = true }
+winit = { version = "0.30", optional = true }
+# приведение пиксельного буфера softbuffer (&[u8]) к формату растеризатора
+bytemuck = { version = "1", optional = true }
 rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -20,6 +43,20 @@ shtorm-engine = { path = "../shtorm-engine" }
 # инициализация ORT в процессе GUI (load-dynamic, ORT_DYLIB_PATH)
 ort = { version = "=2.0.0-rc.11", default-features = false, features = ["load-dynamic"] }
 
+[features]
+default = ["glow"]
+# Обычный EXE PocketTTS-GUI-Rust.exe (eframe/glow, OpenGL).
+glow = ["dep:eframe"]
+# EXE PocketTTS-GUI-Rust-cpu.exe: полностью программная отрисовка GUI на CPU
+# (без OpenGL/WGL/D3D/GPU; CPU/CUDA-инференс не затрагивается).
+sw = [
+    "dep:egui_software_backend",
+    "dep:egui-winit",
+    "dep:softbuffer",
+    "dep:winit",
+    "dep:bytemuck",
+]
+
 [lib]
 name = "pockettts_gui_rust"
 path = "src/lib.rs"
@@ -27,6 +64,14 @@ path = "src/lib.rs"
 [[bin]]
 name = "PocketTTS-GUI-Rust"
 path = "src/main.rs"
+required-features = ["glow"]
+
+# G6.8: второй EXE — программный CPU-рендеринг GUI. Сборка:
+# cargo build --release --no-default-features --features sw
+[[bin]]
+name = "PocketTTS-GUI-Rust-cpu"
+path = "src/sw_main.rs"
+required-features = ["sw"]
 
 [target.'cfg(windows)'.dependencies]
 # G6.4: HWND живого окна для однократного размещения по рабочей области

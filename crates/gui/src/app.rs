@@ -1,11 +1,16 @@
-//! G1/G2: форма GUI (eframe/egui) с рабочей валидацией и запуском синтеза
+//! G1/G2: форма GUI (egui) с рабочей валидацией и запуском синтеза
 //! (G2 — фоновый поток поверх app_core::pipeline::synthesize_stream).
 //!
 //! G6.2.3: автосохранение настроек при штатном закрытии окна — явная машина
 //! состояний [`CloseFlow`] (закрытие при живом задании по-прежнему ждёт
 //! отмены и завершения потока, публикация дорабатывает).
+//!
+//! G6.8: egui обновлён 0.31 → 0.34 (требование egui_software_backend 0.0.3).
+//! Кадр UI выделен в [`ShtormApp::update_ui`] и используется ОБОИМИ
+//! рантаймами: eframe/glow (EXE PocketTTS-GUI-Rust) и программным
+//! sw-рантаймом (EXE PocketTTS-GUI-Rust-cpu, без OpenGL).
 
-use eframe::egui;
+use egui;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -640,7 +645,9 @@ impl ShtormApp {
     /// (CancelClose) → завершение потока → автосохранение → Close. Отмена
     /// не блокирует UI-поток (нет ожидания CUDA/IPC — только флаг и дренаж
     /// событий в poll_job).
-    fn handle_close_flow(&mut self, ctx: &egui::Context) {
+    // G6.8: pub(crate) — headless-тесты программного рантайма (sw.rs)
+    // проверяют контракт CloseFlow поверх обоих рантаймов.
+    pub(crate) fn handle_close_flow(&mut self, ctx: &egui::Context) {
         let close_requested = ctx.input(|i| i.viewport().close_requested());
         if close_requested {
             match self.close_flow {
@@ -1415,8 +1422,10 @@ fn two_columns_threshold() -> f32 {
 
 /// Типографика и отступы — один раз при старте. Размеры логические:
 /// при 125/150/200 % Windows масштабирование делает egui, а не мы.
+/// (egui 0.34: `Context::style`/`set_style` переименованы в
+/// `global_style`/`set_global_style`.)
 fn configure_style(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
+    let mut style = (*ctx.global_style()).clone();
     style.text_styles = [
         (
             egui::TextStyle::Heading,
@@ -1444,7 +1453,7 @@ fn configure_style(ctx: &egui::Context) {
     style.spacing.icon_width_inner = 9.0;
     style.spacing.icon_spacing = 5.0;
     style.spacing.indent = 20.0;
-    ctx.set_style(style);
+    ctx.set_global_style(style);
 }
 
 /// Второстепенный текст: 13 пт (как основной) и контраст в обеих темах
@@ -1870,8 +1879,17 @@ fn two_columns(
     }
 }
 
-impl eframe::App for ShtormApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+impl ShtormApp {
+    /// G6.8: один кадр UI для обоих рантаймов (eframe/glow и программный
+    /// sw). Выделен из `eframe::App::update` (миграция egui 0.34: рантаймы
+    /// передают корневой `Ui`, контекст берётся из него); принимает только
+    /// egui-контекст — платформенно-зависимой части (eframe::Frame) в кадре
+    /// нет, поэтому логика не дублируется.
+    // egui 0.34 объявил deprecated панели/`screen_rect` на контексте
+    // (замена — `show_inside`/`content_rect`); миграция компоновки G6.4 не
+    // входит в этап G6.8 — те же API работают, поведение не изменилось.
+    #[allow(deprecated)]
+    pub(crate) fn update_ui(&mut self, ctx: &egui::Context) {
         // G5: тема применяется только при изменении настройки, не каждый кадр.
         if self.theme_applied != self.settings.theme_dark {
             ctx.set_visuals(if self.settings.theme_dark {
@@ -2268,7 +2286,8 @@ impl eframe::App for ShtormApp {
     /// ошибку пользователю уже некому: политика/снимок соблюдаются те же,
     /// отказ фиксируется в stderr (при перенаправленных потоках — в журнале
     /// скрипта). Основной путь — handle_close_flow, на Drop не полагаемся.
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    /// G6.8: метод общий для обоих рантаймов (eframe on_exit и sw-цикл).
+    pub(crate) fn on_exit_save(&mut self) {
         if self.close_flow != CloseFlow::Idle {
             return; // штатный поток закрытия уже сохранил/осознанно пропустил
         }
@@ -2285,7 +2304,24 @@ impl eframe::App for ShtormApp {
     }
 }
 
+/// G6.8: рантайм eframe/glow — только в EXE PocketTTS-GUI-Rust (feature
+/// `glow`); программный EXE вообще не линкует eframe/OpenGL.
+#[cfg(feature = "glow")]
+impl eframe::App for ShtormApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.update_ui(ui.ctx());
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.on_exit_save();
+    }
+}
+
 #[cfg(test)]
+// egui 0.34: в headless-тестах панели на контексте (CentralPanel::show и
+// т.п.) объявлены deprecated, но остаются штатным способом сборки кадра
+// без рантайма — миграция компоновки не входит в G6.8.
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
@@ -2333,8 +2369,8 @@ mod tests {
                     modifiers: egui::Modifiers::NONE,
                 });
             }
-            let _ = ctx.run(raw, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            let _ = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default().show(ui.ctx(), |ui| {
                     let was_open = open;
                     let resp = egui::CollapsingHeader::new("Тест-секция")
                         .open(Some(open))
@@ -3032,7 +3068,7 @@ mod tests {
         }
         let mut raw = egui::RawInput::default();
         raw.viewports.insert(egui::ViewportId::ROOT, info);
-        let full = ctx.run(raw, |ctx| app.handle_close_flow(ctx));
+        let full = ctx.run_ui(raw, |ui| app.handle_close_flow(ui.ctx()));
         full.viewport_output
             .get(&egui::ViewportId::ROOT)
             .map(|o| o.commands.clone())
@@ -3411,14 +3447,14 @@ mod tests {
         let conf = close_sandbox("onexit");
         let mut app = ShtormApp::with_conf_path(conf.clone());
         app.settings.temperature = 0.75;
-        <ShtormApp as eframe::App>::on_exit(&mut app, None);
+        app.on_exit_save();
         assert_eq!(load_settings(&conf).unwrap().temperature, 0.75);
 
         // уже закрытое штатным потоком состояние не сохраняет повторно
         let mut app2 = ShtormApp::with_conf_path(conf.clone());
         app2.settings.temperature = 0.31;
         app2.close_flow = crate::app::CloseFlow::Closing;
-        <ShtormApp as eframe::App>::on_exit(&mut app2, None);
+        app2.on_exit_save();
         assert_eq!(
             load_settings(&conf).unwrap().temperature,
             0.75,
@@ -3431,7 +3467,7 @@ mod tests {
         std::fs::write(&conf2, b"not json").unwrap();
         let mut app3 = ShtormApp::with_conf_path(conf2.clone());
         app3.settings.temperature = 0.9;
-        <ShtormApp as eframe::App>::on_exit(&mut app3, None);
+        app3.on_exit_save();
         assert_eq!(std::fs::read(&conf2).unwrap(), b"not json");
     }
 
@@ -3602,8 +3638,8 @@ mod tests {
         let ctx = egui::Context::default();
         configure_style(&ctx);
         let mut rects = None;
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            egui::CentralPanel::default().show(ui.ctx(), |ui| {
                 ui.vertical(|ui| {
                     ui.set_width(500.0);
                     let mut checked = true;

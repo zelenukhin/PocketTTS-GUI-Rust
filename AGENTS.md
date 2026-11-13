@@ -73,7 +73,16 @@ GUI для Pocket-TTS на Rust; репозиторий —
   ep_probe,synthesize,diag_p2b2,diag_p2b3}.rs` (CLI/диагностика —
   тестовый инструмент; GUI не должен их
   запускать, а звать app-core напрямую).
-- `crates/gui` — eframe/egui 0.31: `window.rs` (G6.4: стартовый размер по
+- `crates/gui` — egui 0.34 (G6.8): ДВА бинарника на одной библиотеке —
+  `PocketTTS-GUI-Rust.exe` (eframe/glow, OpenGL; feature `glow`) и
+  `PocketTTS-GUI-Rust-cpu.exe` (программная отрисовка CPU без OpenGL —
+  egui_software_backend-растеризатор + softbuffer/GDI + собственный
+  winit-цикл с протоколом закрытия eframe; feature `sw`, сборка
+  `cargo build --release --no-default-features --features sw`; «cpu» —
+  только про рендер GUI, CUDA-инференс не отключается). Общая точка
+  входа/CLI — `entry.rs` (диагностика `--portable-*` и внутренний
+  worker-режим выполняются ДО окна и не зависят от рантайма), общий кадр —
+  `app.rs::ShtormApp::update_ui`; `window.rs` (G6.4: стартовый размер по
   РАБОЧЕЙ области монитора запуска и DPI; 1080×900 с ограничениями
   560…1440×420…1050, миним не больше экрана; однократное
   `SetWindowPos` в физических пикселях до первого кадра; никаких
