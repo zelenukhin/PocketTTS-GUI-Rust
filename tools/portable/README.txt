@@ -3,10 +3,21 @@ PocketTTS-GUI-Rust — portable Windows x64 build
 
 Run: PocketTTS-GUI-Rust.exe
 
+No OpenGL / no GPU driver? Run PocketTTS-GUI-Rust-cpu.exe instead:
+it renders the whole interface on the CPU (GDI) and never touches
+OpenGL, Direct3D or the GPU. Both executables share the same settings
+file (PocketTTS-GUI-Rust.json), the same synthesis engine and the same
+command-line diagnostics; "cpu" in the file name refers ONLY to drawing
+the GUI — CPU and CUDA inference work the same as in the main EXE.
+If PocketTTS-GUI-Rust.exe fails to start with a WGL/GL error, use the
+-cpu build.
+
 Layout:
   msvcp140.dll, msvcp140_1.dll,
   vcruntime140.dll, vcruntime140_1.dll  MSVC++ redistributable runtime
-  PocketTTS-GUI-Rust.exe                 GUI executable
+  PocketTTS-GUI-Rust.exe                 GUI executable (eframe/glow, OpenGL)
+  PocketTTS-GUI-Rust-cpu.exe             GUI executable (software CPU rendering,
+                                       no OpenGL/D3D/GPU required)
   models/ru-v2-fast, models/ru-v2-slow  ONNX models (FP32 default; also
                                        *_int8.onnx graphs: flow_lm_main_int8,
                                        flow_lm_flow_int8, mimi_decoder_int8 —
@@ -69,6 +80,7 @@ Diagnostics:
 
   PocketTTS-GUI-Rust.exe --portable-check
       Print resolved model / ORT / ffmpeg paths and exit.
+      (PocketTTS-GUI-Rust-cpu.exe accepts the same diagnostic commands.)
   PocketTTS-GUI-Rust.exe --portable-selftest [--device cpu|cuda] [--format wav|mp3|opus]
       Run a short synthesis from the portable directory and exit.
   PocketTTS-GUI-Rust.exe --portable-selftest-batch [--device cpu|cuda]

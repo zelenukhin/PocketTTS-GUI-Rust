@@ -29,6 +29,9 @@ param(
     [switch]$SkipCuda,
     [switch]$SkipFfmpeg,
     [switch]$SkipInt8Models,
+    # G6.8: не включать PocketTTS-GUI-Rust-cpu.exe (программный рендер GUI
+    # без OpenGL). По умолчанию комплект содержит ОБА EXE.
+    [switch]$SkipCpuExe,
     [switch]$HardLinkPayload,
     [ValidateSet("release", "debug")][string]$Configuration = "release"
 )
@@ -164,6 +167,26 @@ if (-not (Test-Path -LiteralPath $exeSrc -PathType Leaf)) {
     throw "Built GUI exe not found: $exeSrc"
 }
 
+# G6.8: второй EXE — полностью программная отрисовка GUI (без OpenGL/D3D/GPU),
+# для машин, где glow-рантайм не может создать GL-контекст. Собирается своей
+# feature-конфигурацией (eframe в бинарнике отсутствует).
+$cpuExeSrc = $null
+if (-not $SkipCpuExe) {
+    Push-Location $repo
+    try {
+        & $cargo build --release --no-default-features --features sw --bin PocketTTS-GUI-Rust-cpu
+        if ($LASTEXITCODE -ne 0) {
+            throw "cargo build (cpu exe) failed with exit code $LASTEXITCODE"
+        }
+    } finally {
+        Pop-Location
+    }
+    $cpuExeSrc = Join-Path $repo "target\release\PocketTTS-GUI-Rust-cpu.exe"
+    if (-not (Test-Path -LiteralPath $cpuExeSrc -PathType Leaf)) {
+        throw "Built CPU GUI exe not found: $cpuExeSrc"
+    }
+}
+
 # --- dependency sources ---
 $cpuRoot = Join-Path $repo "deps\ort-cpu\onnxruntime-win-x64-1.23.2"
 $cpuLib = Join-Path $cpuRoot "lib"
@@ -292,6 +315,9 @@ foreach ($d in @(
 
 # --- binaries ---
 Copy-Verified $exeSrc (Join-Path $dest "PocketTTS-GUI-Rust.exe")
+if ($cpuExeSrc) {
+    Copy-Verified $cpuExeSrc (Join-Path $dest "PocketTTS-GUI-Rust-cpu.exe")
+}
 foreach ($f in $vcFiles) {
     Copy-Verified (Join-Path $vcDir $f) (Join-Path $dest $f)
 }
@@ -408,11 +434,24 @@ foreach ($rel in $required) {
         throw "Required file missing in distribution: $rel"
     }
 }
+if ($cpuExeSrc) {
+    $required += "PocketTTS-GUI-Rust-cpu.exe"
+    $p = Join-Path $dest "PocketTTS-GUI-Rust-cpu.exe"
+    if (-not (Test-Path -LiteralPath $p -PathType Leaf)) {
+        throw "Required file missing in distribution: PocketTTS-GUI-Rust-cpu.exe"
+    }
+}
 
 # --- semantic checks ---
 $exeInfo = Get-Item -LiteralPath (Join-Path $dest "PocketTTS-GUI-Rust.exe")
 if ($exeInfo.Length -lt 1000000) {
     throw "PocketTTS-GUI-Rust.exe looks too small: $($exeInfo.Length) bytes"
+}
+if ($cpuExeSrc) {
+    $cpuExeInfo = Get-Item -LiteralPath (Join-Path $dest "PocketTTS-GUI-Rust-cpu.exe")
+    if ($cpuExeInfo.Length -lt 5000000) {
+        throw "PocketTTS-GUI-Rust-cpu.exe looks too small: $($cpuExeInfo.Length) bytes"
+    }
 }
 
 if (-not $SkipModels) {
@@ -497,6 +536,11 @@ Write-Utf8NoBom $manifestPath (($manifest | ConvertTo-Json -Depth 8) + "`n")
 $allFiles = Get-ChildItem -LiteralPath $dest -Recurse -File
 $totalBytes = ($allFiles | Measure-Object -Property Length -Sum).Sum
 $exeHash = (Get-FileHash -LiteralPath (Join-Path $dest "PocketTTS-GUI-Rust.exe") -Algorithm SHA256).Hash
+$cpuExeHash = if ($cpuExeSrc) {
+    (Get-FileHash -LiteralPath (Join-Path $dest "PocketTTS-GUI-Rust-cpu.exe") -Algorithm SHA256).Hash
+} else {
+    "not bundled"
+}
 
 Write-Host ""
 Write-Host "PORTABLE BUILD OK"
@@ -505,4 +549,5 @@ Write-Host "Version     : $version (git $commit, dirty=$gitDirty)"
 Write-Host "Files       : $($allFiles.Count)"
 Write-Host "Total size  : $([math]::Round($totalBytes / 1MB, 1)) MiB"
 Write-Host "Exe SHA256  : $exeHash"
+Write-Host "CPU Exe SHA256: $cpuExeHash"
 Write-Host "Manifest    : $manifestPath"
