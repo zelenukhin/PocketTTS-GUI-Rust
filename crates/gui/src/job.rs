@@ -329,9 +329,9 @@ pub fn pipeline_options(
         pause_scale: s.pause_scale,
         paragraph_pause_s: s.paragraph_pause_s,
         max_tokens: s.max_tokens,
-        // G7 этап 3: дефолт; поля GuiSettings chunking_mode/max_chunk_chars — этап 4
-        chunking: text_processing::ChunkingMode::Standard,
-        max_chunk_chars: 150,
+        // G7: режим чанкования из настроек (единый тип ChunkingMode)
+        chunking: s.chunking_mode,
+        max_chunk_chars: s.max_chunk_chars,
         char_rules,
         anti_repeat: s.anti_repeat,
     }
@@ -2679,6 +2679,8 @@ mod tests {
             pause_scale: 0.75,
             paragraph_pause_s: 1.25,
             max_tokens: 80,
+            chunking_mode: text_processing::ChunkingMode::TeraTtsAndroid,
+            max_chunk_chars: 180,
             anti_repeat: false,
             ..Default::default()
         };
@@ -2700,6 +2702,8 @@ mod tests {
         assert_eq!(o.pause_scale, 0.75);
         assert_eq!(o.paragraph_pause_s, 1.25);
         assert_eq!(o.max_tokens, 80);
+        assert_eq!(o.chunking, text_processing::ChunkingMode::TeraTtsAndroid);
+        assert_eq!(o.max_chunk_chars, 180);
         // char_rules передаются по ссылке в задачи — проверяем содержимое
         assert_eq!(
             o.char_rules.map(|r| r.char_map.len()),

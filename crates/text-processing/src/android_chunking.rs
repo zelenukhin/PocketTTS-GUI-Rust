@@ -31,11 +31,12 @@ use serde::{Deserialize, Serialize};
 /// "lowercase"` дал бы `"terattsandroid"`, поэтому вариант переименован
 /// явно (SPEC_CORRECTIONS 0.1). Неизвестное значение — ошибка чтения
 /// конфига, молчаливая подмена режима не допускается.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ChunkingMode {
     /// Существующий Windows-конвейер: `chunk_pipeline` + `max_tokens`
     /// (не меняется).
+    #[default]
     Standard,
     /// Конвейер teratts-android: `android_chunk_pipeline` +
     /// `max_chunk_chars` (Unicode-символы).

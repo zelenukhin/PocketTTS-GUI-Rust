@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use shtorm_engine::{EosTail, ModelPrecision};
+use text_processing::ChunkingMode;
 
 /// Порог EOS в настройках GUI (G4.1/G5). В интерфейсе G5 выбранное значение —
 /// всегда число; `Auto` оставлен только как совместимый алиас старых конфигов
@@ -161,6 +162,15 @@ pub struct GuiSettings {
     pub pause_scale: f32,
     pub paragraph_pause_s: f32,
     pub max_tokens: u32,
+    /// G7: алгоритм разбиения текста. Сериализация — нормативный контракт
+    /// `"chunking_mode": "standard" | "teratts_android"`; неизвестное
+    /// значение — ошибка чтения конфига (без молчаливой подмены режима).
+    pub chunking_mode: ChunkingMode,
+    /// G7: лимит чанка в Unicode-символах (только TeraTtsAndroid; GUI
+    /// 50..=300 шаг 10). Хранится как есть: 0 отвергается планом явной
+    /// ошибкой, значения вне диапазона клампятся только в виджете.
+    #[serde(default = "default_max_chunk_chars")]
+    pub max_chunk_chars: u32,
     /// None = автомат по устройству (CPU 2 / CUDA 1), ручной выбор не
     /// перезаписывается при смене устройства. G6.6: поле управляет ТОЛЬКО
     /// воркерами чанков одиночного файла; пакетная обработка —
@@ -582,6 +592,10 @@ pub const MP3_PRESETS: &[&str] = &[
 ];
 pub const OPUS_PRESETS: &[&str] = &["opus 96k", "opus 64k", "opus 32k"];
 
+fn default_max_chunk_chars() -> u32 {
+    150
+}
+
 impl Default for GuiSettings {
     fn default() -> Self {
         Self {
@@ -614,6 +628,8 @@ impl Default for GuiSettings {
             pause_scale: 1.0,
             paragraph_pause_s: 0.9,
             max_tokens: 50,
+            chunking_mode: ChunkingMode::Standard,
+            max_chunk_chars: 150,
             workers: None,
             parallel_cpu: ParallelSettings::default(),
             parallel_cuda: ParallelSettings::default(),
@@ -1575,6 +1591,100 @@ mod tests {
         assert!(
             load_settings(&p).unwrap().theme_dark,
             "старый конфиг без ключа — тёмная тема"
+        );
+    }
+
+    /// G7: режим чанкования — сериализация/миграция/независимость значений.
+    #[test]
+    fn chunking_mode_round_trip_both_modes() {
+        let d = tmpdir("chunk_rt");
+        let p = d.join("s.json");
+        // standard + max_tokens 50
+        let s = GuiSettings::default();
+        assert_eq!(s.chunking_mode, ChunkingMode::Standard);
+        assert_eq!(s.max_chunk_chars, 150);
+        save_settings(&s, &p).unwrap();
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(raw.contains("\"chunking_mode\": \"standard\""), "{raw}");
+        assert!(raw.contains("\"max_chunk_chars\": 150"), "{raw}");
+        assert_eq!(
+            load_settings(&p).unwrap().chunking_mode,
+            ChunkingMode::Standard
+        );
+        // teratts_android + 180
+        let s = GuiSettings {
+            chunking_mode: ChunkingMode::TeraTtsAndroid,
+            max_chunk_chars: 180,
+            ..Default::default()
+        };
+        save_settings(&s, &p).unwrap();
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            raw.contains("\"chunking_mode\": \"teratts_android\""),
+            "{raw}"
+        );
+        let back = load_settings(&p).unwrap();
+        assert_eq!(back.chunking_mode, ChunkingMode::TeraTtsAndroid);
+        assert_eq!(back.max_chunk_chars, 180);
+    }
+
+    #[test]
+    fn chunking_mode_old_config_defaults_standard() {
+        let d = tmpdir("chunk_old");
+        let p = d.join("s.json");
+        // старый конфиг без новых ключей: Standard/150, ошибок нет, прочие
+        // настройки сохранены
+        std::fs::write(
+            &p,
+            r#"{"temperature": 0.6, "max_tokens": 50, "pause_scale": 1.2}"#,
+        )
+        .unwrap();
+        let s = load_settings(&p).unwrap();
+        assert_eq!(s.chunking_mode, ChunkingMode::Standard);
+        assert_eq!(s.max_chunk_chars, 150);
+        assert_eq!(s.temperature, 0.6);
+        assert_eq!(s.max_tokens, 50);
+        assert_eq!(s.pause_scale, 1.2);
+    }
+
+    #[test]
+    fn chunking_mode_unknown_value_is_error_not_substitution() {
+        let d = tmpdir("chunk_bad");
+        let p = d.join("s.json");
+        for bad in ["terattsandroid", "android", "TeraTtsAndroid"] {
+            std::fs::write(&p, format!("{{\"chunking_mode\": \"{bad}\"}}")).unwrap();
+            let err = load_settings(&p);
+            assert!(
+                err.is_err(),
+                "{bad} не должен читаться (молчаливая подмена запрещена)"
+            );
+        }
+    }
+
+    #[test]
+    fn chunking_mode_switch_keeps_both_values_independent() {
+        // сценарий задания: Standard(50) → Android(180) → save/load →
+        // Standard → max_tokens всё ещё 50 → Android → 180 на месте
+        let d = tmpdir("chunk_switch");
+        let p = d.join("s.json");
+        let mut s = GuiSettings {
+            max_tokens: 50,
+            chunking_mode: ChunkingMode::Standard,
+            ..Default::default()
+        };
+        s.chunking_mode = ChunkingMode::TeraTtsAndroid;
+        s.max_chunk_chars = 180;
+        save_settings(&s, &p).unwrap();
+        let mut s = load_settings(&p).unwrap();
+        assert_eq!(s.max_chunk_chars, 180);
+        s.chunking_mode = ChunkingMode::Standard;
+        save_settings(&s, &p).unwrap();
+        let s = load_settings(&p).unwrap();
+        assert_eq!(s.chunking_mode, ChunkingMode::Standard);
+        assert_eq!(s.max_tokens, 50, "max_tokens не пересчитывается");
+        assert_eq!(
+            s.max_chunk_chars, 180,
+            "max_chunk_chars пережил возврат в Standard"
         );
     }
 
