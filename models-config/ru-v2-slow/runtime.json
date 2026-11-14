@@ -1,0 +1,19 @@
+{
+    "eos_threshold": -1.0,
+    "frames_after_eos": 0,
+    "char_rules": {
+        "regex_rules": [
+            {"pattern": "([!?])\\.{2,}", "replacement": "\\1"},
+            {"pattern": "\\.{2,}(?=[,;:!?…])", "replacement": ""},
+            {"pattern": "\\.{2,}(?=\\s+[а-яёa-z])", "replacement": ""},
+            {"pattern": "\\.{2,}", "replacement": "."}
+        ],
+        "char_map": {
+            "‹": "«",
+            "›": "»"
+        },
+        "dash_context": "−‒‑―",
+        "bracket_comma": "{}",
+        "delete_chars": "%&@#"
+    }
+}
