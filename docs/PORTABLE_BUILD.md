@@ -505,6 +505,24 @@ README) — не считается эталонным, не удалялся, �
 том же exe вне комплекта (`out/g63_gui_e2e4.ps1`, 9/9 PASS); GUI-подсистема
 и спавны детей не менялись со времён G6.2.3.
 
+## Результаты сборки G7 v1.1 (2026-11-14)
+
+`dist\PocketTTS-GUI-Rust-Portable-2026-11-14-g7-v1.1` — git `6d4d22d`
+(dirty=false; = g7 + bump версии окна на **v1.1** в заголовке обоих EXE и
+верхней панели, README), 61 файл, 3624.1 MiB, `-HardLinkPayload`:
+
+- `PocketTTS-GUI-Rust.exe` — SHA256
+  `DFEC0EFD153F1B90C15DF74C57F9CC8C1BA4100979723C92C9D1E4F7105AAF1C`
+- `PocketTTS-GUI-Rust-cpu.exe` — SHA256
+  `3B695AF664BF6E13EC884D91E2CED56764041599310C0D6F5F72CA3D23FC34E2`
+
+Приёмка: строка «PocketTTS-GUI-Rust v1.1» присутствует в обоих EXE
+(по 2 вхождения: заголовок + панель), «v1.0» отсутствует;
+`--portable-check` с CWD `C:\` — OK обоими EXE (лог
+`out/g7/portable_build_v11.log`). Комплект `...-g7` (v1.0-окно) —
+исторический артефакт, не удалялся. Реальный CUDA-прогон и визуальная
+проверка — за пользователем.
+
 ## Результаты сборки G7 (2026-11-14)
 
 Комплект: `dist\PocketTTS-GUI-Rust-Portable-2026-11-14-g7` — из чистого

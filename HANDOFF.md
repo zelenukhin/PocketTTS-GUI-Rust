@@ -70,7 +70,15 @@
   ALL PASS (после починки `<user>`-плейсхолдеров из 6d10c10 на
   `$env:USERPROFILE` — скрипты были неработоспособны на любой машине).
 - **Артефакты**: `out/g7/` (WAV CPU×3/CUDA, журналы, логи прогонов).
-- **Portable G7 собран и принят (headless)**:
+- **Portable G7-v1.1 собран и принят (headless)** (6d4d22d: версия окна
+  v1.1 в заголовке/панели обоих EXE):
+  `C:\PocketTTS-GUI-Rust\dist\PocketTTS-GUI-Rust-Portable-2026-11-14-g7-v1.1`
+  — git `6d4d22d` dirty=false, 61 файл, 3624.1 MiB, `-HardLinkPayload`;
+  SHA256: GL `DFEC0EFD…AAF1C`, cpu `3B695AF6…C34E2`; v1.1 в обоих EXE
+  подтверждена, portable-check OK обоими EXE. NAS-бэкап ДО сборки:
+  `ShtormTTS-Windows-full-6d4d22d-20261114.zip` (SHA256 `732A13BE…D5E98E`).
+  Прежний комплект `...-2026-11-14-g7` (окно v1.0) — исторический.
+- **Portable G7 (v1.0-окно, заменён v1.1)**:
   `C:\PocketTTS-GUI-Rust\dist\PocketTTS-GUI-Rust-Portable-2026-11-14-g7`
   — git `c8ca2d9` dirty=false, 61 файл, 3624.1 MiB, `-HardLinkPayload`;
   SHA256: GL-EXE `1E43CACC…BC6F4C`, cpu-EXE `76E7AEE8…AA49211`. Приёмка из
