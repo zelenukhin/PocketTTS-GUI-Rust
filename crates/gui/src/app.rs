@@ -1982,7 +1982,7 @@ impl ShtormApp {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("PocketTTS-GUI-Rust v1.0")
+                    egui::RichText::new("PocketTTS-GUI-Rust v1.1")
                         .heading()
                         .strong(),
                 );

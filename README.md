@@ -4,7 +4,7 @@
 (ONNX) + GUI для синтеза аудиокниг. FP32 **и INT8**, CPU и NVIDIA CUDA,
 без Python/PyTorch в рантайме. Готовые сборки — в
 [Releases](https://github.com/zelenukhin/PocketTTS-GUI-Rust/releases)
-(портативные `v1.0 CPU` / `v1.0 GPU`, установки не требуют).
+(портативные `v1.1 CPU` / `v1.1 GPU`, установки не требуют).
 
 ## Модели
 

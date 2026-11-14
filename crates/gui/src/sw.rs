@@ -272,7 +272,7 @@ impl SwGui {
         let builder = egui::ViewportBuilder::default()
             .with_inner_size(plan.inner_size)
             .with_min_inner_size(plan.min_inner_size)
-            .with_title("PocketTTS-GUI-Rust v1.0");
+            .with_title("PocketTTS-GUI-Rust v1.1");
 
         // Баг Wayland в egui-winit: resizable нельзя задать при создании —
         // выставляется после (на Windows безопасно в любом порядке).

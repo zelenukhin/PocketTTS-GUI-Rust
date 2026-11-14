@@ -50,7 +50,7 @@ fn run_glow_gui() -> i32 {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(plan.inner_size)
             .with_min_inner_size(plan.min_inner_size)
-            .with_title("PocketTTS-GUI-Rust v1.0"),
+            .with_title("PocketTTS-GUI-Rust v1.1"),
         ..Default::default()
     };
     match eframe::run_native(
