@@ -84,6 +84,16 @@ struct Args {
     /// int8 — main/flow/decoder квантованные, encoder/text FP32.
     #[arg(long, default_value = "fp32")]
     precision: String,
+    /// G7: алгоритм разбиения текста: standard — прежний конвейер
+    /// (--max-tokens), android — терatts-android (лимит в символах).
+    /// CLI-значение `android` и JSON-значение `teratts_android` — разные
+    /// внешние представления одного enum ChunkingMode.
+    #[arg(long, default_value = "standard", value_parser = parse_chunking)]
+    chunking: text_processing::ChunkingMode,
+    /// G7: лимит чанка в Unicode-символах (только --chunking android;
+    /// 150 — эталон TeraTTS Android; 0 запрещён).
+    #[arg(long, default_value_t = 150)]
+    max_chunk_chars: u32,
 }
 
 /// Разбор значения хвоста EOS: `none` — отдельное состояние (штатная
@@ -101,6 +111,16 @@ fn parse_eos_tail(s: &str) -> Result<EosTail, String> {
                 Ok(EosTail::Fixed(n))
             }
         }
+    }
+}
+
+/// Разбор режима чанкования (clap value_parser: неверное значение —
+/// exit 2 с понятной диагностикой ДО загрузки Pocket).
+fn parse_chunking(s: &str) -> Result<text_processing::ChunkingMode, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "standard" => Ok(text_processing::ChunkingMode::Standard),
+        "android" => Ok(text_processing::ChunkingMode::TeraTtsAndroid),
+        other => Err(format!("--chunking: standard|android, получено '{other}'")),
     }
 }
 
@@ -126,6 +146,12 @@ fn main() -> ExitCode {
 fn run() -> Result<ExitCode> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
+    // G7: явная ошибка до загрузки Pocket (паритет с валидацией плана)
+    anyhow::ensure!(
+        args.max_chunk_chars >= 1,
+        "--max-chunk-chars: минимум 1, получено {}",
+        args.max_chunk_chars
+    );
     if std::env::var("ORT_DYLIB_PATH").is_err() {
         bail!("ORT_DYLIB_PATH не задан (см. tools/smoke-cpu.ps1 / smoke-cuda.ps1)");
     }
@@ -204,19 +230,26 @@ fn run() -> Result<ExitCode> {
         pause_scale: args.pause_scale,
         paragraph_pause_s: args.paragraph_pause_s,
         max_tokens: args.max_tokens,
-        // G7 этап 3: дефолт; CLI-флаги --chunking/--max-chunk-chars — этап 6
-        chunking: text_processing::ChunkingMode::Standard,
-        max_chunk_chars: 150,
+        chunking: args.chunking,
+        max_chunk_chars: args.max_chunk_chars,
         char_rules,
         anti_repeat: true,
     };
 
+    let chunking_desc = match opts.chunking {
+        text_processing::ChunkingMode::Standard => {
+            format!("standard (токенов {})", args.max_tokens)
+        }
+        text_processing::ChunkingMode::TeraTtsAndroid => {
+            format!("android (символов {})", args.max_chunk_chars)
+        }
+    };
     println!(
-        "поток: {} | формат {:?} ({}) | чанков-лимит {} | паузы ×{:.2} | абзац {:.2} с | {} | воркеров {}",
+        "поток: {} | формат {:?} ({}) | чанкование {} | паузы ×{:.2} | абзац {:.2} с | {} | воркеров {}",
         args.text_file.display(),
         format,
         args.mp3_preset,
-        args.max_tokens,
+        chunking_desc,
         args.pause_scale,
         args.paragraph_pause_s,
         args.device,
@@ -436,5 +469,34 @@ mod tests {
         let mut args = base_args();
         args.extend(["--eos-tail-long".into(), "auto".into()]);
         assert!(Args::try_parse_from(args).is_err());
+    }
+
+    /// G7: режим чанкования CLI — standard по умолчанию, android и 150
+    /// символов читаются, мусорные значения отвергаются парсером (exit 2).
+    #[test]
+    fn chunking_defaults_and_parsing() {
+        let a = Args::try_parse_from(base_args()).unwrap();
+        assert_eq!(a.chunking, text_processing::ChunkingMode::Standard);
+        assert_eq!(a.max_chunk_chars, 150);
+        assert_eq!(a.max_tokens, 50, "дефолты обоих лимитов независимы");
+
+        let mut args = base_args();
+        args.extend(["--chunking".into(), "android".into()]);
+        let a = Args::try_parse_from(args).unwrap();
+        assert_eq!(a.chunking, text_processing::ChunkingMode::TeraTtsAndroid);
+
+        let mut args = base_args();
+        args.extend(["--chunking".into(), "android".into(), "--max-chunk-chars".into(), "180".into()]);
+        let a = Args::try_parse_from(args).unwrap();
+        assert_eq!(a.max_chunk_chars, 180);
+
+        for bad in ["foo", "teratts_android", "TeraTtsAndroid", ""] {
+            let mut args = base_args();
+            args.extend(["--chunking".into(), bad.into()]);
+            assert!(
+                Args::try_parse_from(args).is_err(),
+                "значение '{bad}' должно отвергаться (CLI-контракт — standard|android)"
+            );
+        }
     }
 }
