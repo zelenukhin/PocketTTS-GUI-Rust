@@ -7,8 +7,10 @@
 //! `android_tera.rs` (tera.rs), `android_helper.rs` (helper.rs:371-528),
 //! `android_kotlin.rs` (порты Kotlin TTS-пути). Отличия от harness:
 //! глобальные static-настройки Android (paragraph_pause/pause_scale)
-//! заменены параметрами `AndroidChunkOptions`; fastStart/U+2063/плеерный
-//! путь НЕ переносятся (осознанные отклонения, SPEC.md §5).
+//! заменены параметрами `AndroidChunkOptions`; U+2063/EMA-латентность и
+//! плеерный путь НЕ переносятся (осознанные отклонения, SPEC.md §5).
+//! fastStart ПЕРЕНОСИТСЯ дословно: эталон 99 чанков сгенерирован с ним
+//! (первый юнит — упакованная фраза 63 симв. > 55; SPEC_CORRECTIONS 0.8).
 //!
 //! Нормативные документы: out/teratts_android_chunking_spec/ (SPEC.md и
 //! раскрытия) + docs/G7_SPEC_CORRECTIONS.md. Семантика Android
@@ -110,9 +112,11 @@ pub struct AndroidChunk {
 }
 
 impl AndroidChunk {
-    /// Юнит-сцена-разделитель (текст не синтезируется).
+    /// Юнит-сцена-разделитель (текст не синтезируется). Определяется по
+    /// тексту: сцена в конце файла получает boundary EndOfFile (пауза
+    /// снимается переопределением последнего элемента).
     pub fn is_scene(&self) -> bool {
-        self.boundary_kind == AndroidBoundary::SceneBreak
+        self.text == SCENE_BREAK || is_scene_break(&self.text)
     }
 }
 
@@ -376,11 +380,18 @@ fn is_scene_break(p: &str) -> bool {
     ornament && (marks >= 3 || p.contains('⁂') || p.contains('❖'))
 }
 
-/// `paragraphUnits` без fastStart (порт KT:240-259; fastStart —
-/// стриминговая оптимизация читалки, SPEC.md §5 отклонение №1).
+/// `paragraphUnits` (порт KT:240-278 ДОСЛОВНО, включая fastStart).
 /// Quirk KT:247-249: если НЕ-сценовых юнитов < 2 — у последнего флаг
 /// конца абзаца сбрасывается (одно-предложенческий вызов — не абзац).
-fn paragraph_units_nofs(raw_text: &str, call_chunk_limit: usize) -> Vec<(String, bool)> {
+///
+/// fastStart (KT:267-278) переносится, вопреки SPEC.md §5 отклонению №1:
+/// эталон 99 чанков СГЕНЕРИРОВАН с fastStart (первый юнит — УПАКОВАННАЯ
+/// фраза вызова, у эталона 63 симв. > 55 — вырез даёт чанки 0/1 эталона;
+/// обоснование спецификации «первое предложение 38 ≤ 55» измеряло не тот
+/// объект). Реальное поведение TeraTTS 1.59 и нормативный эталон важнее
+/// умозрительного «лишнего стыка»; решение зафиксировано в
+/// docs/G7_SPEC_CORRECTIONS.md (0.8).
+fn paragraph_units(raw_text: &str, call_chunk_limit: usize) -> Vec<(String, bool)> {
     let mut units: Vec<(String, bool)> = Vec::new();
     for p in raw_text
         .split('\n')
@@ -404,7 +415,58 @@ fn paragraph_units_nofs(raw_text: &str, call_chunk_limit: usize) -> Vec<(String,
         let last = units[n - 1].clone();
         units[n - 1] = (last.0, false);
     }
+    // fast start (KT:250-257): разрез первого юнита > 55 симв. у ~40-го
+    if let Some(first) = units.first().cloned() {
+        if first.0 != SCENE_BREAK {
+            let parts = fast_start(&[first.0]);
+            if parts.len() == 2 {
+                units[0] = (parts[1].clone(), first.1);
+                units.insert(0, (parts[0].clone(), false));
+            }
+        }
+    }
     units
+}
+
+/// KT:40 FAST_START_CHARS.
+const FAST_START_CHARS: usize = 40;
+
+/// KT:267-278 `fastStart`: первое предложение > FAST_START_CHARS+15 симв.
+/// режется после последней `, ; : —` в окне 40 симв. (если позиция ≥ 15),
+/// иначе после последнего пробела окна.
+fn fast_start(sentences: &[String]) -> Vec<String> {
+    let first = &sentences[0];
+    if first.chars().count() <= FAST_START_CHARS + 15 {
+        return sentences.to_vec();
+    }
+    let window: Vec<char> = first.chars().take(FAST_START_CHARS).collect();
+    let mut cut: i64 = -1;
+    for (i, c) in window.iter().enumerate() {
+        if matches!(c, ',' | ';' | ':' | '—') {
+            cut = i as i64;
+        }
+    }
+    let cut = if cut >= 15 {
+        (cut + 1) as usize
+    } else {
+        match window.iter().rposition(|c| *c == ' ') {
+            Some(pos) => pos,
+            None => return sentences.to_vec(),
+        }
+    };
+    if cut < 15 {
+        return sentences.to_vec();
+    }
+    let head: String = first.chars().take(cut).collect();
+    let tail: String = first.chars().skip(cut).collect();
+    let head = head.trim().to_string();
+    let tail = tail.trim().to_string();
+    if head.is_empty() || tail.is_empty() {
+        return sentences.to_vec();
+    }
+    let mut out = vec![head, tail];
+    out.extend_from_slice(&sentences[1..]);
+    out
 }
 
 // ============================================================================
@@ -1426,7 +1488,7 @@ fn call_plan(text: &str, opts: &AndroidChunkOptions) -> Vec<CallChunk> {
 pub fn android_chunk_pipeline(text: &str, opts: &AndroidChunkOptions) -> Vec<AndroidChunk> {
     let mut out: Vec<AndroidChunk> = Vec::new();
     let scale = opts.pause_scale;
-    let units = paragraph_units_nofs(text, opts.call_chunk_limit);
+    let units = paragraph_units(text, opts.call_chunk_limit);
     for (unit_raw, para_end) in units {
         if is_scene_break(&unit_raw) {
             out.push(AndroidChunk {
@@ -1554,11 +1616,32 @@ mod tests {
         assert_eq!(out, vec!["Первое ; второе."]);
     }
 
-    // ---- 2. paragraph_units_nofs ----------------------------------------------
+    // ---- 2. paragraph_units ----------------------------------------------
+
+    #[test]
+    fn fast_start_cuts_first_packed_unit_over_55() {
+        // первый юнит — упакованная фраза 59 симв. > 55: разрез ПОСЛЕ запятой
+        // в окне 40 симв. (позиция ≥ 15); голова — отдельный вызов без флага
+        // абзаца, хвост наследует флаг (KT:250-257)
+        let out = android_chunk_pipeline(
+            "Неуж+ели пр+авда, не м+ожет быть? поинтересов+ался Г+ари.",
+            &opts(),
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].text, "Неуж+ели пр+авда,");
+        assert_eq!(out[0].pause_s, Some(PAUSE_COMMA)); // хвост вызова: знак «,»
+                                                       // volatile-пробел перед «?» вставлен ДО упаковки (Kotlin)
+        assert_eq!(out[1].text, "не м+ожет быть ? поинтересов+ался Г+ари.");
+        assert_eq!(out[1].pause_s, None);
+        // короткий первый юнит (≤55) не режется
+        let out2 = android_chunk_pipeline("Неуж+ели пр+авда? Поинтересов+ался Г+ари.", &opts());
+        assert_eq!(out2.len(), 2);
+        assert!(out2[0].text.starts_with("Неуж+ели"));
+    }
 
     #[test]
     fn paragraph_units_flags_last_sentence_of_paragraph() {
-        let u = paragraph_units_nofs("Первое. Второе.\n\nТретье.", 300);
+        let u = paragraph_units("Первое. Второе.\n\nТретье.", 300);
         assert_eq!(
             u,
             vec![
@@ -1570,13 +1653,13 @@ mod tests {
 
     #[test]
     fn paragraph_units_quirk_single_unit_resets_flag() {
-        let u = paragraph_units_nofs("Одно предложение на весь файл.", 300);
+        let u = paragraph_units("Одно предложение на весь файл.", 300);
         assert_eq!(
             u,
             vec![("Одно предложение на весь файл.".to_string(), false)]
         );
         // одно предложение на абзац, но юнитов ≥ 2 — флаги остаются
-        let u = paragraph_units_nofs("Один.\n\nДва.", 300);
+        let u = paragraph_units("Один.\n\nДва.", 300);
         assert_eq!(
             u,
             vec![("Один.".to_string(), true), ("Два.".to_string(), true)]
@@ -1585,7 +1668,7 @@ mod tests {
 
     #[test]
     fn paragraph_units_scene_and_crlf_and_empty_lines() {
-        let u = paragraph_units_nofs("А.\n\n* * *\n\nБ.", 300);
+        let u = paragraph_units("А.\n\n* * *\n\nБ.", 300);
         assert_eq!(
             u,
             vec![
@@ -1595,7 +1678,7 @@ mod tests {
             ]
         );
         // CRLF: trim съедает \r; пустые/пробельные абзацы пропускаются
-        let u = paragraph_units_nofs("Первый.\r\n\r\n\r\n   \r\nВторой.\r\n", 300);
+        let u = paragraph_units("Первый.\r\n\r\n\r\n   \r\nВторой.\r\n", 300);
         assert_eq!(u, vec![("Первый.".into(), true), ("Второй.".into(), true)]);
     }
 
@@ -1824,10 +1907,8 @@ mod tests {
 
     #[test]
     fn pipeline_aside_transitions_get_min_pause() {
-        let out = android_chunk_pipeline(
-            "Стар+ик (а ем+у было за восемьдесят) молч+а смотр+ел в окн+о.",
-            &opts(),
-        );
+        // вход ≤ 55 симв. — fastStart не срабатывает
+        let out = android_chunk_pipeline("Стар+ик (а ем+у за восемьдесят) молч+а.", &opts());
         assert_eq!(out.len(), 3);
         assert!(out[1].is_aside);
         assert_eq!(out[0].pause_s, Some(0.25)); // смена aside при owed=0
@@ -1992,6 +2073,129 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>()
                 .join("\n")
+        );
+    }
+
+    #[test]
+    fn scenes_consecutive_start_and_end() {
+        // сцены подряд — каждая отдельной записью по 1.3 с (интеграция
+        // суммирует их в pause_s предыдущего чанка)
+        let out = android_chunk_pipeline("А.\n\n* * *\n\n\u{2042}\n\nБ.", &opts());
+        let scenes: Vec<&AndroidChunk> = out.iter().filter(|c| c.is_scene()).collect();
+        assert_eq!(scenes.len(), 2);
+        assert!(scenes.iter().all(|s| s.pause_s == Some(PAUSE_SCENE)));
+        // сцена в начале файла — запись есть (пауза без предыдущего чанка
+        // теряется на интеграции с заметкой — WINDOWS_INTEGRATION §4)
+        let out = android_chunk_pipeline("* * *\n\nБ.", &opts());
+        assert!(out[0].is_scene());
+        assert_eq!(out[0].pause_s, Some(PAUSE_SCENE));
+        // сцена — последний юнит файла: пауза не вставляется
+        let out = android_chunk_pipeline("А.\n\n* * *", &opts());
+        assert!(out.last().unwrap().is_scene());
+        assert_eq!(out.last().unwrap().pause_s, None);
+    }
+
+    // ---- эталон: 99 чанков эталонного TXT --------------------------------------------
+
+    #[derive(serde::Deserialize)]
+    struct ReferenceRec {
+        chunk_text: String,
+        #[serde(rename = "pause_after_s")]
+        pause_s: Option<f32>,
+        pause_kind: String,
+        aside: bool,
+        paragraph_end: bool,
+        model_text: Option<String>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ReferenceFile {
+        #[allow(dead_code)]
+        input_sha256: String,
+        chunks: Vec<ReferenceRec>,
+    }
+
+    #[test]
+    fn golden_android_reference_99_chunks() {
+        let input = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/golden/android_reference_input.txt"
+        ))
+        .expect("reference input");
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/golden/android_reference_chunks.json"
+        ))
+        .expect("reference chunks");
+        let reference: ReferenceFile = serde_json::from_str(&raw).expect("reference json");
+        assert_eq!(reference.chunks.len(), 99);
+
+        let got = android_chunk_pipeline(&input, &opts());
+        let mut failures: Vec<String> = Vec::new();
+        if got.len() != 99 {
+            failures.push(format!("чанков {} ≠ 99", got.len()));
+        }
+        for (i, (g, e)) in got.iter().zip(reference.chunks.iter()).enumerate() {
+            if g.text != e.chunk_text {
+                failures.push(format!("[{i}] текст {:?} ≠ {:?}", g.text, e.chunk_text));
+            }
+            if g.model_text != e.model_text {
+                failures.push(format!(
+                    "[{i}] model_text {:?} ≠ {:?}",
+                    g.model_text, e.model_text
+                ));
+            }
+            match (g.pause_s, e.pause_s) {
+                (Some(a), Some(b)) if (a - b).abs() < 1e-6 => {}
+                (None, None) => {}
+                (a, b) => failures.push(format!("[{i}] pause_s {a:?} ≠ {b:?}")),
+            }
+            if g.is_aside != e.aside {
+                failures.push(format!("[{i}] aside"));
+            }
+            if g.paragraph_end != e.paragraph_end {
+                failures.push(format!("[{i}] paragraph_end"));
+            }
+            if g.boundary_kind != boundary_of(&e.pause_kind) {
+                failures.push(format!(
+                    "[{i}] boundary {:?} ≠ kind {}",
+                    g.boundary_kind, e.pause_kind
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "эталон 99 чанков (первые расхождения):\n{}",
+            failures
+                .iter()
+                .take(10)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+
+        // агрегаты ВЫЧИСЛЯЮТСЯ из per-chunk данных (SPEC_CORRECTIONS 0.3):
+        // summary.paragraph_pauses=70 — счётчик флага, НЕ число пауз абзаца
+        let pause_sum: f32 = got.iter().filter_map(|c| c.pause_s).sum();
+        assert!((pause_sum - 56.98).abs() < 1e-3, "сумма пауз {pause_sum}");
+        let paragraph_pauses = got
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.boundary_kind,
+                    AndroidBoundary::CallTail { paragraph: true }
+                )
+            })
+            .count();
+        assert_eq!(paragraph_pauses, 38, "фактических пауз абзаца");
+        assert_eq!(got.iter().filter(|c| c.is_aside).count(), 0);
+        assert!(got.iter().all(|c| c.is_scene() || c.model_text.is_some()));
+        // отброшенных нет: все чанки имеют модельный текст
+        assert_eq!(
+            got.iter()
+                .filter(|c| c.model_text.is_none() && !c.is_scene())
+                .count(),
+            0
         );
     }
 
