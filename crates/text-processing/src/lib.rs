@@ -4,9 +4,14 @@
 //! `to_model_stress_notation()` — 1:1 перенос:
 //! NFC → «+гласная» → «гласная + U+0301» → снятие акута над «ё» → NFC.
 
+pub mod android_chunking;
 pub mod char_rules;
 pub mod chunking;
 pub mod pauses;
+pub use android_chunking::{
+    android_chunk_pipeline, AndroidBoundary, AndroidChunk, AndroidChunkOptions, ChunkingMode,
+    CALL_CHUNK_LIMIT, DEFAULT_MAX_CHUNK_CHARS,
+};
 pub use char_rules::{apply_char_rules, CharRules};
 pub use chunking::{
     annotate_soft_breaks, chunk_pipeline, chunk_text, compute_max_chunk_bytes,

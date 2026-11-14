@@ -7,6 +7,9 @@ license.workspace = true
 
 [dependencies]
 unicode-normalization.workspace = true
+# G7: plain regex — порты android_tera (замены/поиск без lookaround);
+# fancy-regex — Kotlin-порты (lookbehind). regex уже в дереве через fancy-regex.
+regex = "1"
 fancy-regex = "0.13"
 serde.workspace = true
 serde_json = { version = "1", features = ["preserve_order"] }

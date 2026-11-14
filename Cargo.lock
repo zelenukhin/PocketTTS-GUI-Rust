@@ -3421,6 +3421,7 @@ name = "text-processing"
 version = "0.1.0"
 dependencies = [
  "fancy-regex",
+ "regex",
  "serde",
  "serde_json",
  "unicode-normalization",

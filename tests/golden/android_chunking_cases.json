@@ -1,0 +1,1088 @@
+[
+ {
+  "name": "short_sentence",
+  "input": "Коротко.",
+  "android": [
+   {
+    "text": "Коротко.",
+    "chars": 8,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Коротко.",
+    "prepared_text": "        Коротко.",
+    "eos_extra": 5
+   }
+  ]
+ },
+ {
+  "name": "several_short_sentences",
+  "input": "Раз. Два. Три. Вот.",
+  "android": [
+   {
+    "text": "Раз.",
+    "chars": 4,
+    "pause_s": 0.5,
+    "pause_kind": "sign=0.50",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Раз.",
+    "prepared_text": "        Раз.",
+    "eos_extra": 5
+   },
+   {
+    "text": "Два.",
+    "chars": 4,
+    "pause_s": 0.5,
+    "pause_kind": "sign=0.50",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Два.",
+    "prepared_text": "        Два.",
+    "eos_extra": 5
+   },
+   {
+    "text": "Три.",
+    "chars": 4,
+    "pause_s": 0.5,
+    "pause_kind": "sign=0.50",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Три.",
+    "prepared_text": "        Три.",
+    "eos_extra": 5
+   },
+   {
+    "text": "Вот.",
+    "chars": 4,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Вот.",
+    "prepared_text": "        Вот.",
+    "eos_extra": 5
+   }
+  ]
+ },
+ {
+  "name": "question_attribution_upper",
+  "input": "Неуж+ели пр+авда? Поинтересов+ался Г+ари.",
+  "android": [
+   {
+    "text": "Неуж+ели пр+авда ?",
+    "chars": 18,
+    "pause_s": 0.5,
+    "pause_kind": "sign=0.50",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Неуже́ли пра́вда ?",
+    "prepared_text": "        Неуже́ли пра́вда ?",
+    "eos_extra": 5
+   },
+   {
+    "text": "Поинтересов+ался Г+ари.",
+    "chars": 23,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Поинтересова́лся Га́ри.",
+    "prepared_text": "        Поинтересова́лся Га́ри.",
+    "eos_extra": 5
+   }
+  ]
+ },
+ {
+  "name": "question_attribution_lower",
+  "input": "Неуж+ели пр+авда? поинтересов+ался Г+ари.",
+  "android": [
+   {
+    "text": "Неуж+ели пр+авда ? поинтересов+ался Г+ари.",
+    "chars": 42,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Неуже́ли пра́вда ? поинтересова́лся Га́ри.",
+    "prepared_text": "Неуже́ли пра́вда ? поинтересова́лся Га́ри.",
+    "eos_extra": 3
+   }
+  ]
+ },
+ {
+  "name": "uppercase_after_period",
+  "input": "П+ервое предлож+ение. Втор+ое предлож+ение шло дал+ее.",
+  "android": [
+   {
+    "text": "П+ервое предлож+ение.",
+    "chars": 21,
+    "pause_s": 0.5,
+    "pause_kind": "sign=0.50",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Пе́рвое предложе́ние.",
+    "prepared_text": "        Пе́рвое предложе́ние.",
+    "eos_extra": 5
+   },
+   {
+    "text": "Втор+ое предлож+ение шло дал+ее.",
+    "chars": 32,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Второ́е предложе́ние шло дале́е.",
+    "prepared_text": "        Второ́е предложе́ние шло дале́е.",
+    "eos_extra": 5
+   }
+  ]
+ },
+ {
+  "name": "lowercase_after_period",
+  "input": "П+ервое предлож+ение. втор+ое предлож+ение шло дал+ее.",
+  "android": [
+   {
+    "text": "П+ервое предлож+ение. втор+ое предлож+ение шло дал+ее.",
+    "chars": 54,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Пе́рвое предложе́ние. второ́е предложе́ние шло дале́е.",
+    "prepared_text": "Пе́рвое предложе́ние. второ́е предложе́ние шло дале́е.",
+    "eos_extra": 3
+   }
+  ]
+ },
+ {
+  "name": "plus_before_next_sentence",
+  "input": "То б+ыло кр+охотное, невзр+ачное завед+ение. +если б Х+агрид не показ+ал, Г+ари бы и не зам+етил, что он+о вообщ+е тут есть.",
+  "android": [
+   {
+    "text": "То б+ыло кр+охотное, невзр+ачное завед+ение. +если б Х+агрид не показ+ал, Г+ари бы и не зам+етил, что он+о вообщ+е тут есть.",
+    "chars": 124,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "То бы́ло кро́хотное, невзра́чное заведе́ние. е́сли б Ха́грид не показа́л, Га́ри бы и не заме́тил, что оно́ вообще́ тут есть.",
+    "prepared_text": "То бы́ло кро́хотное, невзра́чное заведе́ние. е́сли б Ха́грид не показа́л, Га́ри бы и не заме́тил, что оно́ вообще́ тут есть.",
+    "eos_extra": 3
+   }
+  ]
+ },
+ {
+  "name": "combining_acute_native",
+  "input": "Он у́шёл до́мой и сказа́л, что всё ко́нчено.",
+  "android": [
+   {
+    "text": "Он у́шёл до́мой и сказа́л, что всё ко́нчено.",
+    "chars": 44,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Он у́шёл до́мой и сказа́л, что всё ко́нчено.",
+    "prepared_text": "Он у́шёл до́мой и сказа́л, что всё ко́нчено.",
+    "eos_extra": 3
+   }
+  ]
+ },
+ {
+  "name": "quotes",
+  "input": "«Стр+анно, — сказ+ал он, — очень стр+анно». “Могло быть и х+уже”, — отв+етили ем+у.",
+  "android": [
+   {
+    "text": "«Стр+анно,",
+    "chars": 10,
+    "pause_s": 0.25,
+    "pause_kind": "sign=0.25",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "«Стра́нно,",
+    "prepared_text": "        Стра́нно,",
+    "eos_extra": 5
+   },
+   {
+    "text": "сказ+ал он,",
+    "chars": 11,
+    "pause_s": 0.25,
+    "pause_kind": "sign=0.25",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "сказа́л он,",
+    "prepared_text": "        Сказа́л он,",
+    "eos_extra": 5
+   },
+   {
+    "text": "очень стр+анно».",
+    "chars": 16,
+    "pause_s": 0.5,
+    "pause_kind": "sign=0.50",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "очень стра́нно».",
+    "prepared_text": "        Очень стра́нно.",
+    "eos_extra": 5
+   },
+   {
+    "text": "“Могло быть и х+уже”,",
+    "chars": 21,
+    "pause_s": 0.25,
+    "pause_kind": "sign=0.25",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "“Могло быть и ху́же”,",
+    "prepared_text": "        Могло быть и ху́же,",
+    "eos_extra": 5
+   },
+   {
+    "text": "отв+етили ем+у.",
+    "chars": 15,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "отве́тили ему́.",
+    "prepared_text": "        Отве́тили ему́.",
+    "eos_extra": 5
+   }
+  ]
+ },
+ {
+  "name": "abbrev_ru_g",
+  "input": "Он жив+ет в г. Москв+а уже давн+о.",
+  "android": [
+   {
+    "text": "Он жив+ет в г. Москв+а уже давн+о.",
+    "chars": 34,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Он живе́т в г. Москва́ уже давно́.",
+    "prepared_text": "Он живе́т в г. Москва́ уже давно́.",
+    "eos_extra": 3
+   }
+  ]
+ },
+ {
+  "name": "abbrev_en_mr",
+  "input": "Mr. Smith came. Он прив+ёз книги.",
+  "android": [
+   {
+    "text": "Mr. Smith came.",
+    "chars": 15,
+    "pause_s": 0.5,
+    "pause_kind": "sign=0.50",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": null,
+    "prepared_text": null,
+    "eos_extra": 0
+   },
+   {
+    "text": "Он прив+ёз книги.",
+    "chars": 17,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Он привёз книги.",
+    "prepared_text": "        Он привёз книги.",
+    "eos_extra": 5
+   }
+  ]
+ },
+ {
+  "name": "initials",
+  "input": "А. С. П+ушкин род+ился. По+эт начал пис+ать.",
+  "android": [
+   {
+    "text": "А. С. П+ушкин род+ился.",
+    "chars": 23,
+    "pause_s": 0.5,
+    "pause_kind": "sign=0.50",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "А. С. Пу́шкин роди́лся.",
+    "prepared_text": "        А. С. Пу́шкин роди́лся.",
+    "eos_extra": 5
+   },
+   {
+    "text": "По+эт начал пис+ать.",
+    "chars": 20,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Поэ́т начал писа́ть.",
+    "prepared_text": "        Поэ́т начал писа́ть.",
+    "eos_extra": 5
+   }
+  ]
+ },
+ {
+  "name": "spaced_dash_cut",
+  "input": "Он+а сказ+ала — и замолч+ала. Все смолч+али.",
+  "android": [
+   {
+    "text": "Он+а сказ+ала",
+    "chars": 13,
+    "pause_s": 0.25,
+    "pause_kind": "sign=0.25",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Она́ сказа́ла",
+    "prepared_text": "        Она́ сказа́ла.",
+    "eos_extra": 5
+   },
+   {
+    "text": "и замолч+ала.",
+    "chars": 13,
+    "pause_s": 0.5,
+    "pause_kind": "sign=0.50",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "и замолча́ла.",
+    "prepared_text": "        И замолча́ла.",
+    "eos_extra": 5
+   },
+   {
+    "text": "Все смолч+али.",
+    "chars": 14,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Все смолча́ли.",
+    "prepared_text": "        Все смолча́ли.",
+    "eos_extra": 5
+   }
+  ]
+ },
+ {
+  "name": "in_word_hyphens",
+  "input": "Кт+о-то куда́-то по-м+оему уш+ёл, взяв с соб+ой к+нигу.",
+  "android": [
+   {
+    "text": "Кт+о-то куда́-то по-м+оему уш+ёл, взяв с соб+ой к+нигу.",
+    "chars": 55,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Кто́-то куда́-то по-мо́ему ушёл, взяв с собо́й книгу.",
+    "prepared_text": "Кто́-то куда́-то по-мо́ему ушёл, взяв с собо́й книгу.",
+    "eos_extra": 3
+   }
+  ]
+ },
+ {
+  "name": "commas_no_cut_under_150",
+  "input": "Снач+ала, пот+ом, зат+ем, након+ец, вс+ё.",
+  "android": [
+   {
+    "text": "Снач+ала, пот+ом, зат+ем, након+ец, вс+ё.",
+    "chars": 41,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Снача́ла, пото́м, зате́м, наконе́ц, всё.",
+    "prepared_text": "Снача́ла, пото́м, зате́м, наконе́ц, всё.",
+    "eos_extra": 3
+   }
+  ]
+ },
+ {
+  "name": "semicolon_colon",
+  "input": "П+ервое; втор+ое. Подсказ+ка: вот так.",
+  "android": [
+   {
+    "text": "П+ервое ;",
+    "chars": 9,
+    "pause_s": 0.3,
+    "pause_kind": "sign=0.30",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Пе́рвое ;",
+    "prepared_text": "        Пе́рвое ;",
+    "eos_extra": 5
+   },
+   {
+    "text": "втор+ое.",
+    "chars": 8,
+    "pause_s": 0.5,
+    "pause_kind": "sign=0.50",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "второ́е.",
+    "prepared_text": "        Второ́е.",
+    "eos_extra": 5
+   },
+   {
+    "text": "Подсказ+ка:",
+    "chars": 11,
+    "pause_s": 0.35,
+    "pause_kind": "sign=0.35",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Подсказка:",
+    "prepared_text": "        Подсказка:",
+    "eos_extra": 5
+   },
+   {
+    "text": "вот так.",
+    "chars": 8,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "вот так.",
+    "prepared_text": "        Вот так.",
+    "eos_extra": 5
+   }
+  ]
+ },
+ {
+  "name": "aside_long_brackets",
+  "input": "Стар+ик (а ем+у было за восемьдесят) молч+а смотр+ел в окн+о.",
+  "android": [
+   {
+    "text": "Стар+ик",
+    "chars": 7,
+    "pause_s": 0.25,
+    "pause_kind": "joint",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Стари́к",
+    "prepared_text": "        Стари́к.",
+    "eos_extra": 5
+   },
+   {
+    "text": "а ем+у было за восемьдесят",
+    "chars": 26,
+    "pause_s": 0.25,
+    "pause_kind": "joint",
+    "aside": true,
+    "paragraph_end": false,
+    "model_text": "а ему́ было за восемьдесят",
+    "prepared_text": "А ему́ было за восемьдесят.",
+    "eos_extra": 3
+   },
+   {
+    "text": "молч+а смотр+ел в окн+о.",
+    "chars": 24,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "молча́ смотре́л в окно́.",
+    "prepared_text": "        Молча́ смотре́л в окно́.",
+    "eos_extra": 5
+   }
+  ]
+ },
+ {
+  "name": "aside_short_brackets",
+  "input": "Он вздохн+ул (с) и продолж+ил свой расск+аз дал+ьше.",
+  "android": [
+   {
+    "text": "Он вздохн+ул с и продолж+ил свой расск+аз дал+ьше.",
+    "chars": 50,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Он вздохну́л с и продолжи́л свой расска́з дальше.",
+    "prepared_text": "Он вздохну́л с и продолжи́л свой расска́з дальше.",
+    "eos_extra": 3
+   }
+  ]
+ },
+ {
+  "name": "ellipsis_unicode",
+  "input": "М+ожет быть… Не зн+аю…",
+  "android": [
+   {
+    "text": "М+ожет быть…",
+    "chars": 12,
+    "pause_s": 0.65,
+    "pause_kind": "sign=0.65",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Мо́жет быть…",
+    "prepared_text": "        Мо́жет быть…",
+    "eos_extra": 5
+   },
+   {
+    "text": "Не зн+аю…",
+    "chars": 9,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Не зна́ю…",
+    "prepared_text": "        Не зна́ю…",
+    "eos_extra": 5
+   }
+  ]
+ },
+ {
+  "name": "ellipsis_dots",
+  "input": "Он сказ+ал... и ум+олк навсегд+а...",
+  "android": [
+   {
+    "text": "Он сказ+ал... и ум+олк навсегд+а...",
+    "chars": 35,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Он сказа́л... и умо́лк навсегда́...",
+    "prepared_text": "Он сказа́л... и умо́лк навсегда́...",
+    "eos_extra": 3
+   }
+  ]
+ },
+ {
+  "name": "consecutive_marks",
+  "input": "Что?! Пр+авда?! Не может быть!..",
+  "android": [
+   {
+    "text": "Что? !",
+    "chars": 6,
+    "pause_s": 0.5,
+    "pause_kind": "sign=0.50",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Что? !",
+    "prepared_text": "        Что? !",
+    "eos_extra": 5
+   },
+   {
+    "text": "Пр+авда? !",
+    "chars": 10,
+    "pause_s": 0.5,
+    "pause_kind": "sign=0.50",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Пра́вда? !",
+    "prepared_text": "        Пра́вда? !",
+    "eos_extra": 5
+   },
+   {
+    "text": "Не может быть!..",
+    "chars": 16,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Не может быть!..",
+    "prepared_text": "        Не может быть!..",
+    "eos_extra": 5
+   }
+  ]
+ },
+ {
+  "name": "empty_lines",
+  "input": "П+ервый абз+ац.\n\n\n\nВт+орой абз+ац идёт дал+ье.\n\n   \nТр+етий.",
+  "android": [
+   {
+    "text": "П+ервый абз+ац.",
+    "chars": 15,
+    "pause_s": 0.9,
+    "pause_kind": "paragraph=max(sign=0.50,0.90)",
+    "aside": false,
+    "paragraph_end": true,
+    "model_text": "Пе́рвый абза́ц.",
+    "prepared_text": "        Пе́рвый абза́ц.",
+    "eos_extra": 5
+   },
+   {
+    "text": "Вт+орой абз+ац идёт дал+ье.",
+    "chars": 27,
+    "pause_s": 0.9,
+    "pause_kind": "paragraph=max(sign=0.50,0.90)",
+    "aside": false,
+    "paragraph_end": true,
+    "model_text": "Вто́рой абза́ц идёт далье.",
+    "prepared_text": "        Вто́рой абза́ц идёт далье.",
+    "eos_extra": 5
+   },
+   {
+    "text": "Тр+етий.",
+    "chars": 8,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": true,
+    "model_text": "Тре́тий.",
+    "prepared_text": "        Тре́тий.",
+    "eos_extra": 5
+   }
+  ]
+ },
+ {
+  "name": "crlf_paragraphs",
+  "input": "П+ервый абз+ац с CRLF.\r\n\r\nВт+орой абз+ац.\r\n",
+  "android": [
+   {
+    "text": "П+ервый абз+ац с CRLF.",
+    "chars": 22,
+    "pause_s": 0.9,
+    "pause_kind": "paragraph=max(sign=0.50,0.90)",
+    "aside": false,
+    "paragraph_end": true,
+    "model_text": "Пе́рвый абза́ц с си-ар-эл-э́ф.",
+    "prepared_text": "        Пе́рвый абза́ц с си-ар-эл-э́ф.",
+    "eos_extra": 5
+   },
+   {
+    "text": "Вт+орой абз+ац.",
+    "chars": 15,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": true,
+    "model_text": "Вто́рой абза́ц.",
+    "prepared_text": "        Вто́рой абза́ц.",
+    "eos_extra": 5
+   }
+  ]
+ },
+ {
+  "name": "paragraph_without_period",
+  "input": "Абз+ац без коне́чной т+очки\n\nВтор+ой абз+ац с т+очкой.",
+  "android": [
+   {
+    "text": "Абз+ац без коне́чной т+очки",
+    "chars": 27,
+    "pause_s": 0.9,
+    "pause_kind": "paragraph=max(sign=0.00,0.90)",
+    "aside": false,
+    "paragraph_end": true,
+    "model_text": "Абза́ц без коне́чной то́чки",
+    "prepared_text": "        Абза́ц без коне́чной то́чки.",
+    "eos_extra": 5
+   },
+   {
+    "text": "Втор+ой абз+ац с т+очкой.",
+    "chars": 25,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": true,
+    "model_text": "Второ́й абза́ц с то́чкой.",
+    "prepared_text": "        Второ́й абза́ц с то́чкой.",
+    "eos_extra": 5
+   }
+  ]
+ },
+ {
+  "name": "digits",
+  "input": "Ем+у б+ыло 12 лет, а ст+ало 13.",
+  "android": [
+   {
+    "text": "Ем+у б+ыло 12 лет, а ст+ало 13.",
+    "chars": 31,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Ему́ бы́ло двенадцать ле́т, а ста́ло тринадцать .",
+    "prepared_text": "Ему́ бы́ло двенадцать ле́т, а ста́ло тринадцать .",
+    "eos_extra": 3
+   }
+  ]
+ },
+ {
+  "name": "latin_caps",
+  "input": "Он откр+ыл NASA и Google на своём компь+ютере.",
+  "android": [
+   {
+    "text": "Он откр+ыл NASA и Google на своём компь+ютере.",
+    "chars": 46,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Он откры́л на́са и на своём компью́тере.",
+    "prepared_text": "Он откры́л на́са и на своём компью́тере.",
+    "eos_extra": 3
+   }
+  ]
+ },
+ {
+  "name": "non_bmp_emoji",
+  "input": "Он улыбн+ался 🙂 и продолж+ал говор+ить спок+ойно.",
+  "android": [
+   {
+    "text": "Он улыбн+ался 🙂 и продолж+ал говор+ить спок+ойно.",
+    "chars": 49,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Он улыбна́лся 🙂 и продолжа́л говори́ть споко́йно.",
+    "prepared_text": "Он улыбна́лся 🙂 и продолжа́л говори́ть споко́йно.",
+    "eos_extra": 3
+   }
+  ]
+ },
+ {
+  "name": "scene_break",
+  "input": "Кон+ец ч+асти.\n\n* * *\n\nНач+ало новой глав+ы.",
+  "android": [
+   {
+    "text": "Кон+ец ч+асти.",
+    "chars": 14,
+    "pause_s": 0.9,
+    "pause_kind": "paragraph=max(sign=0.50,0.90)",
+    "aside": false,
+    "paragraph_end": true,
+    "model_text": "Коне́ц ча́сти.",
+    "prepared_text": "        Коне́ц ча́сти.",
+    "eos_extra": 5
+   },
+   {
+    "text": "⁂",
+    "chars": 0,
+    "pause_s": 1.3,
+    "pause_kind": "scene_break",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": null,
+    "prepared_text": null,
+    "eos_extra": 0
+   },
+   {
+    "text": "Нач+ало новой глав+ы.",
+    "chars": 21,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": true,
+    "model_text": "Нача́ло новой главы́.",
+    "prepared_text": "        Нача́ло новой главы́.",
+    "eos_extra": 5
+   }
+  ]
+ },
+ {
+  "name": "long_paragraph_packing",
+  "input": "П+ервое предлож+ение достат+очно дл+инное, чт+обы зан+ять мн+ого м+еста в абз+аце. Втор+ое предлож+ение тоже не к+ороткое и содерж+ит запя́тые, тире и пр+очее. Тр+етье предлож+ение заверша́ет мысль. Четв+ёртое предлож+ение начина́ет н+овую. Пя́тое зака́нчивает.",
+  "android": [
+   {
+    "text": "П+ервое предлож+ение достат+очно дл+инное, чт+обы зан+ять мн+ого м+еста в абз+аце.",
+    "chars": 82,
+    "pause_s": 0.5,
+    "pause_kind": "sign=0.50",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Пе́рвое предложе́ние достато́чно дли́нное, что́бы заня́ть мно́го ме́ста в абза́це.",
+    "prepared_text": "Пе́рвое предложе́ние достато́чно дли́нное, что́бы заня́ть мно́го ме́ста в абза́це.",
+    "eos_extra": 3
+   },
+   {
+    "text": "Втор+ое предлож+ение тоже не к+ороткое и содерж+ит запя́тые, тире и пр+очее.",
+    "chars": 76,
+    "pause_s": 0.5,
+    "pause_kind": "sign=0.50",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Второ́е предложе́ние тоже не ко́роткое и содержи́т запя́тые, тире и про́чее.",
+    "prepared_text": "Второ́е предложе́ние тоже не ко́роткое и содержи́т запя́тые, тире и про́чее.",
+    "eos_extra": 3
+   },
+   {
+    "text": "Тр+етье предлож+ение заверша́ет мысль.",
+    "chars": 38,
+    "pause_s": 0.5,
+    "pause_kind": "sign=0.50",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Тре́тье предложе́ние заверша́ет мысль.",
+    "prepared_text": "        Тре́тье предложе́ние заверша́ет мысль.",
+    "eos_extra": 5
+   },
+   {
+    "text": "Четв+ёртое предлож+ение начина́ет н+овую.",
+    "chars": 41,
+    "pause_s": 0.5,
+    "pause_kind": "sign=0.50",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Четвёртое предложе́ние начина́ет но́вую.",
+    "prepared_text": "        Четвёртое предложе́ние начина́ет но́вую.",
+    "eos_extra": 5
+   },
+   {
+    "text": "Пя́тое зака́нчивает.",
+    "chars": 20,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Пя́тое зака́нчивает.",
+    "prepared_text": "        Пя́тое зака́нчивает.",
+    "eos_extra": 5
+   }
+  ]
+ },
+ {
+  "name": "long_sentence_with_commas_301",
+  "input": "слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово словоа.",
+  "android": [
+   {
+    "text": "слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово",
+    "chars": 149,
+    "pause_s": 0.02,
+    "pause_kind": "joint",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово",
+    "prepared_text": "Слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово.",
+    "eos_extra": 3
+   },
+   {
+    "text": "слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово",
+    "chars": 143,
+    "pause_s": 0.02,
+    "pause_kind": "joint",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово",
+    "prepared_text": "Слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово.",
+    "eos_extra": 3
+   },
+   {
+    "text": "словоа.",
+    "chars": 7,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "словоа.",
+    "prepared_text": "        Словоа.",
+    "eos_extra": 5
+   }
+  ]
+ },
+ {
+  "name": "long_sentence_no_commas_301",
+  "input": "слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово словоа.",
+  "android": [
+   {
+    "text": "слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово",
+    "chars": 149,
+    "pause_s": 0.02,
+    "pause_kind": "joint",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово",
+    "prepared_text": "Слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово.",
+    "eos_extra": 3
+   },
+   {
+    "text": "слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово",
+    "chars": 143,
+    "pause_s": 0.02,
+    "pause_kind": "joint",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово",
+    "prepared_text": "Слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово.",
+    "eos_extra": 3
+   },
+   {
+    "text": "словоа.",
+    "chars": 7,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "словоа.",
+    "prepared_text": "        Словоа.",
+    "eos_extra": 5
+   }
+  ]
+ },
+ {
+  "name": "intra_phrase_sentence_split_over_150",
+  "input": "П+ервое предлож+ение о́чень дл+инное и содержи́т мн+ого слов для превыши́ния лим+ита ча́нка в сто пя́тдесят symb. пот+ом втор+ое предлож+ение идёт со строчн+ой буквы и glue.",
+  "android": [
+   {
+    "text": "П+ервое предлож+ение о́чень дл+инное и содержи́т мн+ого слов для превыши́ния лим+ита ча́нка в сто пя́тдесят symb.",
+    "chars": 113,
+    "pause_s": 0.02,
+    "pause_kind": "joint",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Пе́рвое предложе́ние о́чень дли́нное и содержи́т мно́го слов для превыши́ния лими́та ча́нка в сто пя́тдесят .",
+    "prepared_text": "Пе́рвое предложе́ние о́чень дли́нное и содержи́т мно́го слов для превыши́ния лими́та ча́нка в сто пя́тдесят .",
+    "eos_extra": 3
+   },
+   {
+    "text": "пот+ом втор+ое предлож+ение идёт со строчн+ой буквы и glue.",
+    "chars": 59,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "пото́м второ́е предложе́ние идёт со строчно́й буквы и .",
+    "prepared_text": "Пото́м второ́е предложе́ние идёт со строчно́й буквы и .",
+    "eos_extra": 3
+   }
+  ]
+ },
+ {
+  "name": "exact_149",
+  "input": "слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово аааа.",
+  "android": [
+   {
+    "text": "слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово аааа.",
+    "chars": 149,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово аааа.",
+    "prepared_text": "Слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово аааа.",
+    "eos_extra": 3
+   }
+  ]
+ },
+ {
+  "name": "exact_150",
+  "input": "слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово.",
+  "android": [
+   {
+    "text": "слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово.",
+    "chars": 150,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово.",
+    "prepared_text": "Слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово.",
+    "eos_extra": 3
+   }
+  ]
+ },
+ {
+  "name": "exact_151",
+  "input": "слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово словоа.",
+  "android": [
+   {
+    "text": "слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово",
+    "chars": 143,
+    "pause_s": 0.02,
+    "pause_kind": "joint",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово",
+    "prepared_text": "Слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово.",
+    "eos_extra": 3
+   },
+   {
+    "text": "словоа.",
+    "chars": 7,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "словоа.",
+    "prepared_text": "        Словоа.",
+    "eos_extra": 5
+   }
+  ]
+ },
+ {
+  "name": "exact_151_commas",
+  "input": "слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово словоа.",
+  "android": [
+   {
+    "text": "слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово",
+    "chars": 143,
+    "pause_s": 0.02,
+    "pause_kind": "joint",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово",
+    "prepared_text": "Слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово слово.",
+    "eos_extra": 3
+   },
+   {
+    "text": "словоа.",
+    "chars": 7,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "словоа.",
+    "prepared_text": "        Словоа.",
+    "eos_extra": 5
+   }
+  ]
+ },
+ {
+  "name": "long_word_monolith",
+  "input": "длинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноеслово.",
+  "android": [
+   {
+    "text": "длинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноеслово.",
+    "chars": 361,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "длинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноеслово.",
+    "prepared_text": "        Длинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноесловодлинноеслово.",
+    "eos_extra": 5
+   }
+  ]
+ },
+ {
+  "name": "whole_small_file_end",
+  "input": "Одн+о предлож+ение. Ещё одн+о. Посл+еднее.",
+  "android": [
+   {
+    "text": "Одн+о предлож+ение.",
+    "chars": 19,
+    "pause_s": 0.5,
+    "pause_kind": "sign=0.50",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Одно́ предложе́ние.",
+    "prepared_text": "        Одно́ предложе́ние.",
+    "eos_extra": 5
+   },
+   {
+    "text": "Ещё одн+о.",
+    "chars": 10,
+    "pause_s": 0.5,
+    "pause_kind": "sign=0.50",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "Ещё одно́.",
+    "prepared_text": "        Ещё одно́.",
+    "eos_extra": 5
+   },
+   {
+    "text": "Посл+еднее.",
+    "chars": 11,
+    "pause_s": null,
+    "pause_kind": "end_of_file",
+    "aside": false,
+    "paragraph_end": false,
+    "model_text": "После́днее.",
+    "prepared_text": "        После́днее.",
+    "eos_extra": 5
+   }
+  ]
+ }
+]
