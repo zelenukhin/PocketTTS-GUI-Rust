@@ -538,10 +538,11 @@ fn run_one_file(
         file_opts.seed = Some(app_core::pool::SeedPolicy::Random.resolve());
     }
     let seed = file_opts.seed.unwrap();
-    let (_texts, tasks) = match build_file_tasks(&text, &file_opts) {
+    let file_plan = match build_file_tasks(&text, &file_opts) {
         Ok(t) => t,
         Err(e) => return fail(format!("{e:#}")),
     };
+    let tasks = file_plan.tasks;
     let total = tasks.len() as u64;
 
     (d.emit)(JobEvent::FileStarted {
@@ -858,6 +859,7 @@ fn run_one_file(
         pause_samples: 0,
         denoise_report: denoise.clone(),
         chunks: Vec::new(),
+        plan_notes: file_plan.notes.clone(),
     };
     let res = if let Some(err) = file_err.or(sink_err) {
         let se = app_core::pipeline::StreamError {

@@ -12,7 +12,10 @@ use anyhow::Result;
 use std::path::PathBuf;
 
 use shtorm_engine::{Device, EosTail, ModelPrecision, POCKET_RATE};
-use text_processing::{apply_char_rules, CharRules};
+use text_processing::{
+    android_chunk_pipeline, apply_char_rules, AndroidChunkOptions, CharRules, ChunkingMode,
+    CALL_CHUNK_LIMIT,
+};
 
 /// Полные параметры прогона (зеркалируют SynthSettings + пути).
 #[derive(Debug, Clone)]
@@ -44,6 +47,12 @@ pub struct PipelineOptions {
     pub paragraph_pause_s: f32,
     /// Ползунок «Макс. токенов» GUI (задаёт байтовый лимит чанка).
     pub max_tokens: u32,
+    /// G7: алгоритм разбиения текста. Standard — прежний конвейер
+    /// (max_tokens), TeraTtsAndroid — конвейер teratts-android.
+    pub chunking: ChunkingMode,
+    /// G7: лимит чанка в Unicode-символах (только TeraTtsAndroid;
+    /// 0 запрещён — явная ошибка плана).
+    pub max_chunk_chars: u32,
     /// char_rules из runtime.json модели (если заданы).
     pub char_rules: Option<CharRules>,
     /// Защита от повторов (двухпопытная схема Pocket). GUI-переключатель
@@ -560,6 +569,11 @@ pub fn write_chunk_log(
     )?;
     writeln!(w, "Статус: {:?}", o.status)?;
     writeln!(w, "Денойз: {}", o.denoise_report.summary())?;
+    // G7: заметки плана (пропущенные чанки/сцены) — отдельные строки после
+    // шапки, нумерацию чанков не сдвигают
+    for note in &o.plan_notes {
+        writeln!(w, "{note}")?;
+    }
     for c in &o.chunks {
         writeln!(w, "[{}] {}", c.index + 1, c.text)?;
         writeln!(
@@ -598,6 +612,8 @@ pub struct StreamOutcome {
     pub pause_samples: u64,
     pub denoise_report: DenoiseReport,
     pub chunks: Vec<ChunkLogRow>,
+    /// G7: строки-заметки плана (пропущенные чанки, сцены; обычно пусты).
+    pub plan_notes: Vec<String>,
 }
 
 /// Потоковый конвейер A5: чанки пишутся в `sink` строго по порядку, полное
@@ -696,41 +712,134 @@ where
     )
 }
 
+/// G7: план чанков файла. `texts[i]` соответствует `tasks[i]` 1:1
+/// (плотная нумерация синтезируемых задач); `notes` — строки-заметки
+/// плана (пропущенные чанки, сцены в начале файла) для журналов.
+#[derive(Debug, Default)]
+pub struct FilePlan {
+    pub texts: Vec<String>,
+    pub tasks: Vec<Task>,
+    pub notes: Vec<String>,
+}
+
 /// G6.7: план чанков файла WITHOUT движка — текст → (исходные чанки для
 /// журнала, задачи пула с model_text/паузами). Используется и конвейером
 /// (`synthesize_stream_impl`), и многопроцессным диспетчером (чанки
 /// отправляются дочерним процессам командами AssignChunk).
-pub fn build_file_tasks(
-    raw_text: &str,
-    opts: &PipelineOptions,
-) -> Result<(Vec<String>, Vec<Task>)> {
-    use text_processing::{chunk_pause_s, chunk_pipeline, to_model_stress_notation};
-    let chunks = chunk_pipeline(raw_text, opts.max_tokens);
-    anyhow::ensure!(!chunks.is_empty(), "текст пуст — нечего синтезировать");
-    let total = chunks.len();
-    let tasks: Vec<Task> = chunks
-        .iter()
-        .enumerate()
-        .map(|(i, chunk)| {
-            let mut model_text = to_model_stress_notation(&chunk.text);
-            if let Some(rules) = &opts.char_rules {
-                model_text = apply_char_rules(&model_text, rules);
-            }
-            let pause_s = chunk_pause_s(
-                chunk,
-                i + 1 == total,
-                opts.paragraph_pause_s,
-                opts.pause_scale,
+/// G7: единая точка ветвления режима чанкования (SPEC §9):
+/// Standard — прежний конвейер без изменений; TeraTtsAndroid —
+/// `android_chunk_pipeline` (лимит в символах, собственный план пауз).
+pub fn build_file_tasks(raw_text: &str, opts: &PipelineOptions) -> Result<FilePlan> {
+    match opts.chunking {
+        ChunkingMode::Standard => {
+            use text_processing::{chunk_pause_s, chunk_pipeline, to_model_stress_notation};
+            let chunks = chunk_pipeline(raw_text, opts.max_tokens);
+            anyhow::ensure!(!chunks.is_empty(), "текст пуст — нечего синтезировать");
+            let total = chunks.len();
+            let tasks: Vec<Task> = chunks
+                .iter()
+                .enumerate()
+                .map(|(i, chunk)| {
+                    let mut model_text = to_model_stress_notation(&chunk.text);
+                    if let Some(rules) = &opts.char_rules {
+                        model_text = apply_char_rules(&model_text, rules);
+                    }
+                    let pause_s = chunk_pause_s(
+                        chunk,
+                        i + 1 == total,
+                        opts.paragraph_pause_s,
+                        opts.pause_scale,
+                    );
+                    Task {
+                        index: i as u64,
+                        model_text,
+                        pause_s,
+                    }
+                })
+                .collect();
+            let texts = chunks.iter().map(|c| c.text.clone()).collect();
+            Ok(FilePlan {
+                texts,
+                tasks,
+                notes: Vec::new(),
+            })
+        }
+        ChunkingMode::TeraTtsAndroid => {
+            anyhow::ensure!(
+                opts.max_chunk_chars >= 1,
+                "max_chunk_chars должен быть ≥ 1 (получено {})",
+                opts.max_chunk_chars
             );
-            Task {
-                index: i as u64,
-                model_text,
-                pause_s,
+            let a_opts = AndroidChunkOptions {
+                max_chunk_chars: opts.max_chunk_chars as usize,
+                paragraph_pause_s: opts.paragraph_pause_s,
+                pause_scale: opts.pause_scale,
+                call_chunk_limit: CALL_CHUNK_LIMIT,
+            };
+            let plan = android_chunk_pipeline(raw_text, &a_opts);
+            let mut texts: Vec<String> = Vec::new();
+            let mut tasks: Vec<Task> = Vec::new();
+            let mut notes: Vec<String> = Vec::new();
+            for c in plan {
+                if c.is_scene() {
+                    // сцена: пауза вливается в предыдущий чанк (сцены подряд
+                    // суммируются); в начале файла — только заметка
+                    if let Some(sp) = c.pause_s {
+                        match tasks.last_mut() {
+                            Some(last) => {
+                                if let Some(p) = last.pause_s.as_mut() {
+                                    *p += sp;
+                                }
+                            }
+                            None => notes.push(format!(
+                                "сцена-разделитель в начале файла: ведущая пауза {sp:.2} с не вставляется"
+                            )),
+                        }
+                    }
+                    continue;
+                }
+                match c.model_text {
+                    Some(m) => {
+                        texts.push(c.text.clone());
+                        tasks.push(Task {
+                            index: tasks.len() as u64,
+                            model_text: m,
+                            pause_s: c.pause_s,
+                        });
+                    }
+                    None => {
+                        // чанк без кириллицы: задача не создаётся; пауза
+                        // ПРИБАВЛЯЕТСЯ к предыдущему (арифметика Android —
+                        // тишина эмитится до следующего чанка; SPEC 0.4)
+                        if let Some(p) = c.pause_s {
+                            match tasks.last_mut() {
+                                Some(last) => {
+                                    if let Some(lp) = last.pause_s.as_mut() {
+                                        *lp += p;
+                                    }
+                                }
+                                None => notes.push(format!(
+                                    "чанк в начале файла пропущен (нет кириллицы): {:?} — пауза {p:.2} с не вставляется",
+                                    c.text
+                                )),
+                            }
+                        }
+                        notes.push(format!("(пропущено: нет кириллицы) {}", c.text));
+                    }
+                }
             }
-        })
-        .collect();
-    let texts = chunks.iter().map(|c| c.text.clone()).collect();
-    Ok((texts, tasks))
+            // глобально последний чанк файла — без вставки паузы
+            if let Some(last) = tasks.last_mut() {
+                last.pause_s = None;
+            }
+            anyhow::ensure!(!tasks.is_empty(), "текст пуст — нечего синтезировать");
+            Ok(FilePlan {
+                texts,
+                tasks,
+                notes,
+            })
+        }
+    }
 }
 
 /// Реализация с инъекцией фабрики воркеров: публичная обёртка всегда берёт
@@ -754,8 +863,12 @@ where
     F: FnMut(usize, usize),
 {
     // G6.7: план чанков выделен в build_file_tasks (общий с многопроцессным
-    // диспетчером); порядок/паузы/char_rules — без изменений.
-    let (chunk_texts, tasks) = build_file_tasks(raw_text, opts)?;
+    // диспетчером); G7: план строится по opts.chunking, порядок/паузы/char_rules
+    // Standard — без изменений.
+    let file_plan = build_file_tasks(raw_text, opts)?;
+    let chunk_texts = file_plan.texts;
+    let tasks = file_plan.tasks;
+    let plan_notes = file_plan.notes;
     let total = tasks.len();
     let fs = POCKET_RATE;
     let partial_path = sink.partial_path();
@@ -911,6 +1024,7 @@ where
         pause_samples,
         denoise_report: summary.denoise,
         chunks: rows,
+        plan_notes,
     })
 }
 
@@ -969,6 +1083,8 @@ mod stream_error_tests {
             pause_scale: 1.0,
             paragraph_pause_s: 0.0,
             max_tokens: 10, // короткие чанки — падение на 3-м гарантировано до конца
+            chunking: ChunkingMode::Standard,
+            max_chunk_chars: 150,
             char_rules: None,
             anti_repeat: true,
         };
@@ -1198,6 +1314,8 @@ mod publish_phase_tests {
             pause_scale: 1.0,
             paragraph_pause_s: 0.0,
             max_tokens: 10,
+            chunking: ChunkingMode::Standard,
+            max_chunk_chars: 150,
             char_rules: None,
             anti_repeat: true,
         }
@@ -1389,5 +1507,239 @@ mod publish_phase_tests {
                 RunPhase::Publishing
             ]
         );
+    }
+}
+
+/// G7: планы обоих режимов чанкования против эталонных golden-данных
+/// (tests/golden/android_reference_* / windows_reference_chunks.json).
+#[cfg(test)]
+mod chunk_mode_tests {
+    use super::*;
+
+    fn base_opts() -> PipelineOptions {
+        PipelineOptions {
+            model_dir: PathBuf::from("."),
+            voice: PathBuf::from("voice.wav"),
+            device: Device::Cpu,
+            threads: 1,
+            precision: ModelPrecision::Fp32,
+            seed: Some(42),
+            temperature: 0.3,
+            decode_steps: 1,
+            eos_threshold: -4.0,
+            eos_tail_short: EosTail::Fixed(5),
+            eos_tail_long: EosTail::Fixed(3),
+            brightness_db: 0.0,
+            denoise: false,
+            pause_scale: 1.0,
+            paragraph_pause_s: 0.9,
+            max_tokens: 50,
+            chunking: ChunkingMode::Standard,
+            max_chunk_chars: 150,
+            char_rules: None,
+            anti_repeat: true,
+        }
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RefRec {
+        chunk_text: String,
+        #[serde(rename = "pause_after_s")]
+        pause_s: Option<f32>,
+        model_text: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RefFile {
+        chunks: Vec<RefRec>,
+    }
+
+    fn load_json(name: &str) -> RefFile {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/golden/");
+        let raw = std::fs::read_to_string(format!("{path}{name}")).expect("golden file");
+        serde_json::from_str(&raw).expect("golden json")
+    }
+
+    fn reference_input() -> String {
+        std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/golden/android_reference_input.txt"
+        ))
+        .expect("reference input")
+    }
+
+    fn assert_plan_matches(plan: &FilePlan, reference: &RefFile) {
+        assert_eq!(
+            plan.tasks.len(),
+            reference.chunks.len(),
+            "число задач ≠ эталон"
+        );
+        assert_eq!(plan.texts.len(), plan.tasks.len(), "texts↔tasks 1:1");
+        for (i, (task, e)) in plan.tasks.iter().zip(reference.chunks.iter()).enumerate() {
+            assert_eq!(task.index, i as u64, "плотная нумерация [{i}]");
+            assert_eq!(task.model_text, e.model_text, "model_text [{i}]");
+            assert_eq!(plan.texts[i], e.chunk_text, "текст журнала [{i}]");
+            match (task.pause_s, e.pause_s) {
+                (Some(a), Some(b)) if (a - b).abs() < 1e-6 => {}
+                (None, None) => {}
+                (a, b) => panic!("pause_s [{i}]: {a:?} ≠ {b:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn android_mode_plan_matches_reference_99() {
+        let opts = PipelineOptions {
+            chunking: ChunkingMode::TeraTtsAndroid,
+            ..base_opts()
+        };
+        let plan = build_file_tasks(&reference_input(), &opts).expect("план android");
+        let reference = load_json("android_reference_chunks.json");
+        assert_eq!(reference.chunks.len(), 99);
+        assert_plan_matches(&plan, &reference);
+        assert!(plan.notes.is_empty(), "на эталоне заметок нет");
+    }
+
+    #[test]
+    fn standard_mode_plan_matches_reference_77() {
+        let opts = base_opts();
+        let plan = build_file_tasks(&reference_input(), &opts).expect("план standard");
+        let reference = load_json("windows_reference_chunks.json");
+        assert_eq!(reference.chunks.len(), 77);
+        assert_plan_matches(&plan, &reference);
+        assert!(plan.notes.is_empty());
+    }
+
+    #[test]
+    fn empty_text_and_scenes_only_error_in_both_modes() {
+        for chunking in [ChunkingMode::Standard, ChunkingMode::TeraTtsAndroid] {
+            let opts = PipelineOptions {
+                chunking,
+                ..base_opts()
+            };
+            let err = build_file_tasks("", &opts).unwrap_err().to_string();
+            assert!(err.contains("текст пуст"), "{chunking:?}: {err}");
+            let err = build_file_tasks("\n\n   \n\n", &opts)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("текст пуст"), "{chunking:?}: {err}");
+        }
+        // только сцены-разделители: чанков нет → та же ошибка
+        let opts = PipelineOptions {
+            chunking: ChunkingMode::TeraTtsAndroid,
+            ..base_opts()
+        };
+        let err = build_file_tasks("* * *\n\n⁂", &opts)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("текст пуст"), "{err}");
+    }
+
+    #[test]
+    fn android_zero_max_chunk_chars_is_explicit_error() {
+        let opts = PipelineOptions {
+            chunking: ChunkingMode::TeraTtsAndroid,
+            max_chunk_chars: 0,
+            ..base_opts()
+        };
+        let err = build_file_tasks("Какой-то текст.", &opts)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max_chunk_chars"), "{err}");
+    }
+
+    #[test]
+    fn android_dropped_latin_chunk_merges_pause_and_notes() {
+        // латинская фраза в СЕРЕДИНЕ вызова отбрасывается: задача не
+        // создаётся, texts/tasks выровнены, её пауза (стык 0.5) ПРИБАВЛЯЕТСЯ
+        // к предыдущему чанку (арифметика Android: тишина — до следующего)
+        let opts = PipelineOptions {
+            chunking: ChunkingMode::TeraTtsAndroid,
+            ..base_opts()
+        };
+        let plan =
+            build_file_tasks("П+ервое. Hello world. Вт+орое.\n\nТр+етий.", &opts).expect("план");
+        assert_eq!(plan.tasks.len(), 3);
+        assert_eq!(plan.texts.len(), 3);
+        assert_eq!(plan.texts[0], "П+ервое.");
+        assert_eq!(plan.texts[1], "Вт+орое.");
+        assert_eq!(plan.texts[2], "Тр+етий.");
+        // чанк 0: свой стык 0.5 + влитая пауза отброшенного 0.5; чанк 1 —
+        // хвост вызова КОНЦА АБЗАЦА (фраза вызова упаковала весь абзац 1):
+        // max(0.5, 0.9) = 0.9; чанк 2 — конец файла
+        let p0 = plan.tasks[0].pause_s.unwrap();
+        assert!((p0 - 1.0).abs() < 1e-5, "pauses[0]={p0}");
+        let p1 = plan.tasks[1].pause_s.unwrap();
+        assert!((p1 - 0.9).abs() < 1e-5, "pauses[1]={p1}");
+        assert_eq!(plan.tasks[2].pause_s, None);
+        // плотная нумерация сохранена
+        assert_eq!(
+            plan.tasks.iter().map(|t| t.index).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert!(
+            plan.notes
+                .iter()
+                .any(|n| n.contains("пропущено: нет кириллицы") && n.contains("Hello")),
+            "{:?}",
+            plan.notes
+        );
+    }
+
+    #[test]
+    fn android_dropped_chunk_before_and_between_keeps_order() {
+        // отброшенный чанк В НАЧАЛЕ файла: пауза не вставляется (заметка),
+        // порядок и нумерация остальных не меняются
+        let opts = PipelineOptions {
+            chunking: ChunkingMode::TeraTtsAndroid,
+            ..base_opts()
+        };
+        let plan = build_file_tasks("Hello world\n\nП+ервый абз+ац.\n\nВт+орой абз+ац.", &opts)
+            .expect("план");
+        assert_eq!(plan.tasks.len(), 2);
+        assert_eq!(plan.tasks[0].index, 0);
+        assert_eq!(plan.tasks[1].index, 1);
+        assert!(plan.texts[0].contains("П+ервый"));
+        assert_eq!(plan.tasks[0].pause_s, Some(0.9)); // абзац, без потерь
+        assert_eq!(plan.tasks[1].pause_s, None);
+        assert!(
+            plan.notes.iter().any(|n| n.contains("в начале файла")),
+            "{:?}",
+            plan.notes
+        );
+    }
+
+    #[test]
+    fn android_scene_pause_inlined_into_previous_chunk() {
+        let opts = PipelineOptions {
+            chunking: ChunkingMode::TeraTtsAndroid,
+            ..base_opts()
+        };
+        let plan = build_file_tasks("Кон+ец ч+асти.\n\n* * *\n\nНач+ало новой глав+ы.", &opts)
+            .expect("план");
+        // сцена не создаёт задачи; 0.9 (абзац) + 1.3 (сцена) = 2.2
+        assert_eq!(plan.tasks.len(), 2);
+        let p0 = plan.tasks[0].pause_s.unwrap();
+        assert!((p0 - 2.2).abs() < 1e-5, "pauses[0]={p0}");
+        assert_eq!(plan.tasks[1].pause_s, None);
+        assert_eq!(plan.texts.len(), 2);
+    }
+
+    #[test]
+    fn plan_is_independent_of_workers_and_deterministic() {
+        // одна точка планирования: повторные вызовы дают идентичный план
+        let opts = PipelineOptions {
+            chunking: ChunkingMode::TeraTtsAndroid,
+            ..base_opts()
+        };
+        let a = build_file_tasks(&reference_input(), &opts).unwrap();
+        let b = build_file_tasks(&reference_input(), &opts).unwrap();
+        assert_eq!(a.tasks.len(), b.tasks.len());
+        for (x, y) in a.tasks.iter().zip(b.tasks.iter()) {
+            assert_eq!(x.index, y.index);
+            assert_eq!(x.model_text, y.model_text);
+            assert_eq!(x.pause_s, y.pause_s);
+        }
+        assert_eq!(a.texts, b.texts);
     }
 }

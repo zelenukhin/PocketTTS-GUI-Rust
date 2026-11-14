@@ -513,6 +513,8 @@ impl SynthArgs {
             max_tokens: self.max_tokens,
             char_rules: load_char_rules(&self.char_rules)?,
             anti_repeat: true,
+            chunking: text_processing::ChunkingMode::Standard,
+            max_chunk_chars: 150,
         })
     }
 }

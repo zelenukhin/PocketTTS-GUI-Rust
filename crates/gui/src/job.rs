@@ -329,6 +329,9 @@ pub fn pipeline_options(
         pause_scale: s.pause_scale,
         paragraph_pause_s: s.paragraph_pause_s,
         max_tokens: s.max_tokens,
+        // G7 этап 3: дефолт; поля GuiSettings chunking_mode/max_chunk_chars — этап 4
+        chunking: text_processing::ChunkingMode::Standard,
+        max_chunk_chars: 150,
         char_rules,
         anti_repeat: s.anti_repeat,
     }

@@ -1112,6 +1112,7 @@ fn fake_engine_run(
             pause_samples: 0,
             denoise_report: Default::default(),
             chunks: Vec::new(),
+            plan_notes: Vec::new(),
         });
     }
     let _ = ev_tx.send(Ev::FilePhase {
@@ -1141,6 +1142,7 @@ fn fake_engine_run(
         pause_samples: 0,
         denoise_report: Default::default(),
         chunks: Vec::new(),
+        plan_notes: Vec::new(),
     })
 }
 

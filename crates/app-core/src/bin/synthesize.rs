@@ -204,6 +204,9 @@ fn run() -> Result<ExitCode> {
         pause_scale: args.pause_scale,
         paragraph_pause_s: args.paragraph_pause_s,
         max_tokens: args.max_tokens,
+        // G7 этап 3: дефолт; CLI-флаги --chunking/--max-chunk-chars — этап 6
+        chunking: text_processing::ChunkingMode::Standard,
+        max_chunk_chars: 150,
         char_rules,
         anti_repeat: true,
     };

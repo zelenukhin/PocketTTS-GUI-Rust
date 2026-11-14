@@ -169,6 +169,8 @@ mod tests {
             pause_scale: 1.0,
             paragraph_pause_s: 0.9,
             max_tokens: 50,
+            chunking: text_processing::ChunkingMode::Standard,
+            max_chunk_chars: 150,
             char_rules: None,
             anti_repeat: true,
         }
