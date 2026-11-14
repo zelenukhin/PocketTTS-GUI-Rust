@@ -70,7 +70,17 @@
   ALL PASS (после починки `<user>`-плейсхолдеров из 6d10c10 на
   `$env:USERPROFILE` — скрипты были неработоспособны на любой машине).
 - **Артефакты**: `out/g7/` (WAV CPU×3/CUDA, журналы, логи прогонов).
-- **Не делалось (осознанно)**: portable не пересобирался (по ТЗ); ASIDE
+- **Portable G7 собран и принят (headless)**:
+  `C:\PocketTTS-GUI-Rust\dist\PocketTTS-GUI-Rust-Portable-2026-11-14-g7`
+  — git `c8ca2d9` dirty=false, 61 файл, 3624.1 MiB, `-HardLinkPayload`;
+  SHA256: GL-EXE `1E43CACC…BC6F4C`, cpu-EXE `76E7AEE8…AA49211`. Приёмка из
+  комплекта с CWD `C:\`: portable-check OK обоими EXE; конфиг с
+  `chunking_mode: teratts_android` читается (check OK, шаблон восстановлен
+  побайтово); hybrid fake 2×2 — 6/6, сирот 0 (раздел G7 в
+  docs/PORTABLE_BUILD.md). NAS-бэкап ДО сборки:
+  `ShtormTTS-Windows-full-c8ca2d9-20261114.zip` (SHA256
+  `9083223B…BF7FDE`, CRC OK, локальная копия = NAS).
+- **Не делалось (осознанно)**: ASIDE
   gain/speed не переносятся (нет per-chunk DSP); U+2063/EMA-латентность —
   файловый синтез; словарные проходы normalize() — вход подготовлен;
   плеерный путь (SpokenProgress/quickStart/VoicePlan) запрещён к переносу.

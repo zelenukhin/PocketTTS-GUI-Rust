@@ -505,6 +505,31 @@ README) — не считается эталонным, не удалялся, �
 том же exe вне комплекта (`out/g63_gui_e2e4.ps1`, 9/9 PASS); GUI-подсистема
 и спавны детей не менялись со времён G6.2.3.
 
+## Результаты сборки G7 (2026-11-14)
+
+Комплект: `dist\PocketTTS-GUI-Rust-Portable-2026-11-14-g7` — из чистого
+дерева git `c8ca2d9` (dirty=false; второй алгоритм чанкования «TeraTTS
+Android» — см. HANDOFF G7), **61 файл**, 3624.1 MiB, `-HardLinkPayload`
+(диск C: заполнен, 752 МБ свободно). Оба EXE:
+
+- `PocketTTS-GUI-Rust.exe` — SHA256
+  `1E43CACCBD8B4F0D71DDF0FC2DB4FE28B556AE5CD00F1CD8E0CB05E2E9BC6F4C`
+- `PocketTTS-GUI-Rust-cpu.exe` — SHA256
+  `76E7AEE83234F426FCD1071F8031682974794069A0B5ADEEA1A213CCDAA49211`
+
+Приёмка из комплекта с CWD `C:\` (лог `out/g7/portable_build.log`):
+
+- `--portable-check` — OK обоими EXE (всё exe-relative);
+- конфиг с новыми ключами G7 (`chunking_mode: "teratts_android"` +
+  `max_chunk_chars: 180`) читается без ошибок, `--portable-check` OK;
+  шаблонный `PocketTTS-GUI-Rust.json` после проверки восстановлен
+  побайтово (цепочка rename);
+- `--portable-selftest-hybrid` (cpu-EXE, fake-движок): 2 процесса,
+  4 воркера, **6/6**, сирот 0.
+
+Реальный CUDA-прогон и визуальная проверка GUI-переключателя из
+комплекта — за пользователем (как в g68).
+
 ## Результаты сборки G6.8 (2026-11-13)
 
 Комплект: `dist\PocketTTS-GUI-Rust-Portable-2026-11-13-g68` — из чистого
