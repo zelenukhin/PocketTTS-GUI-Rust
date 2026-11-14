@@ -1088,9 +1088,60 @@ impl ShtormApp {
                     slider_row(ui, "Шаги декодирования:", |ui| {
                         ui.add(egui::Slider::new(&mut s.decode_steps, 1..=8));
                     });
-                    slider_row(ui, "Макс. токенов:", |ui| {
-                        ui.add(egui::Slider::new(&mut s.max_tokens, 10..=300).step_by(5.0));
+                    // G7: алгоритм разбиения текста; ползунок лимита меняется
+                    // на месте (токены ↔ символы), значения независимы
+                    let mode_label = match s.chunking_mode {
+                        text_processing::ChunkingMode::Standard => "Обычный",
+                        text_processing::ChunkingMode::TeraTtsAndroid => "TeraTTS Android",
+                    };
+                    ui.horizontal(|ui| {
+                        label_cell(ui, "Алгоритм разбиения:");
+                        egui::ComboBox::from_id_salt("chunking_mode")
+                            .width(190.0)
+                            .selected_text(mode_label)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut s.chunking_mode,
+                                    text_processing::ChunkingMode::Standard,
+                                    "Обычный",
+                                );
+                                ui.selectable_value(
+                                    &mut s.chunking_mode,
+                                    text_processing::ChunkingMode::TeraTtsAndroid,
+                                    "TeraTTS Android",
+                                );
+                            });
                     });
+                    match s.chunking_mode {
+                        text_processing::ChunkingMode::Standard => {
+                            hint(ui, "Стандартный алгоритм Windows с ограничением по токенам");
+                            slider_row(ui, "Макс. токенов:", |ui| {
+                                ui.add(egui::Slider::new(&mut s.max_tokens, 10..=300).step_by(5.0));
+                            });
+                        }
+                        text_processing::ChunkingMode::TeraTtsAndroid => {
+                            hint(
+                                ui,
+                                "Разбиение по алгоритму TeraTTS Android. Максимальная \
+                                 длина задаётся в символах, а не токенах",
+                            );
+                            slider_row(ui, "Максимум символов:", |ui| {
+                                ui.add(
+                                    egui::Slider::new(&mut s.max_chunk_chars, 50..=300)
+                                        .step_by(10.0),
+                                );
+                            });
+                            if s.max_chunk_chars < 50 {
+                                hint(ui, "очень короткие чанки — много стыков");
+                            } else if s.max_chunk_chars > 200 {
+                                hint(
+                                    ui,
+                                    "длинные чанки — возможно затухание громкости в конце \
+                                     (рекомендация автора модели 120–180)",
+                                );
+                            }
+                        }
+                    }
                     ui.horizontal(|ui| {
                         label_cell(ui, "Seed:");
                         ui.add(egui::DragValue::new(&mut s.seed).range(-1..=i64::MAX));
@@ -3130,6 +3181,45 @@ mod tests {
             Some(&serde_json::json!({"x": 1})),
             "A6: неизвестный ключ пережил автосохранение"
         );
+    }
+
+    /// G7: кадр update_ui рендерится в обоих режимах чанкования без паники
+    /// (переключатель + условный ползунок в «Параметрах генерации»).
+    #[test]
+    fn update_ui_renders_both_chunking_modes() {
+        let conf = close_sandbox("chunkui");
+        let mut app = ShtormApp::with_conf_path(conf.clone());
+        app.settings.gen_open = true;
+        let ctx = egui::Context::default();
+        ctx.style_mut(|st| st.animation_time = 0.0);
+        for mode in [
+            text_processing::ChunkingMode::Standard,
+            text_processing::ChunkingMode::TeraTtsAndroid,
+        ] {
+            app.settings.chunking_mode = mode;
+            let _ = ctx.run(egui::RawInput::default(), |ctx| app.update_ui(ctx));
+            assert_eq!(app.settings.chunking_mode, mode, "режим пережил кадр");
+        }
+    }
+
+    /// G7: переключение режима и правка «Максимум символов» переживают
+    /// автосохранение при закрытии; max_tokens не пересчитывается.
+    #[test]
+    fn close_autosaves_chunking_mode_and_chars() {
+        let conf = close_sandbox("chunksave");
+        let mut app = ShtormApp::with_conf_path(conf.clone());
+        app.settings.max_tokens = 50;
+        app.settings.chunking_mode = text_processing::ChunkingMode::TeraTtsAndroid;
+        app.settings.max_chunk_chars = 180;
+        let cmds = close_frame(&mut app, true);
+        assert!(has_cancel_close(&cmds) && has_close(&cmds));
+        let re = load_settings(&conf).unwrap();
+        assert_eq!(
+            re.chunking_mode,
+            text_processing::ChunkingMode::TeraTtsAndroid
+        );
+        assert_eq!(re.max_chunk_chars, 180);
+        assert_eq!(re.max_tokens, 50, "токены и символы независимы");
     }
 
     /// Сессия без изменений не пишет файл: содержимое байт-в-байт то же,
