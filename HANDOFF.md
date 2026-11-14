@@ -1,18 +1,86 @@
 # HANDOFF.md — оперативный снимок проекта (читать первым вместе с AGENTS.md)
 
-- **Дата обновления**: 2026-11-13 (G6.8: второй EXE
-  **PocketTTS-GUI-Rust-cpu.exe** — полностью программная отрисовка GUI на CPU
-  без OpenGL/D3D/GPU; egui/eframe 0.31→0.34; общий кадр `update_ui` и общая
-  точка входа `entry` для обоих бинарников; собственный winit-цикл с
-  протоколом закрытия eframe (CancelClose/Close) для машины G6.2.3; отчёт
-  `docs/G6_8_SOFTWARE_RENDERING.md`. Ранее G6.7/G6.7.1: единый постоянный
-  ЧАНК-пул P/W/C/T для CPU/CUDA, одиночного TXT и каталога; мультипроцессный
-  чанк-конвейер с бинарным PCM по IPC; отчёт
-  `docs/G6_7_UNIFIED_CHUNK_POOL.md`. Ранее G6.6: постоянный CPU-пул
-  каталогов + единая модель параллелизма; G6.5: переименование в
-  **PocketTTS-GUI-Rust**; G6.4: адаптивный GUI; G6.3: INT8; G6.2.3:
-  автосохранение + GUI без консоли; G6.2: гибридный пакетный CUDA 2×2).
+- **Дата обновления**: 2026-11-14 (G7: второй алгоритм чанкования
+  **«TeraTTS Android»** — дословный порт PocketTTS-пути teratts-android
+  `ec0537f`: модуль `text-processing/src/android_chunking.rs`, лимит
+  `max_chunk_chars` в Unicode-символах (150), собственный план пауз,
+  fastStart перенесён (эталон 99 чанков включает его — SPEC_CORRECTIONS
+  0.8), переключатель GUI «Алгоритм разбиения текста», CLI
+  `--chunking standard|android` + `--max-chunk-chars`; исправления
+  спецификации — `docs/G7_SPEC_CORRECTIONS.md`. Standard не изменился
+  (регрессия 77/77). Ранее G6.8: второй EXE PocketTTS-GUI-Rust-cpu.exe;
+  G6.7/G6.7.1: единый постоянный чанк-пул P/W/C/T и мультипроцессный
+  chunkpipe; G6.6: CPU-пул каталогов; G6.5: переименование; G6.4:
+  адаптивный GUI; G6.3: INT8; G6.2.3: автосохранение; G6.2: гибрид 2×2).
 - **HEAD**: только из Git (`git log -1 --oneline`), не из этого файла.
+
+## G7 — что сделано (текущий этап)
+
+- **Коммиты этапов**: 0=4d96c32 (spec), 1=ba31714 (модуль+cases), 2=752d35d
+  (эталон 99+fastStart), 3=ca5f8da (build_file_tasks/FilePlan), 4=c831bf5
+  (настройки), 5=115a951 (GUI-переключатель), 6=5bc48f3 (CLI+real CPU),
+  7=этот коммит (E2E/HANDOFF/AGENTS + починка smoke-скриптов).
+- **Модуль** `android_chunking.rs` (~1300 строк + тесты): дословные порты
+  из верифицированного harness — Kotlin-стадия (splitIntoSentences≤300 c
+  защитой англ. аббревиатур, commaSplit>300 со срезом конечных `,;`,
+  volatile-пробел, paragraphUnits+fastStart, quirk «<2 юнитов»), чистки K3
+  (footnotes/URL/невидимые/oddHyphen; glued-цифры снимаются только в конце
+  строки — проверено на JVM 21), терa-фронтэнд (pause_split с
+  boundary-проверкой/аббревиатурами/тире, split_asides, prepare_pocket,
+  FIXED_STRESS, КАПС-транслит, цифры словами), helper-стадия (chunk_text
+  ≤150 симв. с монолитами, split_sentences), план пауз вызова (стык ≥0.02,
+  aside ≥0.25, хвост max(знак,0.9)×scale без пола, сцены 1.3×scale,
+  последний чанк файла None). Глобальные static→параметры
+  AndroidChunkOptions.
+- **fastStart (SPEC_CORRECTIONS 0.8)**: эталон 99 чанков СГЕНЕРИРОВАН с
+  fastStart (первый юнит — упакованная фраза 63>55, вырез даёт чанки 0/1
+  эталона); предположение спецификации «первое предложение 38≤55»
+  измеряло не тот объект. fastStart перенесён дословно; корпус cases.json
+  перегенерирован генератором harness (38 кейсов, 11 изменились);
+  android_reference.json НЕ менялся.
+- **Интеграция**: `build_file_tasks` → `FilePlan{texts,tasks,notes}` —
+  единая точка ветвления `opts.chunking`; `texts[i]↔tasks[i]` 1:1
+  (плотная нумерация); сцены вливают паузу в предыдущий чанк (сумма при
+  подряд), отброшенные чанки (нет кириллицы) ПЕРЕНОСЯТ свою паузу в
+  предыдущий (арифметика Android), заметки `notes` → StreamOutcome →
+  журнал чанков после шапки; `max_chunk_chars=0` — явная ошибка плана.
+  char_rules в Android-режиме не применяются. Task/IPC/воркеры не менялись.
+- **Настройки**: `GuiSettings.chunking_mode` (единый
+  `text_processing::ChunkingMode`, JSON `"standard"|"teratts_android"`
+  через явный `rename` — `lowercase` дал бы `terattsandroid`; неизвестное
+  значение — ошибка чтения конфига, без подмены) + `max_chunk_chars`
+  (дефолт 150, хранится как есть). `pipeline_options` прокидывает оба;
+  CLI `--chunking standard|android` (clap value_parser, exit 2 на мусор)
+  и `--max-chunk-chars` (0 — ошибка до загрузки Pocket). max_tokens и
+  max_chunk_chars полностью независимы (тест переключений).
+- **GUI**: блок «Параметры генерации» — ComboBox «Алгоритм разбиения
+  текста» (Обычный/TeraTTS Android); «Максимум символов» (50..=300 шаг 10)
+  заменяет «Макс. токенов» на месте; подсказки режимов + предупреждения
+  <50/>200; значения сохраняются/восстанавливаются (headless-тесты кадров
+  обоих режимов и автосохранения).
+- **Проверки**: `cargo test --workspace` — **338 passed / 0 failed**
+  (+golden android 38 кейсов побуквенно, эталон 99/99 (тексты/model_text/
+  паузы/aside/para/границы, сумма 56.98, пауз абзаца 38), standard 77/77,
+  FilePlan/сцены/пропуски/ноль, serde-контракт, CLI-парсер, настройки);
+  fmt OK; clippy `--all-targets --release` — 0. Real: CLI CPU Fast FP32
+  android — 99 чанков, паузы 56.98 с, журнал 99/99 совпадает с эталоном;
+  повтор и workers=2 — WAV ПОБИТОВО (SHA256 `44247C2F…`, RTF 0.54/0.39);
+  CLI CUDA android — 99/56.98, io binding active; CLI standard — 77
+  чанков/47.72 с, журнал = windows_reference. Smoke: g611/g612/g62 —
+  ALL PASS (после починки `<user>`-плейсхолдеров из 6d10c10 на
+  `$env:USERPROFILE` — скрипты были неработоспособны на любой машине).
+- **Артефакты**: `out/g7/` (WAV CPU×3/CUDA, журналы, логи прогонов).
+- **Не делалось (осознанно)**: portable не пересобирался (по ТЗ); ASIDE
+  gain/speed не переносятся (нет per-chunk DSP); U+2063/EMA-латентность —
+  файловый синтез; словарные проходы normalize() — вход подготовлен;
+  плеерный путь (SpokenProgress/quickStart/VoicePlan) запрещён к переносу.
+- **Ограничения**: визуальная приёмка GUI-переключателя пользователем и
+  реальные GUI-прогоны обоих режимов из окна — за пользователем
+  (headless-тесты и CLI-паритет плана покрывают логику); побитовое
+  равенство МЕЖДУ разными CUDA-топологиями не является критерием
+  (SPEC_CORRECTIONS 0.2); chunkpipe/persistent-пулы Android-режима
+  проверены планом (единая точка планирования + тест идемпотентности) и
+  smoke G6.2/G6.7, отдельные длинные real-прогоны — по запросу.
 
 ## G6.8 — что сделано (текущий этап)
 

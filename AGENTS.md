@@ -42,7 +42,11 @@ GUI для Pocket-TTS на Rust; репозиторий —
   `annotate_soft_breaks`+`terminate_bare_chunks`, golden 96 кейсов),
   `char_rules.rs` (порт `apply_char_rules`, golden 314), `pauses.rs`
   (`trailing_pause_s`, `chunk_pause_s` с исправленной приоритетностью;
-  golden 20 кейсов).
+  golden 20 кейсов), `android_chunking.rs` (G7: режим чанкования
+  «TeraTTS Android» — дословный порт PocketTTS-пути teratts-android
+  `ec0537f` c fastStart; `ChunkingMode` (JSON `standard`/`teratts_android`)
+  + `android_chunk_pipeline`; golden 38 кейсов + эталон 99 чанков,
+  исправления спецификации — `docs/G7_SPEC_CORRECTIONS.md`).
 - `crates/audio-processing` — `lib.rs` (write_wav16 create_new),
   `stream.rs` (`StreamingWav`: потоковый WAV, уникальный `.partial`;
   G5.1 `finish()` закрывает контейнер БЕЗ публикации, отдельная

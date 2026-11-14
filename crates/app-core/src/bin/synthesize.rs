@@ -486,7 +486,12 @@ mod tests {
         assert_eq!(a.chunking, text_processing::ChunkingMode::TeraTtsAndroid);
 
         let mut args = base_args();
-        args.extend(["--chunking".into(), "android".into(), "--max-chunk-chars".into(), "180".into()]);
+        args.extend([
+            "--chunking".into(),
+            "android".into(),
+            "--max-chunk-chars".into(),
+            "180".into(),
+        ]);
         let a = Args::try_parse_from(args).unwrap();
         assert_eq!(a.max_chunk_chars, 180);
 
