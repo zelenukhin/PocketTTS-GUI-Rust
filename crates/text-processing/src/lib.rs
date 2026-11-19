@@ -8,6 +8,7 @@ pub mod android_chunking;
 pub mod char_rules;
 pub mod chunking;
 pub mod pauses;
+pub mod srt_parse;
 pub use android_chunking::{
     android_chunk_pipeline, AndroidBoundary, AndroidChunk, AndroidChunkOptions, ChunkingMode,
     CALL_CHUNK_LIMIT, DEFAULT_MAX_CHUNK_CHARS,
@@ -18,6 +19,7 @@ pub use chunking::{
     terminate_bare_chunks, Chunk,
 };
 pub use pauses::{chunk_pause_s, trailing_pause_s};
+pub use srt_parse::{decode_srt_bytes, parse_srt, strip_srt_tags, SrtParseResult, SubtitleCue};
 
 use unicode_normalization::UnicodeNormalization;
 
