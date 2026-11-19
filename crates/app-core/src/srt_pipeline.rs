@@ -271,6 +271,9 @@ pub struct SrtOutcome {
     pub warnings: Vec<String>,
     pub max_buffered: usize,
     pub max_buffered_bytes: usize,
+    /// Пик длины буфера ОДНОЙ реплики (сэмплы): подтверждение соблюдения
+    /// `max_cue_pcm_samples` (SRT.9A — проверка до накопления).
+    pub max_cue_pcm_len: usize,
 }
 
 /// Сборщик реплик: замыкание приёмника пула. Собирает PCM чанков реплики
@@ -297,6 +300,30 @@ struct SrtAssembler<'a> {
     sink_seq: usize,
     silence_scratch: Vec<f32>,
     speech_samples: u64,
+    /// Пик длины буфера реплики (диагностика соблюдения лимита SRT.9A).
+    max_cue_len: usize,
+}
+
+/// SRT.9A: проверка предела буфера реплики ДО какого-либо расширения.
+/// Возвращает итоговую длину (для `resize` внутренней паузы); превышение
+/// или переполнение счётчика — явная ошибка с требуемым/разрешённым
+/// размером, без копирования входных данных и без роста буфера.
+fn ensure_cue_capacity(cur: u64, add: u64, limit: u64, cue_index: i64) -> Result<usize> {
+    let need = cur.checked_add(add).ok_or_else(|| {
+        anyhow::anyhow!(
+            "реплика [{cue_index}] превышает ограничение PCM-буфера: \
+             переполнение счётчика сэмплов ({cur}+{add})"
+        )
+    })?;
+    anyhow::ensure!(
+        need <= limit,
+        "реплика [{cue_index}] превышает ограничение PCM-буфера: требуется {need} сэмплов, разрешено {limit}"
+    );
+    usize::try_from(need).map_err(|_| {
+        anyhow::anyhow!(
+            "реплика [{cue_index}]: длина буфера {need} сэмплов не поддерживается платформой"
+        )
+    })
 }
 
 impl<'a> SrtAssembler<'a> {
@@ -312,7 +339,17 @@ impl<'a> SrtAssembler<'a> {
             self.current_cue,
             index
         );
+        // SRT.9A: лимит реплики действует ДО накопления — входной блок
+        // копируется только если итог укладывается в предел.
+        let cue_index = self.cue_infos[cue_no].0;
+        let after_pcm = ensure_cue_capacity(
+            self.cue_pcm.len() as u64,
+            pcm.len() as u64,
+            self.max_cue_pcm_samples,
+            cue_index,
+        )?;
         self.cue_pcm.extend_from_slice(pcm);
+        self.max_cue_len = self.max_cue_len.max(self.cue_pcm.len());
         let end = self.plan_ranges[cue_no].1;
         if index + 1 == end {
             self.finish_cue(cue_no)?;
@@ -325,9 +362,14 @@ impl<'a> SrtAssembler<'a> {
                 }
             }
         } else {
+            // Внутренняя пауза — тоже до `resize`: тишина не может
+            // вытолкнуть буфер за предел (раньше это проверялось лишь
+            // после сборки всей реплики).
             let pause = self.pause_after_chunk[index];
-            self.cue_pcm
-                .resize(self.cue_pcm.len() + pause as usize, 0.0);
+            let new_len =
+                ensure_cue_capacity(after_pcm as u64, pause, self.max_cue_pcm_samples, cue_index)?;
+            self.cue_pcm.resize(new_len, 0.0);
+            self.max_cue_len = self.max_cue_len.max(new_len);
         }
         Ok(())
     }
@@ -352,8 +394,14 @@ impl<'a> SrtAssembler<'a> {
     fn finish_cue(&mut self, cue_no: usize) -> Result<()> {
         let pcm = std::mem::take(&mut self.cue_pcm);
         // Финальная обрезка реплики (аналог trim_wav_edges(raw_path) в
-        // _assemble_srt_track; чанки уже обрезаны воркером).
+        // _assemble_srt_track; чанки уже обрезаны воркером). Копия `pcm`
+        // больше не нужна — освобождаем до SoundTouch (SRT.9A: пик памяти
+        // на реплику — буфер + обрезанная копия, не три копии).
         let trimmed = trim_edges(&pcm, 0.02, 0.10, POCKET_RATE);
+        drop(pcm);
+        // SRT.9A: основная проверка лимита — в on_chunk ДО накопления;
+        // здесь остаётся страховка (обрезка только укорачивает, поэтому
+        // при соблюдении инварианта недостижима).
         anyhow::ensure!(
             trimmed.len() as u64 <= self.max_cue_pcm_samples,
             "реплика [{}] слишком длинная после синтеза ({} сэмплов > лимита {})",
@@ -518,6 +566,7 @@ where
         sink_seq: 0,
         silence_scratch: Vec::new(),
         speech_samples: 0,
+        max_cue_len: 0,
     };
 
     let run = run_job(
@@ -552,6 +601,7 @@ where
     // финализации (sink.finish() владеет Box).
     let timing_rows = std::mem::take(&mut assembler.timing_rows);
     let speech_samples = assembler.speech_samples;
+    let max_cue_pcm_len = assembler.max_cue_len;
     drop(assembler);
 
     let mut status = if summary.cancelled {
@@ -621,6 +671,7 @@ where
         warnings: file_plan.warnings,
         max_buffered: summary.max_buffered,
         max_buffered_bytes: summary.max_buffered_bytes,
+        max_cue_pcm_len,
     })
 }
 
@@ -956,7 +1007,8 @@ mod tests {
 
     #[test]
     fn memory_limit_cue_is_error() {
-        // Сверхмалый лимит буфера реплики → явная ошибка вместо роста RAM.
+        // Сверхмалый лимит буфера реплики → явная ошибка ДО накопления
+        // (SRT.9A: раньше проверялось только после сборки реплики).
         let st = load_st();
         let cancel = AtomicBool::new(false);
         let out = temp_wav("memlimit");
@@ -969,8 +1021,242 @@ mod tests {
         let r = run_srt(srt, sink, &srt_opts, st.as_ref(), &cancel);
         assert!(r.is_err());
         let msg = format!("{:#}", r.err().unwrap());
-        assert!(msg.contains("слишком длинная"), "сообщение: {msg}");
-        assert!(!out.exists());
+        assert!(msg.contains("превышает ограничение"), "сообщение: {msg}");
+        assert!(msg.contains("разрешено 100"), "сообщение: {msg}");
+        assert!(!out.exists(), "неполный результат не публикуется");
+    }
+
+    /// SRT.9A: воркер фиксированной длины PCM (для тестов предела буфера).
+    struct FixedLenWorker(usize);
+    impl ChunkWorker for FixedLenWorker {
+        fn process(&mut self, _task: &Task) -> Result<ChunkAudio> {
+            let pcm: Vec<f32> = vec![0.3; self.0];
+            Ok(ChunkAudio {
+                speech: pcm,
+                pause_s: None,
+                denoise: DenoiseChunkStatus::Off,
+            })
+        }
+    }
+
+    fn fixed_factory(len: usize) -> impl Fn(usize, u64) -> Result<FixedLenWorker> {
+        move |_wid, _seed| Ok(FixedLenWorker(len))
+    }
+
+    fn run_srt_fixed(
+        tag: &str,
+        srt: &str,
+        srt_opts: &SrtOptions,
+        chunk_len: usize,
+        cancel: &AtomicBool,
+    ) -> Result<SrtOutcome> {
+        let sink = make_sink(&temp_wav(tag), 24_000, OutputFormat::Wav, "", None).unwrap();
+        let st = load_st();
+        synthesize_srt_stream(
+            srt,
+            &std_opts(),
+            srt_opts,
+            2,
+            sink,
+            st.as_ref(),
+            |_d, _t| {},
+            cancel,
+            &|_| {},
+            fixed_factory(chunk_len),
+        )
+    }
+
+    fn opts_with_limit(limit: u64) -> SrtOptions {
+        SrtOptions {
+            max_cue_pcm_samples: limit,
+            ..Default::default()
+        }
+    }
+
+    /// SRT.9A-1: реплика ровно по лимиту — принимается.
+    #[test]
+    fn cue_at_exact_limit_accepted() {
+        let cancel = AtomicBool::new(false);
+        let len = 24_000usize;
+        let r = run_srt_fixed(
+            "exact",
+            "1\n00:00:00,000 --> 00:00:05,000\nРовно.\n",
+            &opts_with_limit(len as u64),
+            len,
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(r.status, RunStatus::Completed);
+        assert_eq!(r.timing_rows.len(), 1);
+        assert_eq!(r.max_cue_pcm_len, len, "пик буфера равен лимиту");
+    }
+
+    /// SRT.9A-2: на один сэмпл больше лимита — ошибка ДО накопления
+    /// (сообщение новой инварианты: требуется/разрешено).
+    #[test]
+    fn cue_one_sample_over_limit_is_error() {
+        let cancel = AtomicBool::new(false);
+        let len = 24_000usize;
+        let r = run_srt_fixed(
+            "over1",
+            "1\n00:00:00,000 --> 00:00:05,000\nЛимит.\n",
+            &opts_with_limit(len as u64 - 1),
+            len,
+            &cancel,
+        );
+        let err = format!("{:#}", r.expect_err("ошибка лимита"));
+        assert!(
+            err.contains("превышает ограничение PCM-буфера"),
+            "сообщение: {err}"
+        );
+        assert!(
+            err.contains("разрешено 23999"),
+            "в сообщении есть разрешённый лимит: {err}"
+        );
+    }
+
+    /// SRT.9A-3: превышение одним большим входным чанком — ошибка до
+    /// копирования PCM в буфер реплики; результат не публикуется.
+    #[test]
+    fn oversize_single_chunk_error_before_copy() {
+        let cancel = AtomicBool::new(false);
+        let r = run_srt_fixed(
+            "big1",
+            "1\n00:00:00,000 --> 00:00:05,000\nМного.\n",
+            &opts_with_limit(1000),
+            24_000,
+            &cancel,
+        );
+        let err = format!("{:#}", r.expect_err("ошибка лимита"));
+        assert!(
+            err.contains("требуется 24000 сэмплов, разрешено 1000"),
+            "сообщение: {err}"
+        );
+    }
+
+    /// SRT.9A-4: превышение накапливается несколькими чанками (паузы 0) —
+    /// ошибка на чанке, переходящем границу.
+    #[test]
+    fn limit_exceeded_after_several_chunks() {
+        let cancel = AtomicBool::new(false);
+        // Длинная реплика режется на много чанков по max_tokens=50.
+        let long_text = "Длинная реплика с несколькими частями. ".repeat(30);
+        let srt = format!("1\n00:00:00,000 --> 00:10:00,000\n{long_text}\n");
+        let opts = SrtOptions {
+            internal_pause_ms: 0,
+            comma_pause_ms: 0,
+            max_cue_pcm_samples: 2_000,
+            ..Default::default()
+        };
+        let r = run_srt_fixed("multi", &srt, &opts, 600, &cancel);
+        let err = format!("{:#}", r.expect_err("ошибка накопления"));
+        assert!(
+            err.contains("превышает ограничение PCM-буфера"),
+            "сообщение: {err}"
+        );
+        assert!(err.contains("разрешено 2000"), "сообщение: {err}");
+    }
+
+    /// SRT.9A-5: PCM помещается, но внутренняя пауза превышает лимит —
+    /// ошибка ДО resize буфера.
+    #[test]
+    fn internal_pause_over_limit_error_before_resize() {
+        let cancel = AtomicBool::new(false);
+        let long_text = "Длинная реплика с несколькими частями. ".repeat(30);
+        let srt = format!("1\n00:00:00,000 --> 00:10:00,000\n{long_text}\n");
+        // чанк 600, после первого чанка пауза 500 мс = 12000 сэмплов:
+        // 600 + 12000 > 2000 → ошибка до resize.
+        let opts = SrtOptions {
+            internal_pause_ms: 500,
+            comma_pause_ms: 500,
+            max_cue_pcm_samples: 2_000,
+            ..Default::default()
+        };
+        let r = run_srt_fixed("pause", &srt, &opts, 600, &cancel);
+        let err = format!("{:#}", r.expect_err("ошибка паузы"));
+        assert!(
+            err.contains("требуется 12600 сэмплов, разрешено 2000"),
+            "сообщение: {err}"
+        );
+    }
+
+    /// SRT.9A-6: граничные значения u64/usize — без паники и переполнений.
+    #[test]
+    fn capacity_check_arithmetic_boundaries() {
+        // обычное превышение — ошибка с требуемым/разрешённым
+        let e = ensure_cue_capacity(10, 20, 25, 7).unwrap_err();
+        assert!(
+            format!("{e:#}").contains("требуется 30 сэмплов, разрешено 25"),
+            "{e:#}"
+        );
+        // точное совпадение — Ok
+        assert_eq!(ensure_cue_capacity(10, 15, 25, 7).unwrap(), 25);
+        // нулевая добавка на границе usize::MAX — Ok без роста
+        let max = usize::MAX as u64;
+        assert_eq!(
+            ensure_cue_capacity(max, 0, u64::MAX, 7).unwrap(),
+            usize::MAX
+        );
+        // переполнение u64 при сложении — явная ошибка, не паника
+        let e = ensure_cue_capacity(u64::MAX, 1, u64::MAX, 7).unwrap_err();
+        assert!(format!("{e:#}").contains("переполнение счётчика"), "{e:#}");
+        // значение в пределах u64, но больше usize — ошибка на 32-бит;
+        // на 64-бит usize совпадает с u64: максимум представим и проходит
+        if usize::BITS < 64 {
+            let e = ensure_cue_capacity(4_000_000_000u64, 1, u64::MAX, 7).unwrap_err();
+            assert!(
+                format!("{e:#}").contains("не поддерживается платформой"),
+                "{e:#}"
+            );
+        } else {
+            assert_eq!(
+                ensure_cue_capacity(u64::MAX - 1, 1, u64::MAX, 7).unwrap(),
+                usize::MAX
+            );
+        }
+    }
+
+    /// SRT.9A-8: многчанковая реплика под лимитом — пик буфера равен сумме
+    /// PCM + внутренних пауз и не превышает лимит.
+    #[test]
+    fn multichunk_cue_peak_buffer_tracked() {
+        let cancel = AtomicBool::new(false);
+        let long_text = "Длинная реплика с несколькими частями. ".repeat(30);
+        let srt = format!("1\n00:00:00,000 --> 00:10:00,000\n{long_text}\n");
+        let limit = 1_000_000u64;
+        let opts = SrtOptions {
+            max_cue_pcm_samples: limit,
+            ..Default::default()
+        };
+        let r = run_srt_fixed("peak", &srt, &opts, 24_000, &cancel)
+            .expect("многчанковая реплика в лимите");
+        assert_eq!(r.status, RunStatus::Completed);
+        assert_eq!(r.timing_rows.len(), 1, "одна реплика");
+        assert!(r.max_cue_pcm_len > 24_000, "несколько чанков собраны");
+        assert!(
+            (r.max_cue_pcm_len as u64) <= limit,
+            "пик буфера {} <= лимита {limit}",
+            r.max_cue_pcm_len
+        );
+        // план из 15 чанков (как в repro-прогоне): 15*24000 + 14*12000 пауз
+        assert_eq!(r.max_cue_pcm_len, 15 * 24_000 + 14 * 12_000);
+    }
+
+    /// SRT.9A-7: пустой PCM чанка — реплика завершается без паники.
+    #[test]
+    fn empty_pcm_chunk_completes() {
+        let cancel = AtomicBool::new(false);
+        let r = run_srt_fixed(
+            "empty",
+            "1\n00:00:00,000 --> 00:00:02,000\nТихо.\n",
+            &SrtOptions::default(),
+            0,
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(r.status, RunStatus::Completed);
+        assert_eq!(r.timing_rows.len(), 1);
+        assert_eq!(r.timing_rows[0].raw_samples, 0);
     }
 
     #[test]
