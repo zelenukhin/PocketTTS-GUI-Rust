@@ -273,6 +273,13 @@ $int8ModelFiles = @(
     "mimi_decoder_int8.onnx"
 )
 
+# SRT.10: runtime.json (char_rules Standard-режима, файлы пользователя из G7)
+# лежит в репозитории models-config/, а не в каталоге моделей; предыдущий
+# полный комплект (g7) содержал его в models/<model>/ — сохраняем структуру.
+$runtimeConfigFiles = @("ru-v2-fast", "ru-v2-slow") | ForEach-Object {
+    Join-Path $repo ("models-config\" + $_ + "\runtime.json")
+}
+
 if (-not $SkipModels) {
     if ($ModelsDir) {
         $modelsRoot = [IO.Path]::GetFullPath($ModelsDir)
@@ -291,6 +298,10 @@ if (-not $SkipModels) {
             if (-not (Test-Path -LiteralPath (Join-Path $dir $f) -PathType Leaf)) {
                 throw "Model file missing: $($dir)\$f"
             }
+        }
+        $rcfg = Join-Path $repo ("models-config\" + $m + "\runtime.json")
+        if (-not (Test-Path -LiteralPath $rcfg -PathType Leaf)) {
+            throw "runtime.json (char_rules) missing: $rcfg"
         }
         if (-not $SkipInt8Models) {
             foreach ($f in $int8ModelFiles) {
@@ -377,6 +388,8 @@ if (-not $SkipModels) {
         foreach ($f in $modelFiles) {
             Copy-Verified (Join-Path $modelsRoot "$m\$f") (Join-Path $dest "models\$m\$f") -HardLink
         }
+        # SRT.10: runtime.json — из репозитория (models-config), как в g7
+        Copy-Verified (Join-Path $repo ("models-config\" + $m + "\runtime.json")) (Join-Path $dest "models\$m\runtime.json")
         if (-not $SkipInt8Models) {
             foreach ($f in $int8ModelFiles) {
                 Copy-Verified (Join-Path $modelsRoot "$m\$f") (Join-Path $dest "models\$m\$f") -HardLink
@@ -425,7 +438,10 @@ Copy-Verified (Join-Path $repo "Cargo.lock") (Join-Path $dest "LICENSES\Rust-Car
 
 Write-Utf8NoBom (Join-Path $dest "output\README.txt") @"
 Generated audio files are written here by default.
-Existing files are never overwritten: rename the output or choose another directory.
+Existing files are NOT overwritten by default: an existing result is skipped.
+With the explicit "overwrite existing files" option enabled, a finished file
+is replaced atomically only after a successful synthesis; on error/cancel the
+old file is left intact.
 "@
 
 # --- required files check ---
@@ -463,6 +479,7 @@ if (-not $SkipModels) {
         foreach ($f in $modelFiles) {
             $required += "models\$m\$f"
         }
+        $required += "models\$m\runtime.json"
     }
 }
 foreach ($rel in $required) {
@@ -548,7 +565,7 @@ Get-ChildItem -LiteralPath $dest -Recurse -File | Where-Object { $_.FullName -ne
 $modelEntries = @()
 if (-not $SkipModels) {
     foreach ($m in @("ru-v2-fast", "ru-v2-slow")) {
-        foreach ($f in $modelFiles) {
+        foreach ($f in ($modelFiles + @("runtime.json"))) {
             $p = Join-Path $dest "models\$m\$f"
             $i = Get-Item -LiteralPath $p
             $modelEntries += [ordered]@{
@@ -566,6 +583,22 @@ $ortCudaVersion = if (-not $SkipCuda) {
     "not bundled"
 }
 
+# SRT.10: SoundTouch 2.4.1 — динамическая LGPL 2.1-компоновка (LoadLibraryW,
+# в PE-импортах EXE отсутствует); версия и хеши зафиксированы сборкой
+# tools/build-soundtouch.ps1 (побитовая воспроизводимость).
+$soundtouchInfo = if ($srtExeSrc) {
+    [ordered]@{
+        version = "2.4.1"
+        dll = "SoundTouchDLL.dll"
+        dll_sha256 = (Get-FileHash -LiteralPath (Join-Path $dest "SoundTouchDLL.dll") -Algorithm SHA256).Hash
+        source_tarball = "third_party/soundtouch/soundtouch-2.4.1.tar.gz"
+        source_tarball_sha256 = "E07ABF20CE8F95850C280132E1F61AD400FC1F4011B7FAC698A503DE6AAB6733"
+        license = "LGPL-2.1 (dynamic linking at runtime; user-replaceable DLL)"
+    }
+} else {
+    "not bundled"
+}
+
 $manifest = [ordered]@{
     product = "PocketTTS-GUI-Rust portable"
     version = $version
@@ -578,6 +611,7 @@ $manifest = [ordered]@{
         cuda = $ortCudaVersion
     }
     ffmpeg = $ffmpegVersion
+    soundtouch = $soundtouchInfo
     models = $modelEntries
     files = $fileEntries
 }

@@ -1,36 +1,58 @@
 PocketTTS-GUI-Rust — portable Windows x64 build
 ===============================================
 
-Run: PocketTTS-GUI-Rust.exe
+This package contains FOUR executables:
 
-No OpenGL / no GPU driver? Run PocketTTS-GUI-Rust-cpu.exe instead:
-it renders the whole interface on the CPU (GDI) and never touches
-OpenGL, Direct3D or the GPU. Both executables share the same settings
-file (PocketTTS-GUI-Rust.json), the same synthesis engine and the same
-command-line diagnostics; "cpu" in the file name refers ONLY to drawing
-the GUI — CPU and CUDA inference work the same as in the main EXE.
-If PocketTTS-GUI-Rust.exe fails to start with a WGL/GL error, use the
--cpu build.
+  PocketTTS-GUI-Rust.exe        Text (TXT/MD/LOG) narration, OpenGL rendering
+  PocketTTS-GUI-Rust-cpu.exe    Text narration, software (CPU) rendering
+  PocketTTS-GUI-Rust-srt.exe    Subtitle (.srt) narration, OpenGL rendering
+  PocketTTS-GUI-Rust-srt-cpu.exe Subtitle narration, software rendering
+
+No OpenGL / no GPU driver? Use a "-cpu" executable instead: it renders the
+whole interface on the CPU (GDI) and never touches OpenGL, Direct3D or the
+GPU. "cpu" in the file name refers ONLY to drawing the GUI — CPU and CUDA
+inference work the same as in the OpenGL builds; a -cpu EXE does NOT
+disable CUDA.
+
+Text vs SRT executables:
+  * The Text executables narrate plain text files (TXT/MD/LOG) with the
+    Standard or "TeraTTS Android" chunking algorithm, Fast/Slow models,
+    FP32/INT8 precision, single-file and batch modes.
+  * The SRT executables narrate .srt subtitles only: they read timecodes,
+    clean markup, align speech to the subtitle timeline (SoundTouch
+    tempo acceleration without pitch change) and write a timing log.
+    A .txt file is not accepted as an SRT source.
+  * Settings are separate: PocketTTS-GUI-Rust.json for both Text EXEs,
+    PocketTTS-GUI-Rust-srt.json for both SRT EXEs (created on first run).
+    An SRT executable never reads or writes the Text config and vice versa.
 
 Layout:
   msvcp140.dll, msvcp140_1.dll,
   vcruntime140.dll, vcruntime140_1.dll  MSVC++ redistributable runtime
-  PocketTTS-GUI-Rust.exe                 GUI executable (eframe/glow, OpenGL)
-  PocketTTS-GUI-Rust-cpu.exe             GUI executable (software CPU rendering,
+  PocketTTS-GUI-Rust.exe                 Text GUI (eframe/glow, OpenGL)
+  PocketTTS-GUI-Rust-cpu.exe             Text GUI (software CPU rendering,
                                        no OpenGL/D3D/GPU required)
-  models/ru-v2-fast, models/ru-v2-slow  ONNX models (FP32 default; also
+  PocketTTS-GUI-Rust-srt.exe             SRT GUI (eframe/glow, OpenGL)
+  PocketTTS-GUI-Rust-srt-cpu.exe         SRT GUI (software CPU rendering)
+  SoundTouchDLL.dll                      SoundTouch 2.4.1 (SRT tempo
+                                       acceleration; loaded at runtime ONLY
+                                       by the SRT EXEs when a cue must be
+                                       sped up; the Text EXEs never load it)
+  models/ru-v2-fast, models/ru-v2-slow   ONNX models (FP32 default; also
                                        *_int8.onnx graphs: flow_lm_main_int8,
                                        flow_lm_flow_int8, mimi_decoder_int8 —
                                        the INT8 model variants; mimi_encoder
                                        and text_conditioner stay FP32 in both
                                        modes, quantized versions do not exist)
+                                       runtime.json in each model directory
+                                       holds the Standard-mode char_rules.
   onnxruntime/cpu/onnxruntime.dll       CPU ONNX Runtime 1.23.2
   onnxruntime/cuda/                     CUDA ONNX Runtime + providers + CUDA/cuDNN DLLs
   ffmpeg/ffmpeg.exe                     MP3/Opus encoder (GPLv3 build)
   voice/reference.wav                   Voice reference; replace with your own 1-30 s WAV
   input/example.txt                     Example source text
   output/                               Default result directory
-  PocketTTS-GUI-Rust.json                Default settings with RELATIVE paths
+  PocketTTS-GUI-Rust.json                Default Text settings with RELATIVE paths
 
 Important:
   * Relative paths in settings are resolved from the EXE directory, not from
@@ -45,7 +67,8 @@ Important:
     child CUDA worker processes and ffmpeg also do not open console windows.
   * CPU and CUDA use different ONNX Runtime DLLs. A process can initialize only
     one runtime; after switching CPU <-> CUDA inside one GUI session, restart
-    the application.
+    the application. CUDA mode additionally requires a compatible installed
+    NVIDIA display driver (the driver itself is NOT part of this package).
   * Model variants (G6.3): the "Модель" list combines the model and precision —
     "Shtorm-v2 Fast/Slow (FP32)" is the original mode (default); "(INT8)"
     selects the quantized main/flow/decoder graphs plus FP32 encoder/conditioner.
@@ -54,6 +77,18 @@ Important:
     copies) — the GUI warns about this combination and never switches the
     selection automatically. Missing INT8 files is an explicit error; there is
     no silent fallback to FP32.
+  * SRT alignment (SRT EXEs): "Максимальное ускорение" (max tempo, x1.1..x3.0,
+    default x2.0) limits how much an overlong cue may be compressed;
+    "Минимальная пауза" (0..500 ms) keeps a gap to the next cue when borrowing
+    time. Cues that fit their window are never processed by SoundTouch
+    (tempo = 1.0). If even the maximum tempo is not enough, the speech is NOT
+    cut: the cue simply runs late and this is recorded in the timing log
+    ({name}_log.txt). SoundTouchDLL.dll must stay next to the SRT EXEs;
+    without it, files whose cues all fit their windows still work, but the
+    first overlong cue is an explicit error.
+  * The SRT batch mode processes files strictly one by one (multi-process
+    chunk pipeline P>1 is not used for SRT; a single-process chunk pool is
+    used instead — a documented limitation).
   * Existing audio files are NOT overwritten by default: an existing result
     is skipped. If you explicitly enable "Перезаписывать существующие
     файлы" (overwrite existing files), a finished file is replaced
@@ -66,6 +101,11 @@ Important:
     models without permission.
   * FFmpeg is a GPLv3 build; see LICENSES/FFmpeg-GPLv3.txt and
     LICENSES/FFmpeg-NOTICE.txt.
+  * SoundTouch is LGPL-2.1; it is linked DYNAMICALLY (LoadLibraryW at
+    runtime, no static import in any EXE). See LICENSES/SoundTouch-LGPL-2.1.txt
+    and LICENSES/SoundTouch-NOTICE.txt. You may replace SoundTouchDLL.dll
+    with a compatible build of the same version; the source code is
+    third_party/soundtouch/soundtouch-2.4.1.tar.gz of the source project.
   * ONNX Runtime is MIT-licensed; see LICENSES/ONNX-Runtime-LICENSE.txt.
   * CUDA/cuDNN DLLs are NVIDIA redistributables; see
     LICENSES/NVIDIA-CUDA-NOTICE.txt.
@@ -77,10 +117,11 @@ Diagnostics:
       & .\PocketTTS-GUI-Rust.exe --portable-check > check.txt 2>&1
   or use System.Diagnostics.Process with RedirectStandardOutput/Error.
   Exit codes are preserved (0 OK, 1 check failed, 2 bad arguments).
+  ALL FOUR executables accept the same diagnostic commands; the SRT EXEs
+  apply them to the SRT settings file.
 
   PocketTTS-GUI-Rust.exe --portable-check
       Print resolved model / ORT / ffmpeg paths and exit.
-      (PocketTTS-GUI-Rust-cpu.exe accepts the same diagnostic commands.)
   PocketTTS-GUI-Rust.exe --portable-selftest [--device cpu|cuda] [--format wav|mp3|opus]
       Run a short synthesis from the portable directory and exit.
   PocketTTS-GUI-Rust.exe --portable-selftest-batch [--device cpu|cuda]

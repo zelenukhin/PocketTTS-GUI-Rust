@@ -43,6 +43,23 @@ The corresponding source code is available from https://ffmpeg.org/ and the
 build provider https://www.gyan.dev/ffmpeg/builds/. See
 `LICENSES/FFmpeg-GPLv3.txt` and `LICENSES/FFmpeg-NOTICE.txt`.
 
+## SoundTouch 2.4.1
+
+License: GNU Lesser General Public License v2.1 (LGPL-2.1).
+File: `SoundTouchDLL.dll` (official C wrapper, SoundTouch 2.4.1,
+SHA256 e8e56d3db0d72eed6f4ded298a31058398945f2c72cda6e8dc29b67f1330c3f6).
+Compliance: the library is linked DYNAMICALLY — loaded at runtime with
+`LoadLibraryW`/`GetProcAddress` only when an SRT cue must be accelerated;
+no EXE in this package contains a static import of SoundTouch. Per LGPL 2.1
+§4 you may replace `SoundTouchDLL.dll` with a compatible build of the same
+library version. The exact source code shipped is
+`third_party/soundtouch/soundtouch-2.4.1.tar.gz` (upstream tarball, SHA256
+e07abf20ce8f95850c280132e1f61ad400fc1f4011b7fac698a503de6aab6733) of the
+source project, together with the reproducible build script
+`tools/build-soundtouch.ps1` (MSVC x64, /Brepro). See
+`LICENSES/SoundTouch-LGPL-2.1.txt` and `LICENSES/SoundTouch-NOTICE.txt`.
+Home page: https://codeberg.org/soundtouch/soundtouch
+
 ## Shtorm-PocketTTS-RU v2 fast/slow models
 
 Files: `models/ru-v2-fast/*`, `models/ru-v2-slow/*`.
