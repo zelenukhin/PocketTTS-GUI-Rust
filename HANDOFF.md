@@ -14,6 +14,111 @@
   адаптивный GUI; G6.3: INT8; G6.2.3: автосохранение; G6.2: гибрид 2×2).
 - **HEAD**: только из Git (`git log -1 --oneline`), не из этого файла.
 
+## SRT — что сделано (этап SRT.0–SRT.8, отдельные SRT-GUI)
+
+- **Назначение**: две новые программы только для озвучки .srt —
+  `PocketTTS-GUI-Rust-srt.exe` (glow) и `PocketTTS-GUI-Rust-srt-cpu.exe`
+  (программный рендер, без OpenGL); обычные EXE не изменили поведение.
+  Контракт/аудит — `docs/SRT_0_AUDIT_CONTRACT.md`; Python-эталон
+  `C:\PocketTTS-GUI\PocketTTS-GUI\pocket-tts-srt_gui.py` (только чтение).
+- **Коммиты**: 0=ec6cd3f (аудит+контракт), 1=84e1636 (srt_parse+25 тестов),
+  2=5391a8d (SrtTimingPlanner+19), 3=b5d267c (SoundTouch+11 на реальной
+  DLL), 4+5=150b6b8 (srt_pipeline+31), 6=e206ded (AppFlavor/2 EXE/
+  srt_job+11), 7=3a3478a (real CPU/CUDA), 8=этот коммит (portable-скрипт,
+  приёмка, HANDOFF/AGENTS).
+- **Парсер** `text-processing/src/srt_parse.rs`: порт parse_srt/
+  strip_srt_tags — utf-8-sig/lossy, блоки по 
+\s*
+, таймкоды
+  `HH:MM:SS,mmm`/`.mmm` на строке 0/1, индекс i64 (int строки 0 или
+  последовательный), СТАБИЛЬНАЯ сортировка по индексу (хронологию не
+  переупорядочиваем молча — только предупреждения: пропуски блоков,
+  end<=start, дубликаты, перекрытия, >60 с), ASS/HTML→пробел, entities
+  (кураторская таблица ~60 имён + числовые), NBSP→пробел, 
+{3,}→
+
+.
+  Пустые после очистки реплики остаются в списке (тайминги участвуют).
+- **Тайминги** `app-core/src/srt.rs`: SrtTimingPlanner на u64-сэмплах
+  24 кГц (1 мс = 24 сэмпла — мс↔сэмплы точно, дрейфа нет; арифметика f64
+  как Python): тишина до start при опережении >20 мс (вся разность),
+  target=end−track, borrow=max(0,next.start−end−min_pause) (next — по
+  СПИСКУ включая пустые), жёсткий лаг allowable<100 мс → raw/max_tempo
+  (quirk Python сохранён и закрыт тестом), tempo=raw/max(allowable,
+  raw/max_tempo)∈(1,max], замедление отсутствует, commit по фактическим
+  сэмплам. Диагностика §8.1 → лог таймингов.
+- **SoundTouch** `app-core/src/soundtouch.rs` + `third_party/soundtouch/`:
+  SoundTouch 2.4.1, официальная C-обёртка SoundTouchDLL.dll, сборка MSVC
+  `tools/build-soundtouch.ps1` ПОБИТОВО воспроизводима (двухшаговая
+  cl/link /Brepro, постоянный каталог %TEMP%\soundtouch-build; SHA256
+  DLL E8E56D3D…C3F6, tarball e07abf20…6733). Компоновка ДИНАМИЧЕСКАЯ
+  (LGPL 2.1 §4): LoadLibraryW в рантайме, в PE-импортах EXE отсутствует
+  (проверено dumpbin), обычные EXE не зависят. Speech-профиль
+  SEQUENCE=40/SEEKWINDOW=15/OVERLAP=8 + AA/без quickseek (main.cpp 2.4.1),
+  только setTempo (высота не меняется), tempo=1.0 → без обработки.
+  Новый instance на реплику, putSamples блоками→drain→flush→drain,
+  NaN/Inf-защита. Эталон: soundstretch -speech -tempo=100 → 5.000 с ≡ DLL.
+- **Конвейер** `app-core/src/srt_pipeline.rs`: build_srt_tasks — чанкование
+  КАЖДОЙ реплики действующим чанкером (Standard max_tokens / Android
+  max_chunk_chars; границы реплик приоритетны — чанк никогда не объединяет
+  две реплики; is_last последнего чанка реплики гасится как в Python);
+  synthesize_srt_stream — существующий pool::run_job (инъекция фабрики =
+  RealWorker/постоянный пул), сборщик реплик строго по порядку:
+  PCM+внутренние паузы (Standard: плоские internal 500/комма 100 мс по
+  soft_break плана; Android: pause_s метаданные чанкера; последний чанк
+  реплики без паузы; paragraph_pause_s НЕ применяется — подтверждено
+  Python-аудитом §2.14), trim_edges(0.02/0.10) реплики, планировщик,
+  SoundTouch, тишина точными блоками нулей (без f32-секунд), ОДИН sink на
+  файл (WAV/MP3/Opus одним FFmpeg), фазы G5.1 и единая точка публикации,
+  предел буфера реплики 15 мин. Временные WAV/concat отсутствуют by
+  construction. write_srt_timing_log — порт _write_srt_timing_log
+  ({stem}_log.txt, create_new).
+- **GUI**: AppFlavor{Text,Srt}; srt_main.rs/srt_sw_main.rs; заголовок
+  «PocketTTS-GUI-Rust — SRT v1.1»; источник только .srt (валидация+
+  диалог+рекурсивный каталог); блок «Выравнивание субтитров»: макс.
+  ускорение ×1.1–×3.0 (деф. 2.0), мин. пауза 0–500 мс (деф. 100),
+  внутренняя/мягкая пауза 500/100 мс (только Standard, в Android
+  заблокированы с подсказкой); конфиг `PocketTTS-GUI-Rust-srt.json`
+  (оба SRT EXE один; обычный конфиг не читается и не пишется —
+  portable-приёмка подтвердила побайтовую целость); поля srt_* в
+  GuiSettings с serde-default (в обычном конфиге сериализуются с
+  дефолтами). gui/src/srt_job.rs: execute_srt_job/execute_srt_batch —
+  переиспользуют resolve/безопасность путей/ORT/постоянный пул TXT-пути,
+  каталоги результата создаются с повторной валидацией (фикс по итогам
+  real), SoundTouchDLL exe-relative lazy (отсутствие → предупреждение,
+  ошибка только при первом ускорении), события Batch*/File*.
+- **Проверки**: `cargo test --release --workspace` — **412 passed /
+  0 failed** (+97 к базовым 338: 25 парсер, 19 планер, 11 SoundTouch на
+  реальной DLL, 31 srt_pipeline (fake-воркеры, реальный ffmpeg/DLL), 11
+  GUI/srt_job); clippy 0 (glow и sw), fmt OK. Real CPU и CUDA (RTX 3060)
+  все зелёные: WAV 4 реплики (короткая/пустая/многочанковая/тесное окно —
+  лог «Озвучено реплик: 3 из 4» с ускорением) + побитовая идентичность
+  повтора (seed 42); MP3 (CPU)/Opus (CUDA); пакет 2 файла в подкаталоге
+  на пуле 2 Pocket (CPU 14.6 с / CUDA 21.5 с), note.txt не озвучивается.
+  Portable: PE-импорты обоих EXE без SoundTouch; приёмка в hardlink-
+  песочнице комплекта g7 (`out/srt8_portable_acceptance.ps1`): portable-
+  check OK оба SRT EXE (читают -srt.json), GUI-смоук exit 0 оба,
+  FirstRun создаёт только srt.json (обычный конфиг побайтово цел),
+  сирот 0 — ALL PASS.
+- **Артефакты**: `out/srt8_portable_acceptance.ps1` (приёмочный скрипт),
+  тестовые песочницы %TEMP%\srt*.
+- **Portable**: полный комплект НЕ пересобирался (по правилам — после
+  ручной приёмки пользователя). `tools/build-portable.ps1` обновлён:
+  -SkipSrtExe (по умолчанию ВКЛЮЧАЕТ оба SRT EXE + SoundTouchDLL.dll в
+  корень + LICENSES/SoundTouch-LGPL-2.1.txt + SoundTouch-NOTICE.txt,
+  required-проверки дополнены).
+- **Не делалось (осознанно)**: мультипроцессный chunkpipe для SRT (P>1 →
+  однопроцессный пул с предупреждением — документированное ограничение);
+  денойз-специфика SRT не добавлялась (работает как в TXT через воркер);
+  визуальная приёмка окна SRT пользователем; сборка/публикация релиза
+  (запрещена без отдельного задания).
+- **Ограничения**: entities — кураторская таблица (не вся HTML5, формы
+  без «;» не декодируются); жёсткий лаг сжимает влезающие реплики (quirk
+  Python, сохранён); ошибка чанка = ошибка файла (Python молча пропускал
+  реплику); обрезка краёв — алгоритм проекта (−45 дБ), не librosa
+  top_db=70; SoundTouch tempo — прямой f32 (не проценты %.2f soundstretch);
+  INT8/CUDA и денойз — как в TXT (без SRT-специфики).
+
 ## G7 — что сделано (текущий этап)
 
 - **Коммиты этапов**: 0=4d96c32 (spec), 1=ba31714 (модуль+cases), 2=752d35d

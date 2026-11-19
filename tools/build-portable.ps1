@@ -32,6 +32,8 @@ param(
     # G6.8: не включать PocketTTS-GUI-Rust-cpu.exe (программный рендер GUI
     # без OpenGL). По умолчанию комплект содержит ОБА EXE.
     [switch]$SkipCpuExe,
+    # SRT.8: не включать SRT-версии EXE (+SoundTouchDLL) в комплект.
+    [switch]$SkipSrtExe,
     [switch]$HardLinkPayload,
     [ValidateSet("release", "debug")][string]$Configuration = "release"
 )
@@ -187,6 +189,33 @@ if (-not $SkipCpuExe) {
     }
 }
 
+# SRT.8: SRT-версии — озвучка субтитров (glow + программный рендер) и
+# SoundTouchDLL.dll (динамическая, LGPL 2.1; исходник и NOTICE — в
+# third_party/soundtouch репозитория).
+$srtExeSrc = $null
+$srtCpuExeSrc = $null
+$soundTouchDll = Join-Path $repo "third_party\soundtouch\SoundTouchDLL.dll"
+if (-not $SkipSrtExe) {
+    Push-Location $repo
+    try {
+        & $cargo build --release --bin PocketTTS-GUI-Rust-srt
+        if ($LASTEXITCODE -ne 0) {
+            throw "cargo build (srt exe) failed with exit code $LASTEXITCODE"
+        }
+        & $cargo build --release --no-default-features --features sw --bin PocketTTS-GUI-Rust-srt-cpu
+        if ($LASTEXITCODE -ne 0) {
+            throw "cargo build (srt-cpu exe) failed with exit code $LASTEXITCODE"
+        }
+    } finally {
+        Pop-Location
+    }
+    $srtExeSrc = Join-Path $repo "target\release\PocketTTS-GUI-Rust-srt.exe"
+    $srtCpuExeSrc = Join-Path $repo "target\release\PocketTTS-GUI-Rust-srt-cpu.exe"
+    if (-not (Test-Path -LiteralPath $srtExeSrc -PathType Leaf)) { throw "Built SRT exe not found: $srtExeSrc" }
+    if (-not (Test-Path -LiteralPath $srtCpuExeSrc -PathType Leaf)) { throw "Built SRT cpu exe not found: $srtCpuExeSrc" }
+    if (-not (Test-Path -LiteralPath $soundTouchDll -PathType Leaf)) { throw "SoundTouchDLL.dll not found: $soundTouchDll" }
+}
+
 # --- dependency sources ---
 $cpuRoot = Join-Path $repo "deps\ort-cpu\onnxruntime-win-x64-1.23.2"
 $cpuLib = Join-Path $cpuRoot "lib"
@@ -318,6 +347,14 @@ Copy-Verified $exeSrc (Join-Path $dest "PocketTTS-GUI-Rust.exe")
 if ($cpuExeSrc) {
     Copy-Verified $cpuExeSrc (Join-Path $dest "PocketTTS-GUI-Rust-cpu.exe")
 }
+if ($srtExeSrc) {
+    Copy-Verified $srtExeSrc (Join-Path $dest "PocketTTS-GUI-Rust-srt.exe")
+    Copy-Verified $srtCpuExeSrc (Join-Path $dest "PocketTTS-GUI-Rust-srt-cpu.exe")
+    # DLL рядом с exe (runtime LoadLibraryW); лицензия и NOTICE LGPL 2.1
+    Copy-Verified $soundTouchDll (Join-Path $dest "SoundTouchDLL.dll")
+    Copy-Verified (Join-Path $repo "third_party\soundtouch\LGPL-2.1.txt") (Join-Path $dest "LICENSES\SoundTouch-LGPL-2.1.txt")
+    Copy-Verified (Join-Path $repo "third_party\soundtouch\NOTICE.txt") (Join-Path $dest "LICENSES\SoundTouch-NOTICE.txt")
+}
 foreach ($f in $vcFiles) {
     Copy-Verified (Join-Path $vcDir $f) (Join-Path $dest $f)
 }
@@ -439,6 +476,20 @@ if ($cpuExeSrc) {
     $p = Join-Path $dest "PocketTTS-GUI-Rust-cpu.exe"
     if (-not (Test-Path -LiteralPath $p -PathType Leaf)) {
         throw "Required file missing in distribution: PocketTTS-GUI-Rust-cpu.exe"
+    }
+}
+if ($srtExeSrc) {
+    foreach ($rel in @(
+        "PocketTTS-GUI-Rust-srt.exe",
+        "PocketTTS-GUI-Rust-srt-cpu.exe",
+        "SoundTouchDLL.dll",
+        "LICENSES\SoundTouch-LGPL-2.1.txt",
+        "LICENSES\SoundTouch-NOTICE.txt"
+    )) {
+        $p = Join-Path $dest $rel
+        if (-not (Test-Path -LiteralPath $p -PathType Leaf)) {
+            throw "Required file missing in distribution: $rel"
+        }
     }
 }
 

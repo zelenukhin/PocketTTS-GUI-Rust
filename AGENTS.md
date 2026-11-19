@@ -144,6 +144,28 @@ GUI для Pocket-TTS на Rust; репозиторий —
   debug остаётся консольным), диагностика в том же EXE через явные
   redirects, MessageBox только при отсутствии stderr; внутренний
   worker-режим НИКОГДА не открывает окно).
+- **SRT-этап (SRT.0–SRT.8)**: `text-processing/src/srt_parse.rs`
+  (порт parse_srt/strip_srt_tags Python-SRT: BOM/lossy, таймкоды запятая
+  и точка, сортировка по индексу, предупреждения; кейс-таблица —
+  `docs/SRT_0_AUDIT_CONTRACT.md`); `app-core/src/srt.rs` (чистый
+  SrtTimingPlanner на u64-сэмплах 24 кГц: тишина >20 мс, заимствование у
+  паузы до следующей реплики списка, жёсткий лаг <100 мс, tempo∈(1,max],
+  commit по факту); `app-core/src/soundtouch.rs` (runtime-загрузка
+  SoundTouchDLL.dll через LoadLibraryW — в импортах EXE отсутствует,
+  speech 40/15/8, только setTempo; библиотека SoundTouch 2.4.1 LGPL 2.1
+  в `third_party/soundtouch/` с воспроизводимой сборкой
+  `tools/build-soundtouch.ps1`); `app-core/src/srt_pipeline.rs`
+  (build_srt_tasks: чанкование КАЖДОЙ реплики действующим чанкером,
+  границы реплик приоритетны; synthesize_srt_stream: существующий пул,
+  сборка реплик с внутренними паузами (Standard плоские 500/100, Android
+  из pause_s, paragraph_pause не применяется), trim_edges реплики,
+  планировщик, SoundTouch, ОДИН sink, фазы G5.1, предел памяти реплики;
+  write_srt_timing_log); `gui/src/srt_job.rs` (execute_srt_job/
+  execute_srt_batch на постоянном пуле, безопасность путей как TXT);
+  `gui` AppFlavor{Text,Srt} + бинарники `PocketTTS-GUI-Rust-srt`
+  (glow)/`-srt-cpu` (sw) + конфиг `PocketTTS-GUI-Rust-srt.json`
+  (оба SRT EXE — один; обычный не трогается). SRT-задания НЕ используют
+  мультипроцессный chunkpipe (P>1 → однопроцессный пул с предупреждением).
 - `tools/build-portable.ps1` + `tools/portable/` — G4-сборка комплекта:
   новый каталог вне репозитория, без удалений, проверка размеров/SHA256,
   manifest; лицензии/notices, VC++ runtime, FFmpeg, FP32-модели.
