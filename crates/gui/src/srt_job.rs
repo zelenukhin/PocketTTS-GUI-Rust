@@ -372,9 +372,30 @@ pub fn execute_srt_batch(
     emit: &SharedEmit,
 ) -> JobResult {
     let s = settings;
-    let mut files: Vec<(PathBuf, PathBuf)> = Vec::new(); // (input, relative)
-    collect_srt_files(source_dir, source_dir, &mut files);
-    files.sort();
+    let out_root = resources::resolve_user_path(&s.out_dir);
+    // SRT.9B: корень обязан читаться — отказ доступа/отсутствие НЕ
+    // маскируются под «нет файлов .srt» (раньше read_dir молча вернул
+    // пустой список).
+    if let Err(e) = std::fs::read_dir(source_dir) {
+        return JobResult::failed(format!(
+            "каталог-источник не читается {}: {e}",
+            source_dir.display()
+        ));
+    }
+    // SRT.9B: безопасный обход общей инфраструктурой batch::plan_dir_tree —
+    // без следования по symlink/junction/reparse-точкам (пропуск с
+    // предупреждением), с исключением вложенного выходного каталога и
+    // проверкой совпадения источника и выхода.
+    let (planned, warnings) = match crate::batch::plan_dir_tree(source_dir, &out_root, is_srt_name)
+    {
+        Ok(v) => v,
+        Err(e) => return JobResult::failed(format!("{e:#}")),
+    };
+    for w in &warnings {
+        emit(JobEvent::Log(format!("ВНИМАНИЕ: {w}")));
+    }
+    let files: Vec<(PathBuf, PathBuf)> =
+        planned.into_iter().map(|f| (f.input, f.relative)).collect();
     if files.is_empty() {
         return JobResult::failed(format!(
             "в каталоге {} нет файлов .srt",
@@ -399,7 +420,6 @@ pub fn execute_srt_batch(
     if let Err(e) = setup_ort_environment(s) {
         return JobResult::failed(format!("{e:#}"));
     }
-    let out_root = resources::resolve_user_path(&s.out_dir);
     // Каталоги результата: проверка безопасности ДО создания (G5.1), затем
     // создание без следования по ссылкам и повторная проверка (как в
     // одиночном пути execute_srt_job).
@@ -641,28 +661,13 @@ fn report_from_result(
     }
 }
 
-/// Рекурсивный сбор .srt с относительными путями (сортировка вызывающим).
-fn collect_srt_files(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, PathBuf)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let mut items: Vec<_> = entries.flatten().collect();
-    items.sort_by_key(|e| e.file_name());
-    for e in items {
-        let path = e.path();
-        if path.is_dir() {
-            collect_srt_files(root, &path, out);
-        } else if path
-            .extension()
-            .and_then(|x| x.to_str())
-            .is_some_and(|x| x.eq_ignore_ascii_case("srt"))
-        {
-            let Ok(rel) = path.strip_prefix(root) else {
-                continue;
-            };
-            out.push((path.clone(), rel.to_path_buf()));
-        }
-    }
+/// SRT.9B: признак имени файла .srt (без учёта регистра) для
+/// `batch::plan_dir_tree`.
+fn is_srt_name(name: &std::ffi::OsStr) -> bool {
+    Path::new(name)
+        .extension()
+        .and_then(|x| x.to_str())
+        .is_some_and(|x| x.eq_ignore_ascii_case("srt"))
 }
 
 #[cfg(test)]
@@ -713,6 +718,8 @@ mod tests {
 
     #[test]
     fn collect_srt_files_recursive_sorted() {
+        // SRT.9B: обычный рекурсивный обход через безопасный plan_dir_tree
+        // (.srt/.SRT, детерминированный порядок как в TXT-пакете).
         let dir = std::env::temp_dir().join(format!("srt6_collect_{}", std::process::id()));
         std::fs::create_dir_all(dir.join("b")).unwrap();
         std::fs::create_dir_all(dir.join("a")).unwrap();
@@ -720,13 +727,285 @@ mod tests {
         std::fs::write(dir.join("b").join("m.srt"), b"2").unwrap();
         std::fs::write(dir.join("a").join("n.SRT"), b"3").unwrap();
         std::fs::write(dir.join("ignore.txt"), b"x").unwrap();
-        let mut files = Vec::new();
-        collect_srt_files(&dir, &dir, &mut files);
-        let rels: Vec<String> = files.iter().map(|(_, r)| r.display().to_string()).collect();
+        let out = std::env::temp_dir().join(format!("srt6_out_{}", std::process::id()));
+        let (files, warnings) =
+            crate::batch::plan_dir_tree(&dir, &out, is_srt_name).expect("обход без ссылок");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let rels: Vec<String> = files
+            .iter()
+            .map(|f| f.relative.display().to_string())
+            .collect();
         assert_eq!(rels.len(), 3, "{rels:?}");
-        assert!(rels.contains(&"z.srt".to_string()));
-        assert!(rels.contains(&format!("a{}n.SRT", std::path::MAIN_SEPARATOR)));
-        assert!(rels.contains(&format!("b{}m.srt", std::path::MAIN_SEPARATOR)));
+        // порядок: относительный путь без учёта регистра (a, b, z)
+        assert_eq!(
+            rels,
+            vec![
+                format!("a{}n.SRT", std::path::MAIN_SEPARATOR),
+                format!("b{}m.srt", std::path::MAIN_SEPARATOR),
+                "z.srt".to_string(),
+            ]
+        );
+        // детерминизм: повторный обход даёт тот же список
+        let (files2, _) = crate::batch::plan_dir_tree(&dir, &out, is_srt_name).unwrap();
+        assert_eq!(files, files2);
+    }
+
+    // ===== SRT.9B: безопасный обход (ссылки/junction/выходной каталог) =====
+
+    fn srt9b_tmpdir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let d =
+            std::env::temp_dir().join(format!("srt9b_{}_{}_{}", std::process::id(), tag, nanos));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[cfg(windows)]
+    fn make_junction(target: &Path, link: &Path) -> bool {
+        std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn rels_of(files: &[crate::batch::BatchFile]) -> Vec<String> {
+        files
+            .iter()
+            .map(|f| f.relative.display().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn srt9b_output_dir_inside_source_is_excluded() {
+        // Выходная папка внутри исходной: её .srt НЕ включаются в пакет
+        // (результаты прошлых запусков не озвучиваются повторно).
+        let d = srt9b_tmpdir("nested_out");
+        let src = d.join("src");
+        std::fs::create_dir_all(src.join("output")).unwrap();
+        std::fs::write(src.join("chapter1.srt"), b"1").unwrap();
+        std::fs::write(src.join("chapter2.srt"), b"2").unwrap();
+        std::fs::write(src.join("output").join("old1.srt"), b"3").unwrap();
+        std::fs::write(src.join("output").join("old2.srt"), b"4").unwrap();
+        let (files, _) =
+            crate::batch::plan_dir_tree(&src, &src.join("output"), is_srt_name).unwrap();
+        assert_eq!(
+            rels_of(&files),
+            vec!["chapter1.srt".to_string(), "chapter2.srt".to_string()],
+            "файлы из output исключены"
+        );
+    }
+
+    #[test]
+    fn srt9b_output_dir_absent_at_start_still_excluded() {
+        // Выходного каталога ещё нет — исключение всё равно работает
+        // (сравнение по нормализованному пути, не по наличию).
+        let d = srt9b_tmpdir("absent_out");
+        let src = d.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.srt"), b"1").unwrap();
+        let out = src.join("result");
+        let (files, _) = crate::batch::plan_dir_tree(&src, &out, is_srt_name).unwrap();
+        assert_eq!(rels_of(&files), vec!["a.srt".to_string()]);
+    }
+
+    #[test]
+    fn srt9b_output_equals_source_is_error_case_insensitive() {
+        let d = srt9b_tmpdir("same_out");
+        let src = d.join("Src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.srt"), b"1").unwrap();
+        // точное совпадение
+        let err = crate::batch::plan_dir_tree(&src, &src, is_srt_name).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("физически совпадает"),
+            "{err:#}"
+        );
+        // совпадение в другом регистре (Windows нечувствительна к регистру)
+        let lower = d.join("src");
+        let err = crate::batch::plan_dir_tree(&src, &lower, is_srt_name).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("физически совпадает"),
+            "регистронезависимое сравнение: {err:#}"
+        );
+        // пути с . и .. ведут к тому же каталогу
+        let dotted = src.join("..").join("Src");
+        let err = crate::batch::plan_dir_tree(&src, &dotted, is_srt_name).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("физически совпадает"),
+            "нормализация . и ..: {err:#}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn srt9b_junctions_are_not_followed() {
+        let d = srt9b_tmpdir("junction");
+        let src = d.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("own.srt"), b"1").unwrap();
+        // junction на внешний каталог с .srt
+        let external = d.join("external");
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::write(external.join("outside.srt"), b"2").unwrap();
+        let link_out = src.join("to_external");
+        if !make_junction(&external, &link_out) {
+            eprintln!("SKIP srt9b_junctions_are_not_followed: нет прав на junction");
+            return;
+        }
+        // junction на родительский каталог (цикл, если следовать)
+        let link_parent = src.join("to_parent");
+        if !make_junction(&d, &link_parent) {
+            eprintln!("SKIP srt9b_junctions_are_not_followed: нет прав на junction (родитель)");
+            return;
+        }
+        let out = d.join("out");
+        let (files, warnings) = crate::batch::plan_dir_tree(&src, &out, is_srt_name).unwrap();
+        assert_eq!(
+            rels_of(&files),
+            vec!["own.srt".to_string()],
+            "только физический файл"
+        );
+        assert_eq!(
+            warnings.len(),
+            2,
+            "обе junction пропущены с предупреждением: {warnings:?}"
+        );
+        assert!(warnings
+            .iter()
+            .all(|w| w.contains("to_external") || w.contains("to_parent")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn srt9b_two_links_to_same_dir_skipped_once_each() {
+        let d = srt9b_tmpdir("two_links");
+        let src = d.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let target = d.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("t.srt"), b"1").unwrap();
+        let l1 = src.join("alias1");
+        let l2 = src.join("alias2");
+        if !make_junction(&target, &l1) || !make_junction(&target, &l2) {
+            eprintln!("SKIP srt9b_two_links_to_same_dir_skipped_once_each: нет прав на junction");
+            return;
+        }
+        let out = d.join("out");
+        let (files, warnings) = crate::batch::plan_dir_tree(&src, &out, is_srt_name).unwrap();
+        assert!(
+            files.is_empty(),
+            "через ссылки файлы не собираются: {:?}",
+            rels_of(&files)
+        );
+        assert_eq!(
+            warnings.len(),
+            2,
+            "каждая ссылка пропущена отдельно: {warnings:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn srt9b_dir_symlinks_are_not_followed() {
+        use std::os::windows::fs::symlink_dir;
+        let d = srt9b_tmpdir("symlink");
+        let src = d.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("own.srt"), b"1").unwrap();
+        let sibling = d.join("sibling");
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(sibling.join("s.srt"), b"2").unwrap();
+        let link_sibling = src.join("to_sibling");
+        if symlink_dir(&sibling, &link_sibling).is_err() {
+            eprintln!(
+                "SKIP srt9b_dir_symlinks_are_not_followed: нет прав на symlink \
+                 (нужен Developer Mode/администратор); junction-путь покрыт отдельным тестом"
+            );
+            return;
+        }
+        // symlink на родителя — циклическая ссылка
+        let link_parent = src.join("to_parent");
+        if symlink_dir(&d, &link_parent).is_err() {
+            eprintln!("SKIP srt9b_dir_symlinks_are_not_followed: нет прав на symlink (родитель)");
+            return;
+        }
+        let out = d.join("out");
+        let (files, warnings) = crate::batch::plan_dir_tree(&src, &out, is_srt_name).unwrap();
+        assert_eq!(rels_of(&files), vec!["own.srt".to_string()]);
+        assert_eq!(warnings.len(), 2, "оба symlink пропущены: {warnings:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn srt9b_file_symlink_srt_is_skipped() {
+        use std::os::windows::fs::symlink_file;
+        let d = srt9b_tmpdir("fsym");
+        let src = d.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("real.srt"), b"1").unwrap();
+        let link = src.join("linked.srt");
+        if symlink_file(src.join("real.srt"), &link).is_err() {
+            eprintln!("SKIP srt9b_file_symlink_srt_is_skipped: нет прав на symlink");
+            return;
+        }
+        let out = d.join("out");
+        let (files, warnings) = crate::batch::plan_dir_tree(&src, &out, is_srt_name).unwrap();
+        assert_eq!(
+            rels_of(&files),
+            vec!["real.srt".to_string()],
+            "файл-ссылка не собрана"
+        );
+        assert_eq!(
+            warnings.len(),
+            1,
+            "ссылка пропущена с предупреждением: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn srt9b_root_errors_are_explicit() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let emit: SharedEmit = Arc::new(|_| {});
+        // несуществующий корень — честная ошибка доступа, не «нет файлов»
+        let missing = std::env::temp_dir().join(format!(
+            "srt9b_missing_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        let r = execute_srt_batch(&GuiSettings::default(), &missing, &cancel, &emit);
+        assert_eq!(r.status, JobStatus::Failed);
+        assert!(
+            r.summary.contains("не читается"),
+            "несуществующий корень: {}",
+            r.summary
+        );
+        assert!(
+            !r.summary.contains("нет файлов"),
+            "ошибка доступа не маскируется: {}",
+            r.summary
+        );
+        // источник — обычный файл, не каталог
+        let d = srt9b_tmpdir("filesrc");
+        let f = d.join("not_a_dir.srt");
+        std::fs::write(&f, b"1").unwrap();
+        let r = execute_srt_batch(&GuiSettings::default(), &f, &cancel, &emit);
+        assert_eq!(r.status, JobStatus::Failed);
+        assert!(
+            r.summary.contains("не читается") || r.summary.contains("не каталог"),
+            "файл вместо каталога: {}",
+            r.summary
+        );
     }
 
     #[test]

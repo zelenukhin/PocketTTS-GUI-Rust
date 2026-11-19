@@ -521,24 +521,9 @@ pub fn plan_batch(source: &Path, out_root: &Path) -> Result<BatchPlan> {
             }],
         )
     } else if meta.is_dir() {
-        let root = source.to_path_buf();
-        let root_abs = absolute_lexical(&root);
-        let out_abs = absolute_lexical(out_root);
-        // not only textual equality: the same directory can be reached via
-        // symlink/junction/alternative spelling.
-        if same_path(&out_abs, &root_abs) || physically_same(out_root, &root) {
-            bail!(
-                "выходная папка физически совпадает с исходной (в т.ч. через ссылку/альтернативный путь) — выберите другую папку результата: {}",
-                out_root.display()
-            );
-        }
-        // Строгое исключение выходной папки нужно ТОЛЬКО когда она внутри
-        // источника. Если выход — предок источника, исключать нельзя.
-        let exclude_out = is_under(&out_abs, &root_abs) || physically_under(out_root, &root);
-        (
-            root,
-            collect_files(source, &out_abs, out_root, exclude_out, &mut warnings)?,
-        )
+        let (files, dir_warnings) = plan_dir_tree(source, out_root, has_batch_extension)?;
+        warnings.extend(dir_warnings);
+        (source.to_path_buf(), files)
     } else {
         bail!("источник не файл и не каталог: {}", source.display());
     };
@@ -580,11 +565,72 @@ pub fn plan_batch(source: &Path, out_root: &Path) -> Result<BatchPlan> {
     })
 }
 
+/// SRT.9B: безопасный план рекурсивного обхода каталога-источника с
+/// предикатом расширения вызывающего режима (TXT: .txt/.md/.log; SRT: .srt).
+/// Переиспользует проверенный обход `collect_files`: тип записи берётся из
+/// `DirEntry::file_type` (БЕЗ следования по ссылкам), любые reparse-точки
+/// (symlink/junction — каталоги И файлы) пропускаются с предупреждением,
+/// вложенный выходной каталог исключается (лексическое + физическое
+/// сравнение — ловит альтернативные написания и ссылки). Источник сам не
+/// может быть reparse-точкой; выход не должен проходить через неё и не
+/// может совпадать с источником. Возвращает файлы в детерминированном
+/// порядке (относительный путь без учёта регистра, затем точный) +
+/// предупреждения обхода.
+pub fn plan_dir_tree(
+    source: &Path,
+    out_root: &Path,
+    ext_ok: impl Fn(&std::ffi::OsStr) -> bool,
+) -> Result<(Vec<BatchFile>, Vec<String>)> {
+    let meta = std::fs::symlink_metadata(source)
+        .with_context(|| format!("источник не найден: {}", source.display()))?;
+    if is_reparse_metadata(&meta) {
+        bail!(
+            "источник — ссылка/точка перенаправления (reparse point), не поддерживается: {}",
+            source.display()
+        );
+    }
+    if !meta.is_dir() {
+        bail!("источник не каталог: {}", source.display());
+    }
+    // Выходная папка не должна проходить через symlink/junction: иначе
+    // лексическое исключение «внутри out_root» ничего не гарантирует.
+    ensure_no_reparse_components(out_root)?;
+    let root_abs = absolute_lexical(source);
+    let out_abs = absolute_lexical(out_root);
+    // not only textual equality: the same directory can be reached via
+    // symlink/junction/alternative spelling.
+    if same_path(&out_abs, &root_abs) || physically_same(out_root, source) {
+        bail!(
+            "выходная папка физически совпадает с исходной (в т.ч. через ссылку/альтернативный путь) — выберите другую папку результата: {}",
+            out_root.display()
+        );
+    }
+    // Строгое исключение выходной папки нужно ТОЛЬКО когда она внутри
+    // источника. Если выход — предок источника, исключать нельзя.
+    let exclude_out = is_under(&out_abs, &root_abs) || physically_under(out_root, source);
+    let mut warnings = Vec::new();
+    let mut files = collect_files(
+        source,
+        &out_abs,
+        out_root,
+        exclude_out,
+        &ext_ok,
+        &mut warnings,
+    )?;
+    files.sort_by(|a, b| {
+        let ka = a.relative.to_string_lossy().to_ascii_lowercase();
+        let kb = b.relative.to_string_lossy().to_ascii_lowercase();
+        ka.cmp(&kb).then_with(|| a.relative.cmp(&b.relative))
+    });
+    Ok((files, warnings))
+}
+
 fn collect_files(
     root: &Path,
     out_abs: &Path,
     out_root: &Path,
     exclude_out: bool,
+    ext_ok: &dyn Fn(&std::ffi::OsStr) -> bool,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<BatchFile>> {
     let mut files = Vec::new();
@@ -633,7 +679,7 @@ fn collect_files(
                     continue;
                 }
                 stack.push((child, child_rel));
-            } else if ft.is_file() && has_batch_extension(&entry.file_name()) {
+            } else if ft.is_file() && ext_ok(&entry.file_name()) {
                 files.push(BatchFile {
                     input: child,
                     relative: child_rel,
