@@ -195,12 +195,12 @@ pub fn discover_paths() -> Vec<PathBuf> {
     }
     if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
         // crates/app-core → корень workspace → third_party/soundtouch
-        let deps = Path::new(&manifest).ancestors().nth(2).map(|root| {
-            root.join("deps")
+        let vendored = Path::new(&manifest).ancestors().nth(2).map(|root| {
+            root.join("third_party")
                 .join("soundtouch")
                 .join("SoundTouchDLL.dll")
         });
-        if let Some(p) = deps {
+        if let Some(p) = vendored {
             out.push(p);
         }
     }
@@ -444,8 +444,9 @@ pub fn process_cue(
 mod tests {
     use super::*;
 
-    /// DLL может отсутствовать на машинах без deps (не Windows и т.п.) —
-    /// такие запуски пропускают аппаратные проверки молча.
+    /// DLL может отсутствовать на платформах без third_party (не Windows
+    /// и т.п.) — такие запуски пропускают проверки С ГРОМКИМ предупреждением
+    /// (молчаливый пропуск уже один раз замаскировал неверный путь поиска).
     fn load_or_skip() -> Option<SoundTouchLib> {
         match SoundTouchLib::load(None) {
             Ok(lib) => {
@@ -456,7 +457,17 @@ mod tests {
                 );
                 Some(lib)
             }
-            Err(SoundTouchError::LibraryNotFound(_)) => None,
+            Err(SoundTouchError::LibraryNotFound(paths)) => {
+                eprintln!(
+                    "SKIP: SoundTouchDLL не найдена: {}",
+                    paths
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                );
+                None
+            }
             Err(e) => panic!("неожиданная ошибка загрузки SoundTouch: {e}"),
         }
     }

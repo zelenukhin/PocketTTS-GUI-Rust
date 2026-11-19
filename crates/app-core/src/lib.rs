@@ -11,6 +11,7 @@ pub mod settings;
 pub mod sink;
 pub mod soundtouch;
 pub mod srt;
+pub mod srt_pipeline;
 pub mod trace_dir;
 pub mod worker;
 
