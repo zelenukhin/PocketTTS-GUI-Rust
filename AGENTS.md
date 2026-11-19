@@ -161,7 +161,12 @@ GUI для Pocket-TTS на Rust; репозиторий —
   из pause_s, paragraph_pause не применяется), trim_edges реплики,
   планировщик, SoundTouch, ОДИН sink, фазы G5.1, предел памяти реплики;
   write_srt_timing_log); `gui/src/srt_job.rs` (execute_srt_job/
-  execute_srt_batch на постоянном пуле, безопасность путей как TXT);
+  execute_srt_batch на постоянном пуле, безопасность путей как TXT;
+  SRT.9A: предел буфера реплики — ДО каждого расширения (PCM-блок и
+  внутренняя пауза), пик — SrtOutcome.max_cue_pcm_len; SRT.9B: сбор
+  .srt — общий `batch::plan_dir_tree` без следования по symlink/junction/
+  reparse, с исключением вложенного выходного каталога и зондом корня;
+  тот же вход использует dir-ветка plan_batch TXT-пакета);
   `gui` AppFlavor{Text,Srt} + бинарники `PocketTTS-GUI-Rust-srt`
   (glow)/`-srt-cpu` (sw) + конфиг `PocketTTS-GUI-Rust-srt.json`
   (оба SRT EXE — один; обычный не трогается). SRT-задания НЕ используют

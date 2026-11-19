@@ -1,6 +1,10 @@
 # HANDOFF.md — оперативный снимок проекта (читать первым вместе с AGENTS.md)
 
-- **Дата обновления**: 2026-11-14 (G7: второй алгоритм чанкования
+- **Дата обновления**: 2026-11-19 (SRT.9 — корректирующий этап надёжности
+  перед portable-релизом: лимит PCM реплики до накопления, безопасный
+  обход SRT-каталогов без следования по ссылкам, аудит/фиксы SoundTouch
+  FFI — `docs/SRT_9_RELIABILITY.md`; база d0233f4=SRT.8). Ранее
+  2026-11-14 (G7: второй алгоритм чанкования
   **«TeraTTS Android»** — дословный порт PocketTTS-пути teratts-android
   `ec0537f`: модуль `text-processing/src/android_chunking.rs`, лимит
   `max_chunk_chars` в Unicode-символах (150), собственный план пауз,
@@ -24,8 +28,25 @@
 - **Коммиты**: 0=ec6cd3f (аудит+контракт), 1=84e1636 (srt_parse+25 тестов),
   2=5391a8d (SrtTimingPlanner+19), 3=b5d267c (SoundTouch+11 на реальной
   DLL), 4+5=150b6b8 (srt_pipeline+31), 6=e206ded (AppFlavor/2 EXE/
-  srt_job+11), 7=3a3478a (real CPU/CUDA), 8=этот коммит (portable-скрипт,
-  приёмка, HANDOFF/AGENTS).
+  srt_job+11), 7=3a3478a (real CPU/CUDA), 8=d0233f4 (portable-скрипт,
+  приёмка, HANDOFF/AGENTS), **SRT.9 надёжность** (docs/SRT_9_RELIABILITY.md):
+  9A=8689e8a (лимит PCM реплики ДО накопления: ensure_cue_capacity в
+  on_chunk перед extend/resize паузы, max_cue_pcm_len в SrtOutcome, +8
+  тестов; раньше проверка была только в finish_cue — буфер мог вырасти
+  в 88 раз до ошибки), 9B=135cb88 (обход SRT-каталогов через общий
+  batch::plan_dir_tree: без следования по symlink/junction/reparse,
+  вложенный выходной каталог исключён, зонд корня — честная ошибка
+  доступа вместо «нет файлов .srt», +10 тестов ВСЕ реальные junction/
+  symlink; plan_batch использует тот же plan_dir_tree, TXT не изменён),
+  9C=57f1c9f (аудит всех 14 FFI-сигнатур по комплектуемому
+  SoundTouchDLL.h 2.4.1 — ВСЕ СОВПАДАЮТ, в 2.4.1 setSampleRate/
+  setChannels/putSamples/flush объявлены int (1=ok/0=ошибка), НЕ void;
+  исправлены NULL после createInstance (нативный краш) и игнорируемый
+  rc flush; SetupFailed; +2 теста, всего 13 на реальной DLL), 9D=
+  финальный (430 passed workspace / 186 sw / clippy 0 / fmt OK; real
+  CPU 3/3 и CUDA 3/3; ускорение доказано логом ×1.06/×1.02;
+  portable ALL PASS + обычные EXE без SoundTouchDLL PASS + dumpbin
+  чист; память: пик ~1,3 ГБ реального прогона, без накопления).
 - **Парсер** `text-processing/src/srt_parse.rs`: порт parse_srt/
   strip_srt_tags — utf-8-sig/lossy, блоки по 
 \s*
@@ -87,20 +108,24 @@
   каталоги результата создаются с повторной валидацией (фикс по итогам
   real), SoundTouchDLL exe-relative lazy (отсутствие → предупреждение,
   ошибка только при первом ускорении), события Batch*/File*.
-- **Проверки**: `cargo test --release --workspace` — **412 passed /
-  0 failed** (+97 к базовым 338: 25 парсер, 19 планер, 11 SoundTouch на
-  реальной DLL, 31 srt_pipeline (fake-воркеры, реальный ffmpeg/DLL), 11
+- **Проверки**: `cargo test --release --workspace` — **430 passed /
+  0 failed** (+97 к базовым 338: 25 парсер, 19 планер, 13 SoundTouch на
+  реальной DLL, 36 srt_pipeline (fake-воркеры, реальный ffmpeg/DLL), 19
   GUI/srt_job); clippy 0 (glow и sw), fmt OK. Real CPU и CUDA (RTX 3060)
   все зелёные: WAV 4 реплики (короткая/пустая/многочанковая/тесное окно —
-  лог «Озвучено реплик: 3 из 4» с ускорением) + побитовая идентичность
-  повтора (seed 42); MP3 (CPU)/Opus (CUDA); пакет 2 файла в подкаталоге
-  на пуле 2 Pocket (CPU 14.6 с / CUDA 21.5 с), note.txt не озвучивается.
+  лог «Озвучено реплик: 3 из 4» с ускорением ×1.06/×1.02 по фактическим
+  сэмплам) + побитовая идентичность повтора (seed 42); MP3 (CPU)/Opus
+  (CUDA); пакет 2 файла в подкаталоге на пуле 2 Pocket, note.txt не
+  озвучивается; SRT.9D повторил всё на новых коммитах (CPU 3/3 44 с,
+  CUDA 3/3 15 с).
   Portable: PE-импорты обоих EXE без SoundTouch; приёмка в hardlink-
   песочнице комплекта g7 (`out/srt8_portable_acceptance.ps1`): portable-
   check OK оба SRT EXE (читают -srt.json), GUI-смоук exit 0 оба,
   FirstRun создаёт только srt.json (обычный конфиг побайтово цел),
   сирот 0 — ALL PASS.
 - **Артефакты**: `out/srt8_portable_acceptance.ps1` (приёмочный скрипт),
+  `out/srt9_normal_exe_no_soundtouch.ps1` (обычные EXE без SoundTouchDLL),
+  `out/srt9_memory_probe.ps1` (сэмплирование памяти реального прогона),
   тестовые песочницы %TEMP%\srt*.
 - **Portable**: полный комплект НЕ пересобирался (по правилам — после
   ручной приёмки пользователя). `tools/build-portable.ps1` обновлён:
