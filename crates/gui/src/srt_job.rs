@@ -400,11 +400,27 @@ pub fn execute_srt_batch(
         return JobResult::failed(format!("{e:#}"));
     }
     let out_root = resources::resolve_user_path(&s.out_dir);
+    // Каталоги результата: проверка безопасности ДО создания (G5.1), затем
+    // создание без следования по ссылкам и повторная проверка (как в
+    // одиночном пути execute_srt_job).
+    let mut out_dirs: Vec<PathBuf> = Vec::new();
     for (_, rel) in &files {
-        // безопасность каждого каталога результата — до создания (G5.1);
-        // сами файлы проверяются в run_srt_file_on_pool через sink.
-        let dir = out_root.join(rel.parent().unwrap_or(Path::new("")));
-        if let Err(e) = ensure_output_path_safe(s, &dir, &model_dir) {
+        let out_file = out_root.join(rel.with_extension(s.format.extension_str()));
+        let dir = out_file.parent().unwrap_or(&out_root).to_path_buf();
+        if !out_dirs.contains(&dir) {
+            out_dirs.push(dir);
+        }
+    }
+    for dir in &out_dirs {
+        if let Err(e) = ensure_output_path_safe(s, dir, &model_dir) {
+            return JobResult::failed(format!("небезопасный путь результата: {e:#}"));
+        }
+        if !dir.as_os_str().is_empty() && !dir.exists() {
+            if let Err(e) = create_dir_all_no_reparse(dir) {
+                return JobResult::failed(format!("{e:#}"));
+            }
+        }
+        if let Err(e) = ensure_output_path_safe(s, dir, &model_dir) {
             return JobResult::failed(format!("небезопасный путь результата: {e:#}"));
         }
     }
@@ -652,6 +668,7 @@ fn collect_srt_files(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, PathBuf)>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::DeviceChoice;
 
     #[test]
     fn srt_options_from_settings_defaults() {
@@ -721,5 +738,155 @@ mod tests {
         let r = execute_srt_batch(&GuiSettings::default(), &dir, &cancel, &emit);
         assert_eq!(r.status, JobStatus::Failed);
         assert!(r.summary.contains("нет файлов .srt"));
+    }
+
+    // ---- SRT.7: реальные прогоны (модель + голос + SoundTouchDLL) ----
+    // Запуск: cargo test -p pockettts-gui-rust --release --lib
+    //   srt_job::tests::real_ -- --ignored --nocapture --test-threads=1
+    // Устройство: SHTORM_GUI_TEST_DEVICE=cuda (по умолчанию CPU).
+
+    const REAL_ONNX_BASE: &str = r"C:\Users\<user>\Downloads\pocket_tts_android\build\onnx";
+    const REAL_VOICE: &str = r"C:\PocketTTS-GUI\examples\Microsoft Brian Speed 1.wav";
+    const REAL_FFMPEG: &str = r"C:\PocketTTS-GUI\ffmpeg\ffmpeg.exe";
+
+    /// SRT-корпус: короткая реплика / пустая разметочная / длинная
+    /// (несколько чанков) / тесное окно (потребуется ускорение).
+    const REAL_SRT: &str = "1\n00:00:00,000 --> 00:00:04,000\nСтрелки часов показывали полночь, а стрелки застыли.\n\n2\n00:00:04,500 --> 00:00:05,000\n<i></i>\n\n3\n00:00:05,200 --> 00:00:11,000\nВторое предложение для надёжности прогона конвейера субтитров: несколько чанков, паузы и выравнивание.\n\n4\n00:00:11,200 --> 00:00:12,000\nТесное окно.\n";
+
+    fn real_srt_settings(fmt: crate::settings::OutputFormatChoice, out_dir: &Path) -> GuiSettings {
+        let mut s = GuiSettings {
+            model: crate::settings::ModelChoice::Slow,
+            // путь моделей в репозитории анонимизирован (<user>); локальный
+            // прогон задаётся SRT_TEST_ONNX_BASE
+            onnx_base: std::env::var("SRT_TEST_ONNX_BASE")
+                .unwrap_or_else(|_| REAL_ONNX_BASE.into()),
+            voice_wav: REAL_VOICE.into(),
+            device: if std::env::var("SHTORM_GUI_TEST_DEVICE").as_deref() == Ok("cuda") {
+                DeviceChoice::Cuda
+            } else {
+                DeviceChoice::Cpu
+            },
+            device_id: 0,
+            threads: 4,
+            seed: 42,
+            max_tokens: 40,
+            format: fmt,
+            out_dir: out_dir.display().to_string(),
+            chunk_log: true,
+            overwrite_existing: false,
+            ..Default::default()
+        };
+        if fmt.needs_ffmpeg() {
+            s.ffmpeg_path = REAL_FFMPEG.into();
+            s.mp3_preset = "-V2 (Высокое)".into();
+            s.opus_preset = "opus 64k".into();
+        }
+        s.clamped();
+        s
+    }
+
+    fn srt_tmpdir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let d = std::env::temp_dir().join(format!("srt7_{}_{}_{}", std::process::id(), tag, nanos));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    #[ignore]
+    fn real_srt_wav_and_determinism() {
+        let d = srt_tmpdir("wav");
+        let s = real_srt_settings(crate::settings::OutputFormatChoice::Wav, &d);
+        let run = |out: &Path| {
+            let cfg = SrtJobConfig {
+                settings: s.clone(),
+                srt_bytes: REAL_SRT.as_bytes().to_vec(),
+                source_name: "real.srt".into(),
+                out_path: out.to_path_buf(),
+            };
+            let cancel = Arc::new(AtomicBool::new(false));
+            let emit: SharedEmit = Arc::new(|_| {});
+            execute_srt_job(&cfg, &cancel, &emit)
+        };
+        let out1 = d.join("a.wav");
+        let r1 = run(&out1);
+        assert_eq!(r1.status, JobStatus::Completed, "{}", r1.summary);
+        assert!(r1.final_path.as_ref().unwrap().is_file());
+        // лог таймингов написан рядом и содержит ускорение тесного окна
+        let log = d.join("a_log.txt");
+        assert!(log.is_file(), "лог таймингов: {}", log.display());
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.contains("Озвучено реплик: 3 из 4"), "{text}");
+        assert!(
+            text.contains("ускорение"),
+            "тесное окно должно ускоряться: {text}"
+        );
+        // повтор на ДРУГОЙ путь — побитовая идентичность (seed 42)
+        let out2 = d.join("b.wav");
+        let r2 = run(&out2);
+        assert_eq!(r2.status, JobStatus::Completed, "{}", r2.summary);
+        let h1 = std::fs::read(&out1).unwrap();
+        let h2 = std::fs::read(&out2).unwrap();
+        assert_eq!(h1, h2, "повторный прогон побитово идентичен");
+    }
+
+    #[test]
+    #[ignore]
+    fn real_srt_encoder_format() {
+        let is_cuda = std::env::var("SHTORM_GUI_TEST_DEVICE").as_deref() == Ok("cuda");
+        let fmt = if is_cuda {
+            crate::settings::OutputFormatChoice::Opus
+        } else {
+            crate::settings::OutputFormatChoice::Mp3
+        };
+        let d = srt_tmpdir("enc");
+        let mut s = real_srt_settings(fmt, &d);
+        s.srt_max_tempo = 1.5; // отличимый от дефолта потолок
+        let out = d.join(format!("enc.{}", s.format.extension_str()));
+        let cfg = SrtJobConfig {
+            settings: s,
+            srt_bytes: REAL_SRT.as_bytes().to_vec(),
+            source_name: "real.srt".into(),
+            out_path: out.clone(),
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let emit: SharedEmit = Arc::new(|_| {});
+        let r = execute_srt_job(&cfg, &cancel, &emit);
+        assert_eq!(r.status, JobStatus::Completed, "{}", r.summary);
+        let f = r.final_path.unwrap();
+        assert!(f.is_file());
+        assert!(std::fs::metadata(&f).unwrap().len() > 1000);
+    }
+
+    #[test]
+    #[ignore]
+    fn real_srt_batch_directory() {
+        let d = srt_tmpdir("batch");
+        let src = d.join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("one.srt"), REAL_SRT).unwrap();
+        std::fs::write(src.join("sub").join("two.srt"), REAL_SRT).unwrap();
+        std::fs::write(src.join("note.txt"), "не srt").unwrap();
+        let out_root = d.join("out");
+        let mut s = real_srt_settings(crate::settings::OutputFormatChoice::Wav, &out_root);
+        s.batch = true;
+        s.text_file = src.display().to_string();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let emit: SharedEmit = Arc::new(|_| {});
+        let r = execute_srt_batch(&s, &src, &cancel, &emit);
+        if let Some(b) = &r.batch {
+            for line in b.detail_lines() {
+                eprintln!("FILE: {line}");
+            }
+        }
+        assert_eq!(r.status, JobStatus::Completed, "{}", r.summary);
+        let batch = r.batch.expect("batch report");
+        assert_eq!(batch.completed(), 2, "{}", batch.summary());
+        assert!(out_root.join("one.wav").is_file());
+        assert!(out_root.join("sub").join("two.wav").is_file());
+        assert!(!out_root.join("note.wav").exists(), "txt не озвучивается");
     }
 }
