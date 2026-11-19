@@ -70,6 +70,11 @@ fn close_decision(close_requested: bool, commands: &[egui::ViewportCommand]) -> 
 /// Запуск GUI в программном рантайме. Возвращает управление при штатном
 /// закрытии окна (после CloseFlow) или ошибке инициализации.
 pub fn run() -> anyhow::Result<()> {
+    run_flavor(crate::AppFlavor::Text)
+}
+
+/// SRT.6: запуск программного рантайма с флейвором приложения.
+pub fn run_flavor(flavor: crate::AppFlavor) -> anyhow::Result<()> {
     let event_loop: EventLoop<UserEvent> = EventLoop::with_user_event()
         .build()
         .map_err(|e| anyhow::anyhow!("winit: {e}"))?;
@@ -93,6 +98,7 @@ pub fn run() -> anyhow::Result<()> {
     });
 
     let mut app = SwGui::new(egui_ctx, softbuffer_context);
+    app.flavor = flavor;
     event_loop
         .run_app(&mut app)
         .map_err(|e| anyhow::anyhow!("winit event loop: {e}"))?;
@@ -109,6 +115,8 @@ pub fn run() -> anyhow::Result<()> {
 struct SwGui {
     egui_ctx: egui::Context,
     softbuffer_context: softbuffer::Context<winit::event_loop::OwnedDisplayHandle>,
+    /// SRT.6: флейвор приложения (конструируется до старта окна).
+    flavor: crate::AppFlavor,
     state: Option<Running>,
     /// Запланированная перерисовка (модель eframe `windows_next_repaint_times`
     /// для единственного окна). None — перерисовок не запланировано.
@@ -141,6 +149,7 @@ impl SwGui {
         Self {
             egui_ctx,
             softbuffer_context,
+            flavor: crate::AppFlavor::Text,
             state: None,
             next_repaint: None,
         }
@@ -307,7 +316,7 @@ impl SwGui {
             surface,
             egui_winit,
             renderer,
-            app: ShtormApp::new(),
+            app: ShtormApp::new_flavor(self.flavor),
             viewport_info: egui::ViewportInfo::default(),
             actions_requested: Vec::new(),
             close: false,

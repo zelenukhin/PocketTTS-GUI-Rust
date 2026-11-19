@@ -21,9 +21,10 @@ use crate::job::{
 };
 use crate::resources;
 use crate::settings::{
-    legacy_settings_path, load_settings, settings_path, DeviceChoice, GuiSettings,
+    legacy_settings_path, load_settings, settings_path_for, DeviceChoice, GuiSettings,
     OutputFormatChoice,
 };
+use crate::AppFlavor;
 
 const FALLBACK_TEXT: &str =
     "Стр+елки час+ов показ+ывали п+олночь, а стрелк+и заст+ыли. Вт+орое предложение.";
@@ -41,6 +42,12 @@ pub enum CliOutcome {
 /// Полный разбор и диспетчеризация аргументов (общая для обоих EXE).
 /// Графический рантайм создаётся ТОЛЬКО при `CliOutcome::Gui`.
 pub fn dispatch(args: &[String]) -> CliOutcome {
+    dispatch_flavor(args, AppFlavor::Text)
+}
+
+/// SRT.6: диспетчеризация с флейвором (портативная диагностика читает
+/// конфиг СВОЕГО флейвора: PocketTTS-GUI-Rust.json / -srt.json).
+pub fn dispatch_flavor(args: &[String], flavor: AppFlavor) -> CliOutcome {
     // G6.1.1: сначала — строгий разбор; при ошибке никаких окон и никакой
     // загрузки Pocket, только диагностика.
     let command = match parse_cli_args(args) {
@@ -57,10 +64,14 @@ pub fn dispatch(args: &[String]) -> CliOutcome {
             print!("{}", usage_text());
             CliOutcome::Exit(0)
         }
-        CliCommand::PortableCheck => CliOutcome::Exit(portable_check(args)),
-        CliCommand::PortableSelftest => CliOutcome::Exit(portable_selftest(args, false)),
-        CliCommand::PortableSelftestBatch => CliOutcome::Exit(portable_selftest(args, true)),
-        CliCommand::PortableSelftestCancel => CliOutcome::Exit(portable_selftest_cancel(args)),
+        CliCommand::PortableCheck => CliOutcome::Exit(portable_check(args, flavor)),
+        CliCommand::PortableSelftest => CliOutcome::Exit(portable_selftest(args, false, flavor)),
+        CliCommand::PortableSelftestBatch => {
+            CliOutcome::Exit(portable_selftest(args, true, flavor))
+        }
+        CliCommand::PortableSelftestCancel => {
+            CliOutcome::Exit(portable_selftest_cancel(args, flavor))
+        }
         CliCommand::PortableSelftestHybrid => CliOutcome::Exit(portable_selftest_hybrid(args)),
         // G6.2: внутренний worker-процесс гибридного пула. Окно НЕ
         // открывается: выход до любого графического рантайма, конфигурация —
@@ -196,8 +207,8 @@ fn nanos() -> u128 {
         .unwrap_or(0)
 }
 
-fn load_portable_settings() -> Result<GuiSettings, String> {
-    let path = settings_path();
+fn load_portable_settings(flavor: AppFlavor) -> Result<GuiSettings, String> {
+    let path = settings_path_for(flavor);
     if path.is_file() {
         load_settings(&path).map_err(|e| format!("настройки {}: {e:#}", path.display()))
     } else {
@@ -238,8 +249,8 @@ fn hold_ms(args: &[String]) {
     }
 }
 
-fn portable_check(args: &[String]) -> i32 {
-    let mut s = match load_portable_settings() {
+fn portable_check(args: &[String], flavor: AppFlavor) -> i32 {
+    let mut s = match load_portable_settings(flavor) {
         Ok(s) => s,
         Err(e) => {
             println!("SETTINGS ERROR: {e}");
@@ -249,7 +260,7 @@ fn portable_check(args: &[String]) -> i32 {
     apply_overrides(&mut s, args);
     let mut ok = true;
     println!("EXE: {}", resources::exe_dir().display());
-    println!("SETTINGS: {}", settings_path().display());
+    println!("SETTINGS: {}", settings_path_for(flavor).display());
     match resolve_model_dir(&s) {
         Ok(p) => println!("MODEL: {}", p.display()),
         Err(e) => {
@@ -292,8 +303,8 @@ fn portable_check(args: &[String]) -> i32 {
     }
 }
 
-fn portable_selftest(args: &[String], batch: bool) -> i32 {
-    let mut s = match load_portable_settings() {
+fn portable_selftest(args: &[String], batch: bool, flavor: AppFlavor) -> i32 {
+    let mut s = match load_portable_settings(flavor) {
         Ok(s) => s,
         Err(e) => {
             println!("SETTINGS ERROR: {e}");
@@ -380,7 +391,8 @@ fn portable_selftest(args: &[String], batch: bool) -> i32 {
 /// все 6 WAV готовы, процессов CUDA 2, воркеров 4, дочерние процессы
 /// завершились (execute_batch не возвращается раньше).
 fn portable_selftest_hybrid(args: &[String]) -> i32 {
-    let mut s = match load_portable_settings() {
+    // гибридный мультипроцесс — TXT-конвейер: читается обычный конфиг
+    let mut s = match load_portable_settings(AppFlavor::Text) {
         Ok(s) => s,
         Err(e) => {
             println!("SETTINGS ERROR: {e}");
@@ -470,8 +482,8 @@ fn portable_selftest_hybrid(args: &[String]) -> i32 {
 /// готового чанка (воркер в этот момент уже генерирует следующий). Проверка:
 /// Cancelled без итогового файла, `.partial` существует; повторный запуск на
 /// том же пути — Completed. Возвращает 0 только при обеих проверках.
-fn portable_selftest_cancel(args: &[String]) -> i32 {
-    let mut s = match load_portable_settings() {
+fn portable_selftest_cancel(args: &[String], flavor: AppFlavor) -> i32 {
+    let mut s = match load_portable_settings(flavor) {
         Ok(s) => s,
         Err(e) => {
             println!("SETTINGS ERROR: {e}");

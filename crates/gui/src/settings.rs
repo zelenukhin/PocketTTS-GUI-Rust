@@ -189,6 +189,24 @@ pub struct GuiSettings {
     pub out_dir: String,
     pub chunk_log: bool,
     pub ffmpeg_path: String,
+    // SRT-выравнивание (этап SRT; используются только SRT-версиями GUI,
+    // в обычном конфиге сериализуются с дефолтами — формат один)
+    /// Потолок ускорения реплики SoundTouch, ×1.1..=×3.0 (дефолт ×2.0).
+    #[serde(default = "default_srt_max_tempo")]
+    pub srt_max_tempo: f32,
+    /// Минимальная пауза между репликами при заимствовании, мс 0..=500
+    /// (дефолт 100).
+    #[serde(default = "default_srt_min_pause_ms")]
+    pub srt_min_pause_ms: u32,
+    /// Standard-чанкование: внутренняя пауза между чанками реплики, мс
+    /// (дефолт 500 — Python-совместимость; Android использует собственный
+    /// план пауз, поле не применяется).
+    #[serde(default = "default_srt_internal_pause_ms")]
+    pub srt_internal_pause_ms: u32,
+    /// Standard-чанкование: пауза на мягкой границе (запятая/«и»), мс
+    /// (дефолт 100).
+    #[serde(default = "default_srt_comma_pause_ms")]
+    pub srt_comma_pause_ms: u32,
     /// G5: разрешить замену готового аудиофайла назначения. По умолчанию
     /// выключено. Замена выполняется только после успешного синтеза
     /// (sink пишет `.partial`, публикация — MoveFileExW REPLACE).
@@ -596,6 +614,19 @@ fn default_max_chunk_chars() -> u32 {
     150
 }
 
+pub fn default_srt_max_tempo() -> f32 {
+    2.0
+}
+pub fn default_srt_min_pause_ms() -> u32 {
+    100
+}
+pub fn default_srt_internal_pause_ms() -> u32 {
+    500
+}
+pub fn default_srt_comma_pause_ms() -> u32 {
+    100
+}
+
 impl Default for GuiSettings {
     fn default() -> Self {
         Self {
@@ -639,6 +670,10 @@ impl Default for GuiSettings {
             out_dir: "output".into(),
             chunk_log: false,
             ffmpeg_path: String::new(),
+            srt_max_tempo: default_srt_max_tempo(),
+            srt_min_pause_ms: default_srt_min_pause_ms(),
+            srt_internal_pause_ms: default_srt_internal_pause_ms(),
+            srt_comma_pause_ms: default_srt_comma_pause_ms(),
             // защита существующих аудиокниг по умолчанию: без явного согласия
             // пользователя готовые файлы не заменяются
             overwrite_existing: false,
@@ -675,6 +710,10 @@ impl GuiSettings {
     /// Зажим значений в допустимые диапазоны (как Python GUI).
     pub fn clamped(&mut self) {
         self.temperature = self.temperature.clamp(0.05, 1.5);
+        self.srt_max_tempo = self.srt_max_tempo.clamp(1.1, 3.0);
+        self.srt_min_pause_ms = self.srt_min_pause_ms.min(500);
+        self.srt_internal_pause_ms = self.srt_internal_pause_ms.min(2000);
+        self.srt_comma_pause_ms = self.srt_comma_pause_ms.min(500);
         self.decode_steps = self.decode_steps.clamp(1, 8);
         // порог: зажимается числовая часть; устаревший Auto не трогаем
         // (в GUI он не создаётся, load "auto" сразу даёт Fixed(-4.0))
@@ -721,16 +760,29 @@ impl GuiSettings {
 
 /// Имя собственного конфига (G6.5: переименование приложения — новое имя).
 pub const SETTINGS_FILE: &str = "PocketTTS-GUI-Rust.json";
+/// SRT.6: конфиг SRT-версий — ОТДЕЛЬНЫЙ файл (оба SRT EXE используют один;
+/// обычный конфиг SRT-версиями не пишется и наоборот).
+pub const SRT_SETTINGS_FILE: &str = "PocketTTS-GUI-Rust-srt.json";
 /// Прежнее имя конфига до переименования приложения (G6.5). Используется
 /// ТОЛЬКО для чтения при миграции; автоматически не удаляется и не меняется.
 pub const LEGACY_SETTINGS_FILE: &str = "shtorm_gui_settings.json";
 
 /// Путь собственного конфига: рядом с exe (портативный стиль).
 pub fn settings_path() -> PathBuf {
+    settings_path_for(crate::AppFlavor::Text)
+}
+
+/// SRT.6: путь конфига по флейвору приложения (обычный/SRT — разные файлы
+/// в одном каталоге exe).
+pub fn settings_path_for(flavor: crate::AppFlavor) -> PathBuf {
+    let name = match flavor {
+        crate::AppFlavor::Text => SETTINGS_FILE,
+        crate::AppFlavor::Srt => SRT_SETTINGS_FILE,
+    };
     std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|d| d.join(SETTINGS_FILE)))
-        .unwrap_or_else(|| PathBuf::from(SETTINGS_FILE))
+        .and_then(|p| p.parent().map(|d| d.join(name)))
+        .unwrap_or_else(|| PathBuf::from(name))
 }
 
 /// Путь прежнего конфига (до переименования приложения, G6.5): тот же

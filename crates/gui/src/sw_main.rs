@@ -25,15 +25,17 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match entry::dispatch(&args) {
         CliOutcome::Exit(code) => std::process::exit(code),
-        CliOutcome::Gui => std::process::exit(run_software_gui()),
+        CliOutcome::Gui => {
+            std::process::exit(run_software_gui(pockettts_gui_rust::AppFlavor::Text))
+        }
     }
 }
 
 /// Запуск окна в программном рантайме (crate::sw). GL-контекст не создаётся
 /// ни при каких условиях: в этом бинарнике eframe вообще отсутствует
 /// (feature `sw` без `glow`), fallback на OpenGL невозможен by construction.
-fn run_software_gui() -> i32 {
-    match pockettts_gui_rust::sw::run() {
+fn run_software_gui(flavor: pockettts_gui_rust::AppFlavor) -> i32 {
+    match pockettts_gui_rust::sw::run_flavor(flavor) {
         Ok(()) => 0,
         Err(e) => {
             entry::gui_error_dialog(&format!("программный рендер (CPU): {e:#}"));

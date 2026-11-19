@@ -73,6 +73,18 @@ name = "PocketTTS-GUI-Rust-cpu"
 path = "src/sw_main.rs"
 required-features = ["sw"]
 
+# SRT.6: SRT-версии — только озвучка субтитров (общая библиотека, флейвор
+# AppFlavor::Srt, отдельный конфиг PocketTTS-GUI-Rust-srt.json).
+[[bin]]
+name = "PocketTTS-GUI-Rust-srt"
+path = "src/srt_main.rs"
+required-features = ["glow"]
+
+[[bin]]
+name = "PocketTTS-GUI-Rust-srt-cpu"
+path = "src/srt_sw_main.rs"
+required-features = ["sw"]
+
 [target.'cfg(windows)'.dependencies]
 # G6.4: HWND живого окна для однократного размещения по рабочей области
 # монитора запуска (физические пиксели, per-monitor DPI).

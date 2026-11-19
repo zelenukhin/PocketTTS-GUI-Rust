@@ -32,14 +32,14 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match entry::dispatch(&args) {
         CliOutcome::Exit(code) => std::process::exit(code),
-        CliOutcome::Gui => std::process::exit(run_glow_gui()),
+        CliOutcome::Gui => std::process::exit(run_glow_gui(pockettts_gui_rust::AppFlavor::Text)),
     }
 }
 
 /// Запуск окна через eframe/glow (OpenGL). Любая ошибка рантайма (например,
 /// невозможность создать GL-контекст) печатается в stderr; при запуске
 /// двойным кликом (нет stderr) — MessageBox. Код выхода 1.
-fn run_glow_gui() -> i32 {
+fn run_glow_gui(flavor: pockettts_gui_rust::AppFlavor) -> i32 {
     // G6.4: стартовый размер — по рабочей области монитора запуска и его
     // DPI (не фиксированные 980×860). Окно не выходит за экран, на большом
     // мониторе не растягивается на весь экран, min_inner_size уменьшается
@@ -50,11 +50,11 @@ fn run_glow_gui() -> i32 {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(plan.inner_size)
             .with_min_inner_size(plan.min_inner_size)
-            .with_title("PocketTTS-GUI-Rust v1.1"),
+            .with_title(flavor.window_title()),
         ..Default::default()
     };
     match eframe::run_native(
-        "PocketTTS-GUI-Rust",
+        flavor.label(),
         options,
         Box::new(|cc| {
             entry::install_cyrillic_fonts(&cc.egui_ctx);
@@ -62,7 +62,9 @@ fn run_glow_gui() -> i32 {
             // переносим на монитор запуска и выравниваем размер до первого
             // отображения — без мерцания и повторных подстроек.
             pockettts_gui_rust::window::place_on_launch_monitor(cc);
-            Ok(Box::new(pockettts_gui_rust::app::ShtormApp::new()))
+            Ok(Box::new(pockettts_gui_rust::app::ShtormApp::new_flavor(
+                flavor,
+            )))
         }),
     ) {
         Ok(()) => 0,

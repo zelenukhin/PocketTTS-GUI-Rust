@@ -18,7 +18,7 @@ use std::sync::Arc;
 use crate::batch::FileStatus;
 use crate::job::{JobEvent, JobPhase, JobStatus};
 use crate::settings::{
-    load_settings, save_settings, settings_path, DeviceChoice, GuiSettings, ModelChoice,
+    load_settings, save_settings, settings_path_for, DeviceChoice, GuiSettings, ModelChoice,
     OutputFormatChoice, LEGACY_SETTINGS_FILE,
 };
 
@@ -129,6 +129,9 @@ enum CloseFlow {
 }
 
 pub struct ShtormApp {
+    /// SRT.6: флейвор приложения (текстовый/SRT) — заголовок, источник,
+    /// блок настроек SRT и путь исполнения задания.
+    pub flavor: crate::AppFlavor,
     pub settings: GuiSettings,
     log: String,
     status: String,
@@ -212,7 +215,16 @@ impl Default for ShtormApp {
 
 impl ShtormApp {
     pub fn new() -> Self {
-        Self::with_conf_path(settings_path())
+        Self::new_flavor(crate::AppFlavor::Text)
+    }
+
+    /// SRT.6: SRT-версия приложения (конфиг PocketTTS-GUI-Rust-srt.json).
+    pub fn new_srt() -> Self {
+        Self::new_flavor(crate::AppFlavor::Srt)
+    }
+
+    pub fn new_flavor(flavor: crate::AppFlavor) -> Self {
+        Self::with_conf_path_flavor(settings_path_for(flavor), flavor)
     }
 
     /// Конструктор с явным путём конфига (продакшн — рядом с exe; тесты —
@@ -226,7 +238,14 @@ impl ShtormApp {
     /// Повреждённый прежний конфиг — защитная политика `Unreadable` без
     /// перезаписи; повреждённый НОВЫЙ конфиг не подменяется старыми
     /// настройками.
+    #[cfg(test)]
     fn with_conf_path(conf_path: PathBuf) -> Self {
+        Self::with_conf_path_flavor(conf_path, crate::AppFlavor::Text)
+    }
+
+    /// SRT.6: конструктор с флейвором (обычный — для тестов через
+    /// `with_conf_path`, SRT — продакшн SRT-EXE).
+    fn with_conf_path_flavor(conf_path: PathBuf, flavor: crate::AppFlavor) -> Self {
         // Прежнее имя конфига ищем в том же каталоге (продакшн — каталог exe,
         // «рядом со старым EXE или новым EXE» — это один и тот же каталог).
         let legacy_path = conf_path.with_file_name(LEGACY_SETTINGS_FILE);
@@ -318,6 +337,7 @@ impl ShtormApp {
         // (G6.5: считается в ветках загрузки выше — миграция задаёт его явно).
         let settings_snapshot = snapshot;
         Self {
+            flavor,
             settings,
             log: String::new(),
             // G6.4: статус загрузки конфига — отдельно от рабочего статуса
@@ -379,10 +399,42 @@ impl ShtormApp {
         let cancel2 = Arc::clone(&cancel);
         // относительный путь источника — от каталога exe, не от CWD
         let text_file = crate::resources::resolve_user_path(&s.text_file);
+        let srt_flavor = self.flavor == crate::AppFlavor::Srt;
         let thread = std::thread::Builder::new()
             .name("pockettts-synth".into())
             .spawn(move || {
-                let result = if batch {
+                let result = if srt_flavor {
+                    // SRT.6: озвучка субтитров — одиночный файл или каталог.
+                    if batch {
+                        let source = text_file.clone();
+                        crate::srt_job::execute_srt_batch(&s, &source, &cancel2, &emit)
+                    } else {
+                        let bytes = match std::fs::read(&text_file) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                let r = crate::job::JobResult::failed(format!(
+                                    "прочитать файл субтитров {}: {e}",
+                                    text_file.display()
+                                ));
+                                emit(JobEvent::Log(r.summary.clone()));
+                                emit(JobEvent::Finished(Box::new(r)));
+                                return;
+                            }
+                        };
+                        let source_name = text_file
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("srt")
+                            .to_string();
+                        let cfg = crate::srt_job::SrtJobConfig {
+                            settings: s,
+                            srt_bytes: bytes,
+                            source_name,
+                            out_path,
+                        };
+                        crate::srt_job::execute_srt_job(&cfg, &cancel2, &emit)
+                    }
+                } else if batch {
                     let source = text_file.clone();
                     crate::job::execute_batch(&s, &source, &cancel2, &emit)
                 } else {
@@ -833,12 +885,15 @@ impl ShtormApp {
         }
 
         let mut errs = Vec::new();
+        let srt_flavor = self.flavor == crate::AppFlavor::Srt;
         let s = &self.settings;
         let text_path = crate::resources::resolve_user_path(&s.text_file);
         let voice_path = crate::resources::resolve_user_path(&s.voice_wav);
         if s.text_file.trim().is_empty() {
             errs.push(if s.batch {
                 "не выбран исходный каталог".into()
+            } else if srt_flavor {
+                "не выбран файл субтитров".into()
             } else {
                 "не выбран текстовый файл".into()
             });
@@ -850,7 +905,13 @@ impl ShtormApp {
                 ));
             }
         } else if !text_path.is_file() {
-            errs.push(format!("текстовый файл не найден: {}", text_path.display()));
+            errs.push(if srt_flavor {
+                format!("файл субтитров не найден: {}", text_path.display())
+            } else {
+                format!("текстовый файл не найден: {}", text_path.display())
+            });
+        } else if srt_flavor && !s.text_file.to_lowercase().ends_with(".srt") {
+            errs.push("SRT-версия принимает только файлы .srt".into());
         }
         if s.voice_wav.trim().is_empty() {
             errs.push("не выбран WAV-голос".into());
@@ -922,10 +983,17 @@ impl ShtormApp {
         let resp = egui::CollapsingHeader::new(egui::RichText::new("Источник и голос").heading().strong())
             .open(Some(s.source_open))
             .show(ui, |ui| {
+                let srt_flavor = self.flavor == crate::AppFlavor::Srt;
                 path_row(
                     ui,
                     if batch {
-                        "Исходный каталог:"
+                        if srt_flavor {
+                            "Каталог субтитров:"
+                        } else {
+                            "Исходный каталог:"
+                        }
+                    } else if srt_flavor {
+                        "Файл субтитров:"
                     } else {
                         "Текстовый файл:"
                     },
@@ -933,8 +1001,17 @@ impl ShtormApp {
                     || {
                         if batch {
                             rfd::FileDialog::new()
-                                .set_title("Выберите каталог с .txt/.md/.log")
+                                .set_title(if srt_flavor {
+                                    "Выберите каталог с .srt"
+                                } else {
+                                    "Выберите каталог с .txt/.md/.log"
+                                })
                                 .pick_folder()
+                        } else if srt_flavor {
+                            rfd::FileDialog::new()
+                                .set_title("Выберите файл субтитров")
+                                .add_filter("SubRip субтитры", &["srt"])
+                                .pick_file()
                         } else {
                             rfd::FileDialog::new()
                                 .set_title("Выберите текстовый файл")
@@ -946,7 +1023,11 @@ impl ShtormApp {
                 if batch {
                     hint(
                         ui,
-                        "Рекурсивно .txt/.md/.log без символических ссылок; выходная папка исключается.",
+                        if srt_flavor {
+                            "Рекурсивный поиск .srt без символических ссылок; выходная папка исключается."
+                        } else {
+                            "Рекурсивно .txt/.md/.log без символических ссылок; выходная папка исключается."
+                        },
                     );
                 }
                 path_row(ui, "WAV-голос:", &mut s.voice_wav, || {
@@ -1287,6 +1368,65 @@ impl ShtormApp {
                 });
         header_clicked(&resp, &mut s.pauses_open);
         ui.add_space(8.0);
+
+        // ---- Выравнивание SRT (только SRT-версии; ТЗ §10) ----
+        if self.flavor == crate::AppFlavor::Srt {
+            egui::CollapsingHeader::new(
+                egui::RichText::new("Выравнивание субтитров (SRT)").heading().strong(),
+            )
+            .default_open(true)
+            .show(ui, |ui| {
+                two_columns(
+                    ui,
+                    |ui| {
+                        slider_row(ui, "Максимальное ускорение:", |ui| {
+                            ui.add(
+                                egui::Slider::new(&mut s.srt_max_tempo, 1.1..=3.0)
+                                    .step_by(0.05)
+                                    .fixed_decimals(2),
+                            );
+                        });
+                        slider_row(ui, "Мин. пауза между репликами (мс):", |ui| {
+                            ui.add(
+                                egui::Slider::new(&mut s.srt_min_pause_ms, 0..=500)
+                                    .step_by(25.0),
+                            );
+                        });
+                    },
+                    |ui| {
+                        // Внутренние паузы — только Standard-чанкование
+                        // (Android привносит собственный план пауз).
+                        let std_mode =
+                            s.chunking_mode == text_processing::ChunkingMode::Standard;
+                        slider_row(ui, "Внутренняя пауза чанка (мс):", |ui| {
+                            ui.add_enabled(
+                                std_mode,
+                                egui::Slider::new(&mut s.srt_internal_pause_ms, 0..=1000)
+                                    .step_by(50.0),
+                            );
+                        });
+                        slider_row(ui, "Пауза мягкой границы (мс):", |ui| {
+                            ui.add_enabled(
+                                std_mode,
+                                egui::Slider::new(&mut s.srt_comma_pause_ms, 0..=500)
+                                    .step_by(50.0),
+                            );
+                        });
+                        if !std_mode {
+                            hint(
+                                ui,
+                                "TeraTTS Android использует собственные паузы чанкера.",
+                            );
+                        }
+                    },
+                );
+                hint(
+                    ui,
+                    "Длинные реплики ускоряются до потолка SoundTouch (без изменения высоты голоса); нехватка времени занимается у паузы до следующей реплики, но не короче минимальной паузы. Замедление не выполняется.",
+                );
+            });
+            ui.add_space(8.0);
+        }
 
         // ---- Вывод и формат ----
         let resp =
@@ -1982,7 +2122,7 @@ impl ShtormApp {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("PocketTTS-GUI-Rust v1.1")
+                    egui::RichText::new(self.flavor.window_title())
                         .heading()
                         .strong(),
                 );
@@ -3775,5 +3915,95 @@ mod tests {
             !soft_wrap_paths("короткий путь").contains('\u{200B}'),
             "короткий текст не должен разрываться"
         );
+    }
+
+    // ---- SRT.6: флейвор, конфиг, валидация источника, кадр ----
+
+    #[test]
+    fn srt_flavor_uses_separate_config_name() {
+        let srt = crate::settings::settings_path_for(crate::AppFlavor::Srt);
+        let txt = crate::settings::settings_path_for(crate::AppFlavor::Text);
+        assert_eq!(
+            srt.file_name().and_then(|n| n.to_str()),
+            Some("PocketTTS-GUI-Rust-srt.json")
+        );
+        assert_eq!(
+            txt.file_name().and_then(|n| n.to_str()),
+            Some("PocketTTS-GUI-Rust.json")
+        );
+        assert_ne!(srt, txt);
+        assert!(crate::AppFlavor::Srt.window_title().contains("SRT"));
+        assert!(!crate::AppFlavor::Text.window_title().contains("SRT"));
+    }
+
+    #[test]
+    fn srt_validate_accepts_srt_rejects_txt() {
+        let dir = std::env::temp_dir().join(format!("srt6_app_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let srt_file = dir.join("episode.srt");
+        std::fs::write(
+            &srt_file,
+            "1
+00:00:00,000 --> 00:00:01,000
+Тест.
+",
+        )
+        .unwrap();
+        let txt_file = dir.join("book.txt");
+        std::fs::write(&txt_file, b"text").unwrap();
+
+        let mut app = ShtormApp::with_conf_path_flavor(dir.join("c1.json"), crate::AppFlavor::Srt);
+        app.settings.voice_wav = srt_file.display().to_string(); // валидный путь для голоса не важен
+        app.settings.text_file = srt_file.display().to_string();
+        let errs = app.validate();
+        assert!(
+            !errs.iter().any(|e| e.contains("субтитров")),
+            "srt-файл принимается: {errs:?}"
+        );
+
+        app.settings.text_file = txt_file.display().to_string();
+        let errs = app.validate();
+        assert!(
+            errs.iter().any(|e| e.contains("только файлы .srt")),
+            "txt отвергается: {errs:?}"
+        );
+
+        // текстовый флейвор тот же .txt принимает
+        let mut txt_app = ShtormApp::with_conf_path(dir.join("c2.json"));
+        txt_app.settings.text_file = txt_file.display().to_string();
+        txt_app.settings.voice_wav = srt_file.display().to_string();
+        let errs = txt_app.validate();
+        assert!(!errs.iter().any(|e| e.contains(".srt")), "{errs:?}");
+    }
+
+    #[test]
+    fn srt_frame_renders_and_srt_settings_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("srt6_frame_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("PocketTTS-GUI-Rust-srt.json");
+        let mut app = ShtormApp::with_conf_path_flavor(conf.clone(), crate::AppFlavor::Srt);
+        app.settings.srt_max_tempo = 2.5;
+        app.settings.srt_min_pause_ms = 200;
+
+        // один headless-кадр: SRT-блок рендерится без паники
+        let ctx = egui::Context::default();
+        ctx.style_mut(|st| st.animation_time = 0.0);
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(raw, |ui| app.update_ui(ui.ctx()));
+
+        // сохранение и перезагрузка: значения SRT-настроек переживают цикл
+        app.manual_save().expect("save");
+        let raw_json = std::fs::read_to_string(&conf).unwrap();
+        assert!(raw_json.contains("srt_max_tempo"));
+        let reloaded = crate::settings::load_settings(&conf).unwrap();
+        assert_eq!(reloaded.srt_max_tempo, 2.5);
+        assert_eq!(reloaded.srt_min_pause_ms, 200);
+        assert_eq!(reloaded.srt_comma_pause_ms, 100);
     }
 }
