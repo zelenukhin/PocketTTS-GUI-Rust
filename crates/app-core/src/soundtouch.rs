@@ -17,8 +17,20 @@
 //! переносится) → putSamples блоками → выборка до осушения → flush →
 //! выборка до осушения. Выходная длительность = фактически полученные
 //! сэмплы; tempo = 1.0 обрабатывается без SoundTouch вовсе.
+//!
+//! SRT.9C-аудит C ABI по комплектуемому заголовку 2.4.1
+//! (soundtouch-2.4.1.tar.gz → source/SoundTouchDLL/SoundTouchDLL.h, DLL
+//! SHA256 E8E56D3D…C3F6): все загружаемые сигнатуры совпадают; ВАЖНО — в
+//! версии 2.4.1 `soundtouch_setSampleRate`/`setChannels`/`putSamples`/
+//! `flush` объявлены `int` (возврат 1=успех / 0=неверный обработчик или
+//! исключение), а НЕ `void`, как в старых версиях SoundTouch: проверка
+//! `rc == 0` в put_samples корректна. Единственные исключения C++ через
+//! FFI возможны из `soundtouch_createInstance` (там нет try/catch —
+//! `new` при нехватке памяти); все остальные функции обёртки ловят
+//! std::exception внутри себя.
 
 use std::fmt;
+use std::os::raw::c_int;
 use std::path::{Path, PathBuf};
 
 /// Ожидаемая версия SoundTouch (2.4.1 = 2·10000 + 4·100 + 1). Более
@@ -49,6 +61,10 @@ pub enum SoundTouchError {
     MissingExport(String),
     /// Версия DLL старше поддерживаемой.
     UnsupportedVersion { actual: u32, required: u32 },
+    /// DLL не смогла создать/настроить обработчик или промыть буфер
+    /// (NULL после createInstance, отклонённые параметры/настройки,
+    /// сбой flush — по контракту 2.4.1 эти функции возвращают 0).
+    SetupFailed(String),
     /// Вход/выход содержит NaN/Inf.
     InvalidSampleData(&'static str),
 }
@@ -70,6 +86,9 @@ impl fmt::Display for SoundTouchError {
             }
             SoundTouchError::UnsupportedVersion { actual, required } => {
                 write!(f, "SoundTouch версии {actual} старше требуемой {required}")
+            }
+            SoundTouchError::SetupFailed(what) => {
+                write!(f, "SoundTouch: сбой настройки обработчика ({what})")
             }
             SoundTouchError::InvalidSampleData(what) => {
                 write!(f, "SoundTouch: некорректные сэмплы ({what})")
@@ -302,26 +321,60 @@ impl SoundTouchLib {
     /// Новый обработчик одной реплики: частота/каналы + речевой профиль
     /// (SEQUENCE/SEEKWINDOW/OVERLAP, AA вкл, QUICKSEEK выкл). Состояние
     /// между репликами не переносится — на каждую реплику свой instance.
+    ///
+    /// SRT.9C: контракт 2.4.1 — createInstance может вернуть NULL, а
+    /// setSampleRate/setChannels/setSetting возвращают 0 при неверном
+    /// обработчике/исключении/неизвестной настройке. Всё это проверяется
+    /// здесь явно (раньше NULL приводил к разыменованию нулевого
+    /// указателя внутри DLL, а отклонённые настройки молча меняли профиль).
     pub fn create_speech_instance(
         &self,
         sample_rate: u32,
         channels: u32,
-    ) -> SoundTouchInstance<'_> {
+    ) -> Result<SoundTouchInstance<'_>, SoundTouchError> {
         let handle = unsafe { (self.create_instance)() };
-        unsafe {
-            (self.set_sample_rate)(handle, sample_rate);
-            (self.set_channels)(handle, channels);
-            (self.set_setting)(handle, SETTING_USE_AA_FILTER, 1);
-            (self.set_setting)(handle, SETTING_USE_QUICKSEEK, 0);
-            (self.set_setting)(handle, SETTING_SEQUENCE_MS, SPEECH_SEQUENCE_MS);
-            (self.set_setting)(handle, SETTING_SEEKWINDOW_MS, SPEECH_SEEKWINDOW_MS);
-            (self.set_setting)(handle, SETTING_OVERLAP_MS, SPEECH_OVERLAP_MS);
+        if handle.is_null() {
+            return Err(SoundTouchError::SetupFailed(
+                "soundtouch_createInstance вернула NULL".into(),
+            ));
         }
-        SoundTouchInstance {
+        let setup: [(&str, c_int); 7] = unsafe {
+            [
+                ("setSampleRate", (self.set_sample_rate)(handle, sample_rate)),
+                ("setChannels", (self.set_channels)(handle, channels)),
+                (
+                    "AA-фильтр",
+                    (self.set_setting)(handle, SETTING_USE_AA_FILTER, 1),
+                ),
+                (
+                    "QUICKSEEK",
+                    (self.set_setting)(handle, SETTING_USE_QUICKSEEK, 0),
+                ),
+                (
+                    "SEQUENCE_MS",
+                    (self.set_setting)(handle, SETTING_SEQUENCE_MS, SPEECH_SEQUENCE_MS),
+                ),
+                (
+                    "SEEKWINDOW_MS",
+                    (self.set_setting)(handle, SETTING_SEEKWINDOW_MS, SPEECH_SEEKWINDOW_MS),
+                ),
+                (
+                    "OVERLAP_MS",
+                    (self.set_setting)(handle, SETTING_OVERLAP_MS, SPEECH_OVERLAP_MS),
+                ),
+            ]
+        };
+        if let Some((what, _)) = setup.iter().find(|(_, rc)| *rc == 0) {
+            unsafe { (self.destroy_instance)(handle) };
+            return Err(SoundTouchError::SetupFailed(format!(
+                "DLL отклонила {what}"
+            )));
+        }
+        Ok(SoundTouchInstance {
             lib: self,
             handle,
             channels,
-        }
+        })
     }
 }
 
@@ -394,9 +447,19 @@ impl SoundTouchInstance<'_> {
 
     /// Промыть внутренний буфер и добрать хвост. После этого instance
     /// больше не используется (закрывается на Drop).
-    pub fn finish(&mut self, out: &mut Vec<f32>) {
-        unsafe { (self.lib.flush)(self.handle) };
+    ///
+    /// SRT.9C: soundtouch_flush по контракту 2.4.1 возвращает 0 при
+    /// сбое (исключение/неверный обработчик) — раньше код игнорировался и
+    /// хвост мог молча теряться.
+    pub fn finish(&mut self, out: &mut Vec<f32>) -> Result<(), SoundTouchError> {
+        let rc = unsafe { (self.lib.flush)(self.handle) };
+        if rc == 0 {
+            return Err(SoundTouchError::SetupFailed(
+                "soundtouch_flush не смог промыть буфер".into(),
+            ));
+        }
         self.drain_into(out);
+        Ok(())
     }
 
     pub fn num_samples(&self) -> u32 {
@@ -428,12 +491,12 @@ pub fn process_cue(
         // замедление запрещено контрактом).
         return Ok(pcm.to_vec());
     }
-    let mut inst = lib.create_speech_instance(sample_rate, channels);
+    let mut inst = lib.create_speech_instance(sample_rate, channels)?;
     inst.set_tempo(tempo);
     inst.put_samples(pcm)?;
     let mut out = Vec::with_capacity((pcm.len() as f64 / tempo as f64) as usize + 4096);
     inst.drain_into(&mut out);
-    inst.finish(&mut out);
+    inst.finish(&mut out)?;
     if out.iter().any(|s| !s.is_finite()) {
         return Err(SoundTouchError::InvalidSampleData("NaN/Inf на выходе"));
     }
@@ -499,6 +562,11 @@ mod tests {
         let Some(lib) = load_or_skip() else { return };
         let id = lib.version_id();
         assert!((20_400..20_500).contains(&id), "неожиданная версия {id}");
+        // SRT.9C: точная фиксация комплектуемой версии (third_party).
+        assert_eq!(
+            id, SOUNDTOUCH_BUILT_VERSION_ID,
+            "ожидалась комплектуемая 2.4.1"
+        );
         assert!(
             lib.version_string().starts_with("2."),
             "{}",
@@ -557,11 +625,12 @@ mod tests {
         let Some(lib) = load_or_skip() else { return };
         // После finish() в конвейере не должно остаться сэмплов.
         let pcm = sine(3.0, 300.0, 24_000.0);
-        let mut inst = lib.create_speech_instance(24_000, 1);
+        let mut inst = lib.create_speech_instance(24_000, 1).expect("instance");
         inst.set_tempo(1.7);
         inst.put_samples(&pcm).expect("put");
         let mut out = Vec::new();
-        inst.finish(&mut out);
+        inst.finish(&mut out)
+            .expect("flush без ошибки (rc!=0, SRT.9C)");
         assert!(inst.is_empty(), "после flush буфер пуст");
         let expected = 3.0 / 1.7 * 24_000.0;
         assert!(
@@ -571,6 +640,45 @@ mod tests {
         );
     }
 
+    /// SRT.9C §15.9: длинная реплика (60 с) на реальной DLL.
+    #[test]
+    fn long_cue_60s_tempo() {
+        let Some(lib) = load_or_skip() else { return };
+        let pcm = sine(60.0, 440.0, 24_000.0);
+        let out = process_cue(&lib, &pcm, 1.5, 24_000, 1).expect("process 60s");
+        let expected = 60.0 / 1.5 * 24_000.0;
+        // допуск шире из-за длины (внутренняя задержка фиксирована)
+        assert!(
+            (out.len() as f64 - expected).abs() <= 0.150 * 24_000.0,
+            "длина {} против {expected}",
+            out.len()
+        );
+        assert!(out.iter().all(|s| s.is_finite()));
+    }
+
+    /// SRT.9C §15.16: модуль без soundtouch_* экспортов — явная ошибка
+    /// MissingExport (реальная системная DLL, не заглушка).
+    #[test]
+    #[cfg(windows)]
+    fn foreign_module_is_missing_export_error() {
+        let kernel = std::env::var_os("windir")
+            .map(PathBuf::from)
+            .map(|w| w.join("System32").join("kernel32.dll"))
+            .filter(|p| p.is_file());
+        let Some(kernel) = kernel else {
+            eprintln!("SKIP foreign_module_is_missing_export_error: windir не найден");
+            return;
+        };
+        let err = SoundTouchLib::load(Some(&kernel)).expect_err("kernel32 не SoundTouch");
+        match &err {
+            SoundTouchError::MissingExport(name) => {
+                assert_eq!(name, "soundtouch_createInstance");
+            }
+            other => panic!("ожидалась MissingExport, получено {other:?}"),
+        }
+        assert!(err.to_string().contains("не экспортирует"));
+    }
+
     #[test]
     fn chunked_feed_same_as_single_feed() {
         let Some(lib) = load_or_skip() else { return };
@@ -578,14 +686,14 @@ mod tests {
         // Целая подача.
         let whole = process_cue(&lib, &pcm, 1.4, 24_000, 1).expect("whole");
         // Блочная подача (как потоковая сборка реплики).
-        let mut inst = lib.create_speech_instance(24_000, 1);
+        let mut inst = lib.create_speech_instance(24_000, 1).expect("instance");
         inst.set_tempo(1.4);
         let mut out = Vec::new();
         for block in pcm.chunks(7_777) {
             inst.put_samples(block).expect("put");
             inst.drain_into(&mut out);
         }
-        inst.finish(&mut out);
+        inst.finish(&mut out).expect("flush");
         assert_eq!(whole.len(), out.len(), "длины равны");
         assert_eq!(
             whole, out,
