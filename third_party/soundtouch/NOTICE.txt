@@ -1,0 +1,45 @@
+SoundTouchDLL.dll — NOTICE (этап SRT.3, docs/SRT_0_AUDIT_CONTRACT.md §7)
+=========================================================================
+
+Что здесь находится
+-------------------
+soundtouch-2.4.1.tar.gz  — точный исходный tarball SoundTouch 2.4.1
+                           (https://www.surina.net/soundtouch /
+                           https://codeberg.org/soundtouch/soundtouch),
+                           SHA256 e07abf20ce8f95850c280132e1f61ad400fc1f4011b7fac698a503de6aab6733
+SoundTouchDLL.dll        — собранная из этого tarball динамическая
+                           библиотека официальной C-обёртки SoundTouchDLL
+                           (x64, MSVC 2022, /O2 /MD /std:c++17),
+                           SHA256 E8E56D3DB0D72EED6F4DED298A31058398945F2C72CDA6E8DC29B67F1330C3F6
+                           (повторная сборка tools/build-soundtouch.ps1 из того же
+                           исходника побитово воспроизводима: /Brepro + постоянный
+                           каталог сборки во %TEMP%)
+LGPL-2.1.txt             — текст лицензии SoundTouch (COPYING.TXT tarball)
+NOTICE.txt               — этот файл
+
+Сборка
+------
+tools/build-soundtouch.ps1 — распаковывает tarball в уникальный каталог
+%TEMP%, компилирует cl.exe (vcvars64), проверяет экспорты soundtouch_*,
+атомарно обновляет DLL в этом каталоге. Исходное дерево deps не меняется.
+
+Лицензия (LGPL 2.1) и компоновка
+--------------------------------
+SoundTouch распространяется по LGPL 2.1. Проект PocketTTS-GUI-Rust
+компонует SoundTouchDLL.dll ДИНАМИЧЕСКИ: обёртка
+crates/app-core/src/soundtouch.rs загружает DLL вызовом LoadLibraryW в
+рантайме; в таблице импортов EXE SoundTouch отсутствует. Обычные EXE
+(PocketTTS-GUI-Rust.exe / -cpu.exe) не зависят от DLL ни в сборке, ни в
+работе; DLL требуется только SRT-версиям при необходимости ускорения
+реплик. Условия LGPL 2.1 для динамической компоновки выполняются
+распространением: (a) самой DLL, (b) текста лицензии LGPL-2.1.txt,
+(c) точного исходника библиотеки (tarball здесь же) с возможностью
+пересборки скриптом tools/build-soundtouch.ps1. На лицензию собственного
+кода проекта обёртка по C-API не влияет.
+
+Параметры речевого профиля (эквивалент soundstretch -speech,
+проверено по source/SoundStretch/main.cpp версии 2.4.1):
+SETTING_SEQUENCE_MS=40, SETTING_SEEKWINDOW_MS=15, SETTING_OVERLAP_MS=8,
+AA-фильтр включён, QUICKSEEK выключен. Темп меняется только setTempo
+(без изменения высоты тона); setRate/setPitch не используются.
+SOUNDTOUCH_VERSION_ID собранной DLL — 20401 (2.4.1).

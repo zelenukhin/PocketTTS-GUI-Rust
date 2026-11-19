@@ -9,6 +9,7 @@ pub mod pipeline;
 pub mod pool;
 pub mod settings;
 pub mod sink;
+pub mod soundtouch;
 pub mod srt;
 pub mod trace_dir;
 pub mod worker;
